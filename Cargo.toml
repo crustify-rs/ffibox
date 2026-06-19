@@ -1,0 +1,28 @@
+[package]
+name = "crustify-prim"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+authors = ["Marius Momeu <marius.momeu@berkeley.edu>", "The Crustify Contributors"]
+license = "MIT OR Apache-2.0"
+description = "Generic smart pointers and traits for building safe Rust wrappers over C types"
+repository = "https://github.com/marius-momeu/crustify-prim"
+documentation = "https://docs.rs/crustify-prim"
+homepage = "https://github.com/marius-momeu/crustify-prim"
+readme = "README.md"
+keywords = ["ffi", "smart-pointer", "raii", "refcount", "c-interop"]
+categories = ["api-bindings", "rust-patterns", "no-std", "memory-management"]
+
+[features]
+default = ["std"]
+# Enables `std`-only conveniences (currently just `Debug` formatter helpers).
+# The core types and traits work without it; nothing in the crate needs
+# `alloc`.
+std = []
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
