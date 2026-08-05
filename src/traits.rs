@@ -18,7 +18,7 @@
 //! Alongside: [`CValued`] (by-value dispose), [`CDroppedUninit`] (pre-init
 //! storage free), [`CLenDropped`] / [`CLenCloned`] (length-aware buffer
 //! strategies), and the `*With` strategy traits [`CDropper`] / [`CCloner`]
-//! (for the fat owners that carry runtime teardown state).
+//! (for the owners that carry their teardown policy as a value).
 
 use core::ptr::NonNull;
 
@@ -268,15 +268,15 @@ pub unsafe trait CLenCloned: CLenDropped {
 // pair, implemented on the state object `D`, driving CBoxWith
 // ===========================================================================
 
-/// Exclusive drop **strategy** carrying runtime state: the fat-owner analogue
-/// of [`CDropped`]. Implemented by a state object `D` (a `fn`, a length, any
-/// struct) stored inline on [`CBoxWith<T, D>`]; `c_drop` receives that state
+/// Exclusive drop **strategy** carried as a value: the fat-owner analogue of
+/// [`CDropped`]. Implemented by a policy object `D` (a `fn`, a length, any
+/// struct, or a ZST) stored inline on [`CBoxWith<T, D>`]; `c_drop` receives it
 /// (`&self`) alongside the pointer, so teardown can use runtime data a
 /// zero-state [`CDropped`] cannot carry (e.g. `OPENSSL_sk_pop_free(ptr, fn)`).
 ///
-/// Prefer static monomorphization: when the policy is known at compile time,
-/// register a plain [`CDropped`] and use [`CBox`]. This trait earns its keep
-/// only when the state is not known until runtime.
+/// Use this when teardown is not recoverable from `T` alone: runtime state, or
+/// a second policy for one C type. Otherwise register a plain [`CDropped`] and
+/// use [`CBox`].
 ///
 /// # Safety
 ///
@@ -302,8 +302,8 @@ pub unsafe trait CDropper<T> {
 /// no separate strategy type — register the down-ref as
 /// [`CDropper::c_drop`] and the bump here.
 ///
-/// As with [`CDropper`], prefer static monomorphization: a compile-time policy
-/// belongs in a plain [`CCloned`] on a [`CBox`].
+/// As with [`CDropper`]: a `T` with one recoverable policy belongs in a plain
+/// [`CCloned`] on a [`CBox`].
 ///
 /// # Safety
 ///

@@ -21,7 +21,7 @@
 //! | Type                | Owns                                  | Requires                  |
 //! |---------------------|---------------------------------------|---------------------------|
 //! | [`CBox<T>`]         | heap object, sole owner **or** refcount share | `T: CDropped + CCell` |
-//! | [`CBoxWith<T, D>`]  | the same, with runtime teardown state, giving up pointer compatibility | `D: CDropper<T>` |
+//! | [`CBoxWith<T, D>`]  | the same, plus teardown state `D`; fat unless `D` is a ZST | `D: CDropper<T>` |
 //! | [`CBoxUninit<T>`]   | an allocated, not-yet-initialised slot | `T: CDroppedUninit + CCell` |
 //! | [`CVoidBox<D>`]     | a type-erased `void *`                 | `D: CDropped`             |
 //! | [`CrustifyStr<D>`]  | a NUL-terminated `char *`              | `D: CDropped`             |
@@ -29,7 +29,7 @@
 //! | [`CVal<T>`]         | a value inline, disposing fields only  | `T: CValued + CCell`      |
 //! | [`CValGuard<'a, T>`]| the same, borrowed and dismissible     | `T: CValued + CCell`      |
 //!
-//! Patterns 1 and 2 share **one** type. [`CBox<T>`] is not "the unique
+//! Sole ownership and refcounting share **one** type. [`CBox<T>`] is not "the unique
 //! pointer" — whether it is exclusive or one share of a refcount depends only
 //! on which C routines you register: a `*_free` and a `*_dup` make it
 //! exclusive, a down-ref and an `up_ref` make it shared. There is no `CArc`,
@@ -55,7 +55,7 @@
 //! | [`CValued`]          | `c_dispose` — dispose fields, leave the header         |
 //! | [`CLenDropped`]      | `c_drop_len(ptr, byte_len)` on a buffer strategy       |
 //! | [`CLenCloned`]       | `c_clone_len` — the buffer memdup                      |
-//! | [`CDropper`] / [`CCloner`] | the same ops for [`CBoxWith`], threading state via `&self` — only for state unknown until runtime |
+//! | [`CDropper`] / [`CCloner`] | the same ops for [`CBoxWith`], threading state via `&self` |
 //!
 //! ## Quick example
 //!
@@ -90,8 +90,9 @@
 //!
 //! ## `no_std`
 //!
-//! `#![no_std]` by default. The `std` feature (on by default) only adds
-//! convenience `Debug` formatters; nothing here needs `std` or `alloc`.
+//! `#![no_std]` by default. The `std` feature (on by default) selects
+//! [`std::process::abort`] for the unrecoverable-failure path; without it that
+//! path is a double-panic. Nothing here needs `alloc`.
 
 #![no_std]
 #![cfg_attr(docsrs, feature(doc_cfg))]

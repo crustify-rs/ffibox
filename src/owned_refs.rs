@@ -106,6 +106,12 @@ impl<T: CValued + CCell> CVal<T> {
     }
 }
 
+impl<T: CValued + CCell> fmt::Debug for CVal<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("CVal").field(&self.inner.as_ptr()).finish()
+    }
+}
+
 impl<T: CValued + CCell> Deref for CVal<T> {
     type Target = T;
     #[inline]
@@ -184,6 +190,14 @@ impl<'a, T: CValued + CCell> CValGuard<'a, T> {
     #[inline]
     pub fn dismiss(self) {
         core::mem::forget(self);
+    }
+}
+
+impl<T: CValued + CCell> fmt::Debug for CValGuard<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("CValGuard")
+            .field(&self.ptr.as_ptr())
+            .finish()
     }
 }
 
@@ -308,15 +322,12 @@ impl<T: CCloned + CCell> CBox<T> {
 impl<T: CCloned + CCell> Clone for CBox<T> {
     #[inline]
     fn clone(&self) -> Self {
-        // SAFETY: `self.ptr` is a live `T`, and the `CCloned` contract makes a
-        // `Some` return a handle owing exactly one `c_drop`.
-        //
         // Failure aborts rather than fabricating a handle: `Clone` is
         // infallible by trait contract, and a panic would be swallowed by a
         // `catch_unwind` at the FFI boundary. Use `try_clone` for the
         // recoverable path.
-        match unsafe { T::c_clone(self.ptr) } {
-            Some(ptr) => Self { ptr },
+        match self.try_clone() {
+            Some(b) => b,
             None => abort_process(),
         }
     }
@@ -600,6 +611,10 @@ impl<D: CDropped> CrustifyStr<D> {
     }
 
     /// Borrow the raw `*const c_char` for passing to C. Ownership is retained.
+    ///
+    /// `*const`, not `*mut` like the other owners' `as_ptr`: the views are
+    /// read-only, so this mirrors [`CStr::as_ptr`](core::ffi::CStr::as_ptr).
+    /// [`into_raw`](Self::into_raw) is the `*mut` path.
     #[inline]
     #[must_use]
     pub fn as_ptr(&self) -> *const core::ffi::c_char {
@@ -852,7 +867,7 @@ impl<T, S: CLenDropped> fmt::Debug for CVec<T, S> {
 // does. Add `unsafe impl`s per concrete instantiation once verified.
 
 // ===========================================================================
-// CBoxWith — the fat owner, carrying runtime teardown state
+// CBoxWith — the owner that carries its teardown policy as a value
 // ===========================================================================
 //
 // The distinction from the thin `CBox` is one fact seen twice: `CDropped` is a
@@ -875,24 +890,24 @@ impl<T, S: CLenDropped> fmt::Debug for CVec<T, S> {
 // the down-ref as `CDropper::c_drop` and the `up_ref` as `CCloner::c_clone`.
 //
 // A ZST `D` collapses back to the thin layout under `repr(C)`; a stateful one
-// is genuinely fat and no longer a bare pointer. Prefer static monomorphization
-// — a `CBox` whose `CDropped` fixes the policy at compile time — and reach for
-// `CBoxWith` only when the state is not known until runtime.
+// is genuinely fat and no longer a bare pointer. Reach for `CBoxWith` when
+// teardown is not recoverable from `T` alone: runtime state, or a second policy
+// for one C type. Otherwise `CBox`.
 
 // ---------------------------------------------------------------------------
 // CBoxWith<T, D> — unique owner + inline teardown state
 // ---------------------------------------------------------------------------
 
-/// Unique owner of a C-allocated object whose destructor needs **runtime
-/// state** — the fat sibling of [`CBox`]. Stores `{ptr, dropper: D}` and runs
-/// `D::c_drop(&self, ptr)` on drop; `Clone` is opt-in via [`CCloner`] plus
-/// `D: Clone`.
+/// Unique owner whose teardown is carried by a **policy object** `D` rather
+/// than recovered from `T` — the sibling of [`CBox`]. Stores `{ptr, dropper: D}`
+/// and runs `D::c_drop(&self, ptr)` on drop; `Clone` is opt-in via [`CCloner`]
+/// plus `D: Clone`.
 ///
 /// `#[repr(C)]`, so a ZST `D` collapses to pointer size while a stateful one is
-/// genuinely fat and no longer layout-compatible with `*mut T::C`. Prefer
-/// static monomorphization — a [`CBox`] whose [`CDropped`] fixes the policy at
-/// compile time — and reach for this only when the state is not known until
-/// runtime.
+/// genuinely fat and no longer layout-compatible with `*mut T::C`. Reach for it
+/// when teardown is not recoverable from `T` alone: runtime state, or a second
+/// policy for one C type — a ZST `D` keeps the pointer-compatible layout.
+/// Otherwise [`CBox`].
 ///
 /// The seam speaks the raw C type exactly like [`CBox`]; only
 /// [`from_raw`](Self::from_raw) gains the `dropper` argument — the point at
@@ -982,13 +997,9 @@ impl<T: CCell, D: CCloner<T> + Clone> CBoxWith<T, D> {
 impl<T: CCell, D: CCloner<T> + Clone> Clone for CBoxWith<T, D> {
     #[inline]
     fn clone(&self) -> Self {
-        // SAFETY: as `try_clone`. On failure we abort rather than fabricate a
-        // handle — same contract as `CBox::clone`.
-        match unsafe { self.dropper.c_clone(self.ptr) } {
-            Some(ptr) => Self {
-                ptr,
-                dropper: self.dropper.clone(),
-            },
+        // Abort rather than fabricate a handle; see `CBox::clone`.
+        match self.try_clone() {
+            Some(b) => b,
             None => abort_process(),
         }
     }

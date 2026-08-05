@@ -164,7 +164,6 @@ unsafe impl<T: Sync> Send for SelfPtr<'_, T> {}
 // SAFETY: see the `Send` impl above.
 unsafe impl<T: Sync> Sync for SelfPtr<'_, T> {}
 
-#[cfg(feature = "std")]
 impl<T> core::fmt::Debug for SelfPtr<'_, T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_tuple("SelfPtr").field(&self.ptr).finish()

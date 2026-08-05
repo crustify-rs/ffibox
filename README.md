@@ -1,8 +1,8 @@
-# Crustify
+# crustify-prim
 
-[![crates.io](https://img.shields.io/crates/v/crustify.svg)](https://crates.io/crates/crustify)
-[![docs.rs](https://docs.rs/crustify/badge.svg)](https://docs.rs/crustify)
-[![license](https://img.shields.io/crates/l/crustify.svg)](#license)
+[![crates.io](https://img.shields.io/crates/v/crustify-prim.svg)](https://crates.io/crates/crustify-prim)
+[![docs.rs](https://docs.rs/crustify-prim/badge.svg)](https://docs.rs/crustify-prim)
+[![license](https://img.shields.io/crates/l/crustify-prim.svg)](#license)
 
 Generic smart pointers and traits for building safe Rust wrappers over C
 types. Designed for arbitrary user-space C interop, including the case
@@ -18,7 +18,8 @@ conventions into RAII. The recurring shapes:
 - Unique ownership with a destructor (`*_free`, no refcount).
 - By-value object whose teardown disposes fields but not the header.
 - Length-aware buffer with a cleanup policy (e.g. secure zeroing).
-- Rust state parked in an opaque C `*mut c_void` slot.
+- NUL-terminated `char *` owned by Rust, freed by a C allocator.
+- Type-erased `void *` that stays opaque end to end.
 
 Each shape gets one trait (the per-type lifecycle contract) and one
 wrapper (the handle that enforces it). The wrapper picks which teardown
@@ -32,7 +33,8 @@ runs; the trait is implemented on the wrapped C type or on a strategy ZST.
 | `CVoidBox<D>`       | the same, type-erased (`void *`) with deleter class `D` | `D::c_drop`      | 8           |
 | `CVal<T>`           | inline by-value storage; disposes fields, not header | `c_dispose`         | size_of `T` |
 | `CVec<T, S>`        | length-aware buffer with cleanup strategy `S`        | `S::c_drop_len`     | 16          |
-| `CBoxWith<T, D>`    | `CBox` with runtime teardown state `D` (fat)         | `D::c_drop`         | 8 + `D`     |
+| `CrustifyStr<D>`    | owned NUL-terminated `char *`; read-only views        | `D::c_drop`         | 8           |
+| `CBoxWith<T, D>`    | `CBox` with its teardown policy as a value `D`       | `D::c_drop`         | 8 + `D`     |
 
 There is **one** owned-pointer type, not two. Whether a `CBox<T>` is an
 exclusive owner or one share of a refcount depends only on which C routines
@@ -46,12 +48,12 @@ no type-level distinction.
 layout-compatible with `*mut T`, and their `Option<_>` forms reuse the
 `NonNull` niche, so they drop into `#[repr(C)]` pointer fields unchanged.
 `CVal<T>` is `#[repr(transparent)]` over `T`. `CVec` stores pointer +
-count and is not pointer-compatible. `CBoxWith` is the **fat** owner
-(`#[repr(C)]` `{ptr, D}`): it carries runtime teardown state a bare pointer
-cannot (the `sk_pop_free(elem_free_fn)` shape), so it is not
-pointer-compatible when `D` is non-empty. Prefer static monomorphization — a
-`CBox` whose `CDropped` fixes the policy at compile time — and reach for it
-only when the state is not known until runtime.
+count and is not pointer-compatible. `CBoxWith` is `#[repr(C)]` `{ptr, D}`:
+it carries a teardown policy a bare pointer cannot (the
+`sk_pop_free(elem_free_fn)` shape), so it is not
+pointer-compatible when `D` is non-empty. Reach for it when teardown is not
+recoverable from `T` alone: runtime state, or a second policy for one C type
+(a ZST `D` keeps the pointer-compatible layout). Otherwise `CBox`.
 
 ## Construction handles
 
@@ -86,7 +88,7 @@ the clone trait a sub-trait of its drop trait:
 | `CDroppedUninit` | `CBoxUninit` | `c_drop_uninit` (pre-init storage-only free)          |
 | `CLenDropped`    | `CVec`       | `c_drop_len(ptr, byte_len)` on a strategy ZST         |
 | `CLenCloned`     | `CVec`       | `c_clone_len` buffer memdup; enables `Clone` (sub-trait of `CLenDropped`) |
-| `CDropper` / `CCloner` | `CBoxWith` | fat-owner strategies — same ops, threading state via `&self`; only for state unknown until runtime |
+| `CDropper` / `CCloner` | `CBoxWith` | fat-owner strategies — same ops, threading state via `&self` |
 
 There are no built-in strategies: every `CVec` names a `CLenDropped` you
 write (see the secure-erase example below).
@@ -120,7 +122,8 @@ define_type!(Foo, ffi::foo_st);
 impl_dropped!(Foo, ffi::foo_st, ffi::FOO_free);                 // Drop  -> c_drop
 impl_cloned!(Foo, ffi::foo_st, up_ref = ffi::FOO_up_ref);       // Clone -> c_clone
 
-let a: CBox<Foo> = unsafe { CBox::from_raw(ffi::FOO_new() as *mut Foo) }.unwrap();
+// The seam speaks the raw C type, so no cast is needed.
+let a: CBox<Foo> = unsafe { CBox::<Foo>::from_raw(ffi::FOO_new()) }.unwrap();
 let b = a.clone();    // FOO_up_ref
 drop(a);              // FOO_free (refcount > 0, lives on)
 drop(b);              // FOO_free (refcount == 0, freed)
@@ -161,13 +164,14 @@ For scope-driven dismissal that isn't a property of the object, defuse via
 
 ## no_std
 
-Crustify is `#![no_std]` by default. The `std` feature (on by default)
-only enables convenience formatters; the core types and traits work
-without `std` — and without `alloc`.
+Crustify is `#![no_std]` by default. The `std` feature (on by default) selects
+`std::process::abort` for the unrecoverable-failure path (`Clone` when the C
+copy routine fails); without it that path is a double-panic. Nothing here
+needs `alloc`.
 
 ```toml
 [dependencies]
-crustify = { version = "0.1", default-features = false }
+crustify-prim = { version = "0.1", default-features = false }
 ```
 
 ## Comparison with alternative systems

@@ -82,7 +82,7 @@ form plus the `(N, ffi::c, fn…)` delegating form shown below). The **Bound by*
 column is what the macro enables; the pointer types in Axis 3 require these
 traits as bounds.
 
-The four core lifecycle traits form a **clone/drop x exclusive/shared grid**.
+The two base lifecycle traits form a **clone/drop x exclusive/shared grid**.
 Each clone trait is a sub-trait of its drop trait — a cloned handle must
 be releasable the same way:
 
@@ -128,18 +128,18 @@ destructor on a formed object; `CDroppedUninit` only releases the raw storage of
 a half-built one. A self-contained ctor port uses both — `CDroppedUninit` while
 initializing, `CDropped` once `assume_init`'d.
 
-**Stateful teardown — the `*With` strategies.** When teardown needs **runtime
-state** the pointee cannot carry, bind a
-**strategy object** `D` implementing the agent-noun analogue of the base pair:
+**Value-carried teardown — the `*With` strategies.** When teardown is not
+recoverable from the pointee, bind a
+**policy object** `D` implementing the agent-noun analogue of the base pair:
 `CDropper<T>` (drop) and `CCloner<T>` (clone). As with the base pair there is no
 separate shared flavour — a refcounted pointee registers the down-ref as
 `CDropper::c_drop` and the `up_ref` as `CCloner::c_clone`.
 
 Each method takes `(&self_state, ptr)`, so `D` carries the `fn` / length / struct
 into `Drop`. These are **hand-implemented on the state type** (no `impl_*!`
-macro) and consumed by `CBoxWith` in Axis 3. Prefer static monomorphization —
-a `CBox` whose `CDropped` fixes the policy at compile time — and reach for these
-only when the state is not known until runtime. All in `src/traits.rs`.
+macro) and consumed by `CBoxWith` in Axis 3. Use them when teardown is not
+recoverable from `T` alone: runtime state, or a second policy for one C type.
+Otherwise register a plain `CDropped` and use `CBox`. All in `src/traits.rs`.
 
 ---
 
@@ -167,12 +167,12 @@ automatic for any `define_type!` / hand-written wrapper; it also unlocks the
 is a *deleter strategy* (or `T` an *element*), not a wrapper.
 
 `CBoxWith` is the **fat** owner: `#[repr(C)]` `{ptr, dropper: D}`, so it is
-**not** layout-compatible with `*mut T::C` when `D` carries state (the trade for
-runtime teardown state). Its `from_raw` takes the extra `dropper` argument
+**not** layout-compatible with `*mut T::C` when `D` carries state (a ZST `D`
+stays pointer-sized). Its `from_raw` takes the extra `dropper` argument
 (`from_raw(*mut T::C, D)`) — the seam point where the policy is fixed;
-`into_raw` hands back `(*mut T::C, D)`. Prefer static monomorphization — a
-`CBox` whose `CDropped` fixes the policy at compile time — and reach for it only
-when the state is not known until runtime.
+`into_raw` hands back `(*mut T::C, D)`. Reach for it when teardown is not
+recoverable from `T` alone: runtime state, or a second policy for one C type
+(a ZST `D` keeps the pointer-compatible layout). Otherwise `CBox`.
 
 ### Non-owning pointer wrappers
 
@@ -246,8 +246,9 @@ way. Adopt an already-built C pointer via `CBox::from_raw`.
 **Runtime-state overlay.** If the cell's teardown needs a value chosen at the
 wrapping site rather than a fixed `*_free`, swap the thin owner for its fat
 sibling: `CBox<T>` -> `CBoxWith<T, D>`, with `D` a strategy carrying the state
-(`CDropper`, plus `CCloner` to clone). Orthogonal to the cell. Prefer static
-monomorphization; reach here only when the state is not known until runtime.
+(`CDropper`, plus `CCloner` to clone). Orthogonal to the cell. Reach here when
+teardown is not recoverable from `T` alone: runtime state, or a second policy
+for one C type.
 
 **Allocated<->initialized overlay.** When you **allocate + initialize in Rust**
 (porting a ctor), reach the matrix cell through the uninit ladder:
