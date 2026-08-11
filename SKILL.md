@@ -1,6 +1,5 @@
 ---
 name: crustify-prim
-roles: [translator]
 description: >-
   Choose and apply the right crustify smart pointer / trait when representing a
   C type's ownership and lifetime in safe Rust. Use when wrapping a raw C
