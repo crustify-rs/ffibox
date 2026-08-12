@@ -11,15 +11,14 @@ Wrapping a C API in Rust means re-homing C's ownership and lifecycle
 conventions into RAII. The recurring shapes:
 
 - Refcounted or exclusive ownership with destructor (`up_ref` / `free`).
+- Types with multiple or runtime-conditional destructors.
 - By-value object whose teardown disposes fields but not the header.
-- Length-aware buffer with a cleanup policy (e.g. secure zeroing).
-- NUL-terminated `char *` owned by Rust, freed by a C allocator.
+- Length-aware buffer or NUL-terminated `char *` accessed in Rust, freed by a C allocator.
 - Type-erased `void *` that stays opaque end to end.
 
 Each shape gets one trait (the per-type lifecycle contract) and one
 wrapper (the handle that enforces it). The wrapper picks which teardown
 runs; the trait is implemented on the wrapped C type or on a strategy ZST.
-
 
 
 ## Mental model in one paragraph
@@ -34,6 +33,127 @@ by implementing one of the **trait contracts** , and
 you choose a **pointer type** that consumes that contract. The split below is
 the three axes: *representation* (one shape), *contracts* (what teardown means),
 *pointers* (who owns, and in which phase of life).
+
+
+## Examples
+
+### CBox
+
+```rust,ignore
+use crustify_prim::{define_type, CBox, CDropped};
+use core::ptr::NonNull;
+
+mod sys {
+    #[repr(C)] pub struct point_st { pub x: i32, pub y: i32 }
+    extern "C" {
+        pub fn point_new(x: i32, y: i32) -> *mut point_st;
+        pub fn point_free(p: *mut point_st);
+    }
+}
+
+define_type!(Point, sys::point_st);
+
+unsafe impl CDropped for Point {
+    unsafe fn c_drop(obj: NonNull<Self>) {
+        unsafe { sys::point_free(obj.as_ptr().cast()) }
+    }
+}
+
+impl Point {
+    pub fn new(x: i32, y: i32) -> Option<CBox<Self>> {
+        unsafe { CBox::from_raw(sys::point_new(x, y)) }
+    }
+    pub fn x(&self) -> i32 {
+        unsafe { (*self.as_ptr()).x }
+    }
+}
+
+let p = Point::new(3, 4).unwrap();
+assert_eq!(p.x(), 3);
+// `point_free` runs here.
+```
+
+### CVoidBox
+
+```rust,ignore
+use crustify_prim::{CVoidBox, CDropped};
+use core::ptr::NonNull;
+
+mod sys {
+    extern "C" {
+        pub fn arena_alloc(n: usize) -> *mut core::ffi::c_void;
+        pub fn arena_fill(p: *mut core::ffi::c_void, n: usize);
+        pub fn arena_free(p: *mut core::ffi::c_void);
+    }
+}
+
+/// Names the destructor class, not the pointee — the bytes stay opaque.
+pub struct ArenaFree;
+
+unsafe impl CDropped for ArenaFree {
+    unsafe fn c_drop(obj: NonNull<Self>) {
+        unsafe { sys::arena_free(obj.as_ptr().cast()) }
+    }
+}
+
+type ArenaBuf = CVoidBox<ArenaFree>;
+
+let buf: ArenaBuf = unsafe { CVoidBox::from_raw(sys::arena_alloc(64)) }.unwrap();
+unsafe { sys::arena_fill(buf.as_ptr(), 64) };
+// `arena_free` runs here.
+```
+
+### CVal
+
+```rust,ignore
+use crustify_prim::{define_type, CVal, CValued};
+use core::ptr::NonNull;
+
+mod sys {
+    #[repr(C)] pub struct buf_st { pub ptr: *mut u8, pub len: usize }
+    extern "C" { pub fn buf_dispose(b: *mut buf_st); }
+}
+
+define_type!(Buf, sys::buf_st);
+
+// Rust owns the struct BY VALUE; C owns what its fields point at.
+unsafe impl CValued for Buf {
+    unsafe fn c_dispose(this: NonNull<Self>) {
+        unsafe { sys::buf_dispose(this.as_ptr().cast()) }
+    }
+}
+
+let b = CVal::new(Buf::zeroed());
+assert_eq!(unsafe { (*b.as_ptr()).len }, 0);
+// `buf_dispose` runs here; the struct itself is dropped inline.
+```
+
+### CVec
+
+```rust,ignore
+use crustify_prim::{CVec, CLenDropped};
+use core::mem::size_of;
+
+mod sys {
+    extern "C" {
+        pub fn oids_new(n: usize) -> *mut u32;
+        pub fn oids_free(p: *mut u32, n: usize);
+    }
+}
+
+/// Names the allocator strategy: freeing needs the length back.
+pub struct OidsFree;
+
+unsafe impl CLenDropped for OidsFree {
+    unsafe fn c_drop_len(ptr: *mut u8, byte_len: usize) {
+        unsafe { sys::oids_free(ptr.cast(), byte_len / size_of::<u32>()) }
+    }
+}
+
+let v: CVec<u32, OidsFree> = unsafe { CVec::from_raw_parts(sys::oids_new(3), 3) }.unwrap();
+assert_eq!(v.as_slice().len(), 3);
+// `oids_free(ptr, 3)` runs here.
+```
 
 ---
 
