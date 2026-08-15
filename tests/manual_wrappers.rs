@@ -4,17 +4,22 @@
     clippy::undocumented_unsafe_blocks,
     clippy::missing_safety_doc
 )]
-//! `define_type!` covers only the trivial base case; lifetime- and type-generic
-//! newtypes are written by hand against `CCell` (native Rust generics, no macro
-//! arm). These tests guard that hand-written path: the whole seam
-//! (`as_ptr`/`as_void_ptr`/`from_ptr`/`uninit`/`zeroed`) comes from `CCell` with
-//! only `type C = ...;`, and the layout stays `#[repr(transparent)]`.
+//! `define_ctype!` covers only the trivial base case; lifetime- and
+//! type-generic newtypes are written by hand against `CCell` (native Rust
+//! generics, no macro arm). These tests guard that hand-written path: the
+//! wrapper supplies `type C` plus its own two handle types and the constructors
+//! that build them, and the layout stays `#[repr(transparent)]` throughout.
+//!
+//! The invariant under test is the crate's premise: **no reference to a wrapped
+//! C object is ever formed.** Every accessor lives on a handle, which is one
+//! pointer of Rust-owned storage.
 
 use core::marker::PhantomData;
 use core::mem::size_of;
-use core::ptr::NonNull;
+use core::ops::Deref;
+use core::ptr::{addr_of, addr_of_mut, NonNull};
 use core::sync::atomic::{AtomicUsize, Ordering};
-use crustify_prim::{define_type, CBox, CBoxWith, CCell, CDropped, CDropper, CType};
+use crustify_prim::{define_ctype, CBox, CBoxWith, CCell, CDropped, CDropper, CPtr, CType};
 
 #[repr(C)]
 pub struct foo_st {
@@ -23,24 +28,7 @@ pub struct foo_st {
 }
 
 // Base case — via the macro.
-define_type!(FooOwned, foo_st);
-
-// --- Hand-written lifetime-carrying wrapper (formerly the lifetime arm) ---
-#[repr(transparent)]
-pub struct FooBorrowed<'a>(CType<foo_st>, PhantomData<&'a ()>);
-unsafe impl<'a> CCell for FooBorrowed<'a> {
-    type C = foo_st;
-}
-// CDropped so we can box it and check niche.
-unsafe impl<'a> CDropped for FooBorrowed<'a> {
-    unsafe fn c_drop(_o: NonNull<Self>) {}
-}
-
-#[repr(transparent)]
-pub struct FooBiBorrowed<'a, 'b>(CType<foo_st>, PhantomData<(&'a (), &'b ())>);
-unsafe impl<'a, 'b> CCell for FooBiBorrowed<'a, 'b> {
-    type C = foo_st;
-}
+define_ctype!(FooFull, FooFullRef, FooFullMut, foo_st);
 
 // --- Hand-written type-generic wrapper: the STACK_OF shape Stack<T, S> ---
 #[repr(C)]
@@ -56,67 +44,177 @@ pub struct X509Free;
 
 #[repr(transparent)]
 pub struct Stack<T, S>(CType<stack_st>, PhantomData<(T, S)>);
+
+/// The hand-written shared handle. The generic parameters ride along, so
+/// borrowing a pointer cannot lose the element type or the free strategy.
+#[repr(transparent)]
+pub struct StackRef<'a, T, S>(CPtr<'a, Stack<T, S>>);
+impl<T, S> Clone for StackRef<'_, T, S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T, S> Copy for StackRef<'_, T, S> {}
+
+/// The hand-written exclusive handle.
+#[repr(transparent)]
+pub struct StackMut<'a, T, S>(StackRef<'a, T, S>);
+
+// SAFETY: `Stack` is `#[repr(transparent)]` over `CType<stack_st>`; both handles
+// are transparent over `CPtr<'a, Stack<T, S>>` and expose no reference to
+// `Stack`; the shared one has no write path.
 unsafe impl<T, S> CCell for Stack<T, S> {
     type C = stack_st;
+    type Ref<'a>
+        = StackRef<'a, T, S>
+    where
+        Self: 'a;
+    type Mut<'a>
+        = StackMut<'a, T, S>
+    where
+        Self: 'a;
+
+    unsafe fn ref_from_raw<'a>(p: NonNull<Self>) -> StackRef<'a, T, S>
+    where
+        Self: 'a,
+    {
+        StackRef(unsafe { CPtr::new(p) })
+    }
+    unsafe fn mut_from_raw<'a>(p: NonNull<Self>) -> StackMut<'a, T, S>
+    where
+        Self: 'a,
+    {
+        StackMut(StackRef(unsafe { CPtr::new(p) }))
+    }
 }
+
+impl<T, S> Stack<T, S> {
+    /// All-zero is a valid `stack_st` (an `i32` and a raw pointer).
+    fn zeroed() -> Self {
+        Self(unsafe { CType::zeroed() }, PhantomData)
+    }
+}
+
+impl<'a, T, S> StackRef<'a, T, S> {
+    unsafe fn from_ptr(p: *mut stack_st) -> Option<Self> {
+        NonNull::new(p.cast::<Stack<T, S>>()).map(|p| StackRef(unsafe { CPtr::new(p) }))
+    }
+    fn as_ptr(&self) -> *const stack_st {
+        self.0.as_non_null().as_ptr().cast()
+    }
+    /// A getter: reads through the raw pointer, forms no reference.
+    fn num(&self) -> i32 {
+        unsafe { addr_of!((*self.as_ptr()).num).read() }
+    }
+}
+
+impl<'a, T, S> StackMut<'a, T, S> {
+    fn as_mut_ptr(&mut self) -> *mut stack_st {
+        self.0 .0.as_non_null().as_ptr().cast()
+    }
+    /// A setter: `&mut self` on the HANDLE — one pointer of Rust stack.
+    fn set_num(&mut self, v: i32) {
+        unsafe { addr_of_mut!((*self.as_mut_ptr()).num).write(v) }
+    }
+}
+
+impl<'a, T, S> Deref for StackMut<'a, T, S> {
+    type Target = StackRef<'a, T, S>;
+    fn deref(&self) -> &StackRef<'a, T, S> {
+        &self.0
+    }
+}
+
 // Each STACK_OF(T) is a zero-cost alias picking a strategy — not a redefinition.
 pub type StackOfX509Borrowed = Stack<X509, Borrowed>;
 pub type StackOfX509Owned = Stack<X509, Owned<X509Free>>;
 
 #[test]
 fn layout_and_niche() {
-    // repr(transparent): wrapper == its C type.
-    assert_eq!(
-        size_of::<Option<&FooBorrowed<'static>>>(),
-        size_of::<*const foo_st>()
-    );
-    assert_eq!(
-        size_of::<Option<CBox<FooBorrowed<'static>>>>(),
-        size_of::<*mut foo_st>()
-    );
-    assert_eq!(
-        size_of::<FooBiBorrowed<'static, 'static>>(),
-        size_of::<foo_st>()
-    );
-    // generic wrapper stays transparent over stack_st regardless of T, S.
+    // The layout newtype keeps the C struct's size, so it embeds by value.
+    assert_eq!(size_of::<FooFull>(), size_of::<foo_st>());
     assert_eq!(size_of::<Stack<X509, Borrowed>>(), size_of::<stack_st>());
     assert_eq!(size_of::<StackOfX509Owned>(), size_of::<stack_st>());
+
+    // The handles are one pointer regardless of the generics, with the niche.
+    assert_eq!(
+        size_of::<StackRef<'_, X509, Borrowed>>(),
+        size_of::<*const stack_st>()
+    );
+    assert_eq!(
+        size_of::<StackMut<'_, X509, Borrowed>>(),
+        size_of::<*const stack_st>()
+    );
+    assert_eq!(
+        size_of::<Option<StackRef<'_, X509, Borrowed>>>(),
+        size_of::<*const stack_st>()
+    );
+    assert_eq!(size_of::<Option<CBox<FooFull>>>(), size_of::<*mut foo_st>());
 }
 
-// covariance: a 'static borrow is usable where a shorter one is expected.
-fn _covariant<'a>(x: &'a FooBorrowed<'static>) -> &'a FooBorrowed<'a> {
+// Covariance: a longer borrow is usable where a shorter one is expected, just
+// like `&'a T`.
+fn _covariant<'a>(x: StackRef<'static, X509, Borrowed>) -> StackRef<'a, X509, Borrowed> {
     x
 }
 
 #[test]
-fn seam_provided_by_ccell() {
-    // uninit/zeroed/as_ptr/as_void_ptr are provided by CCell for hand-written
-    // wrappers (only `type C` was written). Exercise the transmute_copy ctors.
-    let s = Stack::<X509, Borrowed>::zeroed();
-    let p: *mut stack_st = s.as_ptr();
-    assert!(!p.is_null());
-    let _v = s.as_void_ptr();
-    let _u = StackOfX509Owned::uninit();
-    let _b = FooBorrowed::<'static>::zeroed();
+fn the_hand_written_seam_reads_and_writes() {
+    let raw = Box::into_raw(Box::new(stack_st {
+        num: 3,
+        data: core::ptr::null_mut(),
+    }));
 
-    // inherent forwarder on the macro base case: callable without `CCell` name.
-    let f = FooOwned::zeroed();
-    let _ = f.as_ptr();
+    let r: StackRef<'_, X509, Borrowed> = unsafe { StackRef::from_ptr(raw) }.unwrap();
+    assert_eq!(r.num(), 3);
+
+    let mut m: StackMut<'_, X509, Borrowed> =
+        unsafe { Stack::mut_from_raw(NonNull::new(raw.cast()).unwrap()) };
+    m.set_num(7);
+    // Getters reach through `Deref` to the shared handle.
+    assert_eq!(m.num(), 7);
+
+    // `zeroed` builds a value for inline storage; the pointer to it comes from
+    // `addr_of_mut!`, never `&mut`.
+    let mut inline: Stack<X509, Borrowed> = Stack::zeroed();
+    let slot = addr_of_mut!(inline);
+    assert_eq!(
+        unsafe { addr_of!((*slot.cast::<stack_st>()).num).read() },
+        0
+    );
+
+    drop(unsafe { Box::from_raw(raw) });
+}
+
+#[test]
+fn owning_handles_hand_out_handles_not_references() {
+    let raw = Box::into_raw(Box::new(foo_st {
+        a: 1,
+        p: core::ptr::null_mut(),
+    }));
+    let mut b = unsafe { CBox::<FooFull>::from_raw(raw) }.unwrap();
+
+    // `as_ref` / `as_mut` replace `Deref`: the handle carries the lifetime,
+    // which `Deref::Target` could not name.
+    let _shared: FooFullRef<'_> = b.as_ref();
+    let mut excl: FooFullMut<'_> = b.as_mut();
+    unsafe { addr_of_mut!((*excl.as_mut_ptr()).a).write(9) };
+    assert_eq!(unsafe { addr_of!((*b.as_ref().as_ptr()).a).read() }, 9);
+
+    core::mem::forget(b);
+    drop(unsafe { Box::from_raw(raw) });
 }
 
 // ---------------------------------------------------------------------------
-// CBoxWith<T, D> — fat owner carrying a runtime teardown fn (the sk_pop_free
-// shape): the element-free function is chosen at the wrapping site and threaded
-// into `Drop`, which a zero-state `CBox<Stack<..>>` cannot express.
+// CBoxWith<T, D> — the fat owner, and now the construction-phase handle too
 // ---------------------------------------------------------------------------
 
 static POP_FREE_CALLS: AtomicUsize = AtomicUsize::new(0);
 static ELEM_FN_SEEN: AtomicUsize = AtomicUsize::new(0);
 
-// Mock element destructor; identity is what we assert reached teardown.
 extern "C" fn x509_free_mock(_p: *mut core::ffi::c_void) {}
 
-// The dropper IS the runtime state: the caller-supplied element-free fn.
+/// The dropper IS the runtime state: the caller-supplied element-free fn.
 #[derive(Clone, Copy)]
 pub struct ElemFree(unsafe extern "C" fn(*mut core::ffi::c_void));
 
@@ -140,7 +238,6 @@ fn cboxwith_runs_dropper_with_runtime_state() {
         data: core::ptr::null_mut(),
     }));
     // The free fn is fixed HERE, at the seam — the whole point of the fat owner.
-    // `from_raw` speaks the raw C type (`*mut stack_st`), cast-free.
     let owned = unsafe {
         CBoxWith::<Stack<X509, Borrowed>, ElemFree>::from_raw(raw, ElemFree(x509_free_mock))
     }
@@ -156,18 +253,87 @@ fn cboxwith_runs_dropper_with_runtime_state() {
     );
 }
 
+// The construction phase `CBoxUninit` used to model: hold the allocation under
+// a storage-only dropper while filling it, then promote. One-way, and a type
+// change, so a half-built object cannot reach code expecting a formed one.
+static STORAGE_FREES: AtomicUsize = AtomicUsize::new(0);
+static FULL_FREES: AtomicUsize = AtomicUsize::new(0);
+
+pub struct StorageFree;
+// SAFETY: reclaims exactly the raw allocation, touching no field — the
+// construction-phase contract.
+unsafe impl CDropper<FooFull> for StorageFree {
+    unsafe fn c_drop(&self, ptr: NonNull<FooFull>) {
+        STORAGE_FREES.fetch_add(1, Ordering::SeqCst);
+        drop(unsafe { Box::from_raw(ptr.as_ptr().cast::<foo_st>()) });
+    }
+}
+// SAFETY: the full destructor, run once the object is formed.
+unsafe impl CDropped for FooFull {
+    unsafe fn c_drop(obj: NonNull<Self>) {
+        FULL_FREES.fetch_add(1, Ordering::SeqCst);
+        drop(unsafe { Box::from_raw(obj.as_ptr().cast::<foo_st>()) });
+    }
+}
+
+#[test]
+fn construction_phase_promotes_with_exactly_one_teardown() {
+    STORAGE_FREES.store(0, Ordering::SeqCst);
+    FULL_FREES.store(0, Ordering::SeqCst);
+
+    let raw = Box::into_raw(Box::new(foo_st {
+        a: 0,
+        p: core::ptr::null_mut(),
+    }));
+    let mut slot = unsafe { CBoxWith::<FooFull, StorageFree>::from_raw(raw, StorageFree) }.unwrap();
+    unsafe { addr_of_mut!((*slot.as_mut().as_mut_ptr()).a).write(42) };
+
+    // Promote: the storage dropper is forgotten, `FooFull::c_drop` takes over.
+    let formed: CBox<FooFull> = unsafe { slot.into_box() };
+    assert_eq!(
+        unsafe { addr_of!((*formed.as_ref().as_ptr()).a).read() },
+        42
+    );
+    assert_eq!(STORAGE_FREES.load(Ordering::SeqCst), 0);
+
+    drop(formed);
+    assert_eq!(FULL_FREES.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        STORAGE_FREES.load(Ordering::SeqCst),
+        0,
+        "the construction-phase teardown must not run on a promoted object"
+    );
+}
+
+#[test]
+fn construction_phase_bails_with_storage_only_teardown() {
+    STORAGE_FREES.store(0, Ordering::SeqCst);
+    FULL_FREES.store(0, Ordering::SeqCst);
+
+    let raw = Box::into_raw(Box::new(foo_st {
+        a: 0,
+        p: core::ptr::null_mut(),
+    }));
+    {
+        let _slot = unsafe { CBoxWith::<FooFull, StorageFree>::from_raw(raw, StorageFree) };
+        // dropped without promoting — the construction-failure path
+    }
+    assert_eq!(STORAGE_FREES.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        FULL_FREES.load(Ordering::SeqCst),
+        0,
+        "the real destructor must not run over a half-built object"
+    );
+}
+
 #[test]
 fn cboxwith_layout_thin_vs_fat() {
-    // The thin owner stays pointer-sized, with the Option niche.
+    // A ZST dropper keeps the fat owner pointer-sized, with the niche.
     assert_eq!(
-        size_of::<CBox<FooBorrowed<'static>>>(),
+        size_of::<CBoxWith<FooFull, StorageFree>>(),
         size_of::<*mut foo_st>()
     );
-    assert_eq!(
-        size_of::<Option<CBox<FooBorrowed<'static>>>>(),
-        size_of::<*mut foo_st>()
-    );
-    // The fat owner is genuinely ptr + inline state (here a fn pointer).
+    // With real state it is genuinely ptr + inline state (here a fn pointer).
     assert_eq!(
         size_of::<CBoxWith<Stack<X509, Borrowed>, ElemFree>>(),
         size_of::<*mut stack_st>() + size_of::<ElemFree>(),

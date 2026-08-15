@@ -21,8 +21,7 @@
 //! | Type                | Owns                                  | Requires                  |
 //! |---------------------|---------------------------------------|---------------------------|
 //! | [`CBox<T>`]         | heap object, sole owner **or** refcount share | `T: CDropped + CCell` |
-//! | [`CBoxWith<T, D>`]  | the same, plus teardown state `D`; fat unless `D` is a ZST | `D: CDropper<T>` |
-//! | [`CBoxUninit<T>`]   | an allocated, not-yet-initialised slot | `T: CDroppedUninit + CCell` |
+//! | [`CBoxWith<T, D>`]  | the same, plus teardown state `D`; fat unless `D` is a ZST. Also the construction-phase handle: hold the allocation under a storage-only `D`, then [`into_box`](CBoxWith::into_box). | `D: CDropper<T>` |
 //! | [`CVoidBox<D>`]     | a type-erased `void *`                 | `D: CDropped`             |
 //! | [`CrustifyStr<D>`]  | a NUL-terminated `char *`              | `D: CDropped`             |
 //! | [`CVec<T, S>`]      | a length-aware buffer                  | `S: CLenDropped`          |
@@ -33,13 +32,40 @@
 //! pointer" — whether it is exclusive or one share of a refcount depends only
 //! on which C routines you register: a `*_free` and a `*_dup` make it
 //! exclusive, a down-ref and an `up_ref` make it shared. There is no `CArc`,
-//! because it would do nothing differently: no handle hands out `&mut T`
-//! (mutation goes through the raw pointer and the [`CCell`] layer), so an
-//! aliased and a sole-owner handle have identical capabilities.
+//! because it would do nothing differently: every handle reaches the object
+//! through a raw pointer, so an aliased and a sole-owner handle have identical
+//! capabilities.
 //!
 //! [`CBox`] is layout-compatible with `*mut T`, and so is `Option<CBox<T>>` via
 //! the [`NonNull`](core::ptr::NonNull) niche, so it substitutes for a raw
 //! pointer field in a `#[repr(C)]` struct.
+//!
+//! ## Access: the three types per C type
+//!
+//! **No reference to a wrapped C object is ever formed.** A `&Wrapper` over the
+//! object's bytes asserts `noalias` / `readonly` / validity over memory C may
+//! write through a pointer it kept, so access goes through handles that hold
+//! the pointer by value:
+//!
+//! | Type | Size | Role |
+//! |------|------|------|
+//! | `Foo` (= [`CType<ffi::foo>`]) | the C struct's | layout: embeds by value in a `#[repr(C)]` mirror, and is what [`CBox`] points at |
+//! | `FooRef<'a>` | one pointer | shared borrow; `Copy`; the getters |
+//! | `FooMut<'a>` | one pointer | exclusive borrow; derefs to `FooRef<'a>`, adds the setters |
+//!
+//! [`define_ctype!`] emits all three plus the [`CCell`] impl linking them.
+//! `&FooRef` covers the handle — one pointer of Rust-owned stack — so `&self` /
+//! `&mut self` methods are sound on it, and passing `&mut FooRef` reborrows
+//! implicitly the way `&mut T` does. Field access projects a raw pointer out of
+//! the handle and goes through `addr_of!` / `addr_of_mut!`.
+//!
+//! Owning handles reach the borrowed ones with [`as_ref`](CBox::as_ref) /
+//! [`as_mut`](CBox::as_mut) rather than `Deref`: `Deref::Target` cannot name a
+//! lifetime taken from `&self`, and a handle carries one.
+//!
+//! [`CType<T>`] is `T` plus `PhantomPinned`. Address-sensitivity is independent
+//! of aliasing — a self-referential struct, or one C recorded in a list, must
+//! not move regardless of who holds a reference.
 //!
 //! ## The lifecycle traits
 //!
@@ -51,7 +77,6 @@
 //! |----------------------|--------------------------------------------------------|
 //! | [`CDropped`]         | `c_drop` — a `*_free` **or** the refcount down-ref     |
 //! | [`CCloned`]          | `c_clone` — a `*_dup` **or** the `up_ref`              |
-//! | [`CDroppedUninit`]   | `c_drop_uninit` — pre-init storage-only free           |
 //! | [`CValued`]          | `c_dispose` — dispose fields, leave the header         |
 //! | [`CLenDropped`]      | `c_drop_len(ptr, byte_len)` on a buffer strategy       |
 //! | [`CLenCloned`]       | `c_clone_len` — the buffer memdup                      |
@@ -60,7 +85,7 @@
 //! ## Quick example
 //!
 //! ```ignore
-//! use crustify_prim::{CBox, define_type, impl_cloned, impl_dropped};
+//! use crustify_prim::{CBox, define_ctype, impl_cloned, impl_dropped};
 //!
 //! mod ffi {
 //!     #[repr(C)]
@@ -74,7 +99,7 @@
 //!
 //! // `FOO_free` is a down-ref, so registering it as the destructor and
 //! // `FOO_up_ref` as the clone makes `CBox<Foo>` a refcounted share.
-//! define_type!(Foo, ffi::foo_st);
+//! define_ctype!(Foo, FooRef, FooMut, ffi::foo_st);
 //! impl_dropped!(Foo, ffi::foo_st, ffi::FOO_free);
 //! impl_cloned!(Foo, ffi::foo_st, up_ref = ffi::FOO_up_ref);
 //!
@@ -114,11 +139,7 @@ pub mod c_out {
 }
 
 // Re-export the primary items at the crate root for convenience.
-pub use crate::borrowed_refs::{COut, SelfPtr};
-pub use crate::c_type::{CCell, CType};
-pub use crate::owned_refs::{
-    CBox, CBoxUninit, CBoxWith, CVal, CValGuard, CVec, CVoidBox, CrustifyStr,
-};
-pub use crate::traits::{
-    CCloned, CCloner, CDropped, CDroppedUninit, CDropper, CLenCloned, CLenDropped, CValued,
-};
+pub use crate::borrowed_refs::COut;
+pub use crate::c_type::{CCell, CPtr, CType};
+pub use crate::owned_refs::{CBox, CBoxWith, CVal, CValGuard, CVec, CVoidBox, CrustifyStr};
+pub use crate::traits::{CCloned, CCloner, CDropped, CDropper, CLenCloned, CLenDropped, CValued};

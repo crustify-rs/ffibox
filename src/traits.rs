@@ -15,10 +15,11 @@
 //! differ only in *which C routine* you register, not in the handle type. See
 //! [`CCloned`] for the two mechanisms it spans.
 //!
-//! Alongside: [`CValued`] (by-value dispose), [`CDroppedUninit`] (pre-init
-//! storage free), [`CLenDropped`] / [`CLenCloned`] (length-aware buffer
-//! strategies), and the `*With` strategy traits [`CDropper`] / [`CCloner`]
-//! (for the owners that carry their teardown policy as a value).
+//! Alongside: [`CValued`] (by-value dispose), [`CLenDropped`] / [`CLenCloned`]
+//! (length-aware buffer strategies), and the `*With` strategy traits
+//! [`CDropper`] / [`CCloner`] — which also carry the construction phase, a
+//! storage-only [`CDropper`] holding the allocation until
+//! [`CBoxWith::into_box`] promotes it.
 
 use core::ptr::NonNull;
 
@@ -27,7 +28,7 @@ use core::ptr::NonNull;
 #[allow(unused_imports)]
 use crate::c_type::CCell;
 #[allow(unused_imports)]
-use crate::owned_refs::{CBox, CBoxUninit, CBoxWith, CVal, CVec};
+use crate::owned_refs::{CBox, CBoxWith, CVal, CVec};
 
 // ===========================================================================
 // Base lifecycle grid (drop/clone x exclusive/shared) + refcount unifier,
@@ -72,31 +73,6 @@ pub unsafe trait CDropped {
     ///
     /// `obj` must point to a live, uniquely-owned instance of `Self`.
     unsafe fn c_drop(obj: NonNull<Self>);
-}
-
-/// Storage-only release for the **not-yet-formed** phase: the raw deallocator
-/// paired with the byte-level allocator (`git__free` for `git__malloc`), which
-/// frees only that allocation and never touches fields — they are not
-/// initialised yet. [`CBoxUninit`] runs it on `Drop`, so a construction failure
-/// before [`assume_init`](CBoxUninit::assume_init) unwinds via RAII instead of
-/// leaking.
-///
-/// Distinct from [`CDropped::c_drop`], the *formed*-phase teardown that also
-/// disposes fields (or down-refs). A heap type implements both.
-///
-/// # Safety
-///
-/// [`c_drop_uninit`](Self::c_drop_uninit) must release exactly the raw
-/// allocation and run **no** field teardown, so that calling it on an
-/// allocated-but-uninitialised slot is sound.
-pub unsafe trait CDroppedUninit {
-    /// Free the raw storage at `obj`, running **no** field cleanup.
-    ///
-    /// # Safety
-    ///
-    /// `obj` must be a live allocation from this type's byte-level allocator,
-    /// not yet freed or consumed, with no other live alias.
-    unsafe fn c_drop_uninit(obj: NonNull<Self>);
 }
 
 /// Teardown for a C type Rust owns **by value**: disposes owned resources

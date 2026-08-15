@@ -19,27 +19,21 @@
 //! pointer field in a `#[repr(C)]` struct. [`CVec<T, S>`] stores pointer +
 //! count and is not.
 //!
-//! ## Uninit construction handles
+//! ## Construction-phase teardown
 //!
-//! [`CBoxUninit<T>`] models the allocated-but-uninitialised phase. Its `Drop`
-//! runs the storage-only [`CDroppedUninit::c_drop_uninit`], never
-//! [`CDropped::c_drop`] — a real destructor over fields with no valid bit
-//! pattern is UB. So a construction failure before `assume_init` is plain RAII:
-//! bail with `?` and the allocation is reclaimed. Both
-//! [`assume_init`](CBoxUninit::assume_init) and
-//! [`into_raw_uninit`](CBoxUninit::into_raw_uninit) `mem::forget` the handle so
-//! the storage-only free never runs on a graduated object.
+//! An allocation being filled in by Rust is held as
+//! [`CBoxWith<T, D>`] with a storage-only `D`, then promoted with
+//! [`into_box`](CBoxWith::into_box) once the object is formed — a one-way type
+//! change, so a half-built object cannot reach code expecting a finished one.
+//! Bail with `?` before promoting and `D`'s teardown reclaims the allocation
+//! without running the real destructor over fields that are not there yet.
 
 use core::fmt;
 use core::marker::PhantomData;
-use core::mem::MaybeUninit;
-use core::ops::Deref;
 use core::ptr::NonNull;
 
 use crate::c_type::{CCell, CType};
-use crate::traits::{
-    CCloned, CCloner, CDropped, CDroppedUninit, CDropper, CLenCloned, CLenDropped, CValued,
-};
+use crate::traits::{CCloned, CCloner, CDropped, CDropper, CLenCloned, CLenDropped, CValued};
 
 // ---------------------------------------------------------------------------
 // Abort helper — portable across std and no_std builds
@@ -108,15 +102,38 @@ impl<T: CValued + CCell> CVal<T> {
 
 impl<T: CValued + CCell> fmt::Debug for CVal<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("CVal").field(&self.inner.as_ptr()).finish()
+        f.debug_tuple("CVal")
+            .field(&core::ptr::addr_of!(self.inner))
+            .finish()
     }
 }
 
-impl<T: CValued + CCell> Deref for CVal<T> {
-    type Target = T;
+impl<T: CValued + CCell> CVal<T> {
+    /// Shared handle to the inline value.
+    ///
+    /// `&self` / `&mut self` gate read against write here the ordinary Rust
+    /// way, because `CVal` owns the storage: the pointer is taken with
+    /// `addr_of!` / `addr_of_mut!`, so no reference to `T` is formed and the
+    /// write provenance comes from the exclusive borrow.
     #[inline]
-    fn deref(&self) -> &T {
-        &self.inner
+    #[must_use]
+    pub fn as_ref(&self) -> T::Ref<'_> {
+        // SAFETY: `self.inner` is a live, initialised `T` we own inline, and
+        // the handle is bound to this borrow.
+        unsafe {
+            T::ref_from_raw(NonNull::new_unchecked(
+                core::ptr::addr_of!(self.inner).cast_mut(),
+            ))
+        }
+    }
+
+    /// Exclusive handle to the inline value.
+    #[inline]
+    #[must_use]
+    pub fn as_mut(&mut self) -> T::Mut<'_> {
+        // SAFETY: as `as_ref`, from an exclusive borrow, so the pointer carries
+        // write provenance and no other handle can coexist.
+        unsafe { T::mut_from_raw(NonNull::new_unchecked(core::ptr::addr_of_mut!(self.inner))) }
     }
 }
 
@@ -201,12 +218,22 @@ impl<T: CValued + CCell> fmt::Debug for CValGuard<'_, T> {
     }
 }
 
-impl<'a, T: CValued + CCell> Deref for CValGuard<'a, T> {
-    type Target = T;
+impl<'a, T: CValued + CCell> CValGuard<'a, T> {
+    /// Shared handle to the guarded value.
     #[inline]
-    fn deref(&self) -> &T {
-        // SAFETY: `ptr` borrows a live, initialised `T` for `'a`.
-        unsafe { self.ptr.as_ref() }
+    #[must_use]
+    pub fn as_ref(&self) -> T::Ref<'_> {
+        // SAFETY: `ptr` borrows a live, initialised `T` for `'a`; the handle is
+        // bound to this borrow, which is shorter.
+        unsafe { T::ref_from_raw(self.ptr) }
+    }
+
+    /// Exclusive handle to the guarded value.
+    #[inline]
+    #[must_use]
+    pub fn as_mut(&mut self) -> T::Mut<'_> {
+        // SAFETY: as `as_ref`, from an exclusive borrow of the guard.
+        unsafe { T::mut_from_raw(self.ptr) }
     }
 }
 
@@ -285,13 +312,27 @@ impl<T: CDropped + CCell> Drop for CBox<T> {
     }
 }
 
-impl<T: CDropped + CCell> Deref for CBox<T> {
-    type Target = T;
-
+impl<T: CDropped + CCell> CBox<T> {
+    /// Shared handle to the owned object — `Copy`, getters only.
+    ///
+    /// Not `Deref`: `Deref::Target` cannot name a lifetime taken from `&self`,
+    /// and the handle must carry one. The cost is one call; the gain is that no
+    /// reference to `T` is ever formed.
     #[inline]
-    fn deref(&self) -> &T {
-        // SAFETY: `self.ptr` is non-null and points to a live `T`.
-        unsafe { self.ptr.as_ref() }
+    #[must_use]
+    pub fn as_ref(&self) -> T::Ref<'_> {
+        // SAFETY: `self.ptr` is non-null and addresses a live `T` we own; the
+        // handle is bound to this borrow.
+        unsafe { T::ref_from_raw(self.ptr) }
+    }
+
+    /// Exclusive handle to the owned object — setters live here.
+    #[inline]
+    #[must_use]
+    pub fn as_mut(&mut self) -> T::Mut<'_> {
+        // SAFETY: as `as_ref`, from an exclusive borrow, so no other handle to
+        // this object can coexist.
+        unsafe { T::mut_from_raw(self.ptr) }
     }
 }
 
@@ -340,137 +381,6 @@ impl<T: CDropped + CCell> fmt::Debug for CBox<T> {
 }
 
 impl<T: CDropped + CCell> fmt::Pointer for CBox<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Pointer::fmt(&self.ptr.as_ptr(), f)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// CBoxUninit<T> — construction-phase handle (pre-initialisation)
-// ---------------------------------------------------------------------------
-
-/// Exclusive ownership of an allocated slot that does **not yet** hold a valid
-/// `T` — the type-level signal for "allocated but not initialised", one rung
-/// below [`CBox<T>`], whose contract requires a fully-formed pointee.
-///
-/// For a Rust-driven construction sequence against a C allocator: allocate raw
-/// memory, [`from_raw_uninit`](Self::from_raw_uninit), fill fields through
-/// [`as_mut_ptr`](Self::as_mut_ptr), then [`assume_init`](Self::assume_init) to
-/// promote — which swaps the storage-only teardown for the full one.
-///
-/// `Drop` runs [`CDroppedUninit::c_drop_uninit`], never `T::c_drop`: the real
-/// destructor inspects fields (sub-pointers, refcount cells) that do not yet
-/// hold valid bit patterns. See the [module docs](self#uninit-construction-handles).
-#[repr(transparent)]
-#[must_use = "a CBoxUninit should be consumed via `assume_init` (once the slot \
-              has been initialised) or `into_raw_uninit`; dropping it runs the \
-              storage-only `c_drop_uninit`, reclaiming the allocation but \
-              discarding the partially-built object"]
-pub struct CBoxUninit<T: CDroppedUninit + CCell> {
-    ptr: NonNull<T>,
-}
-
-impl<T: CDroppedUninit + CCell> CBoxUninit<T> {
-    /// Wrap a freshly-allocated, potentially-uninitialised slot; `None` if
-    /// null. `ptr` is typed `*mut MaybeUninit<T>` so the call site shows the
-    /// pointee is not yet a valid `T`.
-    ///
-    /// # Safety
-    ///
-    /// - `ptr` must be a valid allocation matching `T`'s size and alignment,
-    ///   typically from a C allocator (`CRYPTO_zalloc`, `malloc`, `kmalloc`).
-    /// - No other handle, Rust or C-side, may alias it.
-    /// - The caller must either initialise the slot and
-    ///   [`assume_init`](Self::assume_init), or free the allocation after
-    ///   [`into_raw_uninit`](Self::into_raw_uninit).
-    #[inline]
-    pub unsafe fn from_raw_uninit(ptr: *mut MaybeUninit<T>) -> Option<Self> {
-        // SAFETY: MaybeUninit<T> has the same layout as T, so the cast is
-        // sound. We then re-wrap the non-null pointer.
-        NonNull::new(ptr.cast::<T>()).map(|ptr| Self { ptr })
-    }
-
-    /// Raw pointer to the slot for in-place initialisation — C init functions
-    /// or raw field projections. Valid until the handle is consumed.
-    #[inline]
-    #[must_use]
-    pub fn as_mut_ptr(&mut self) -> *mut T {
-        self.ptr.as_ptr()
-    }
-
-    /// Consume the handle, asserting the slot now holds a valid `T`.
-    ///
-    /// # Safety
-    ///
-    /// All of `T`'s validity invariants must hold for the slot's bytes, as
-    /// must every invariant the C library expects — including any state
-    /// `T::c_drop` reads (sub-allocations, refcount cells). The returned
-    /// [`CBox<T>`] will run it on drop, which is UB on a partial `T`.
-    #[inline]
-    pub unsafe fn assume_init(self) -> CBox<T>
-    where
-        T: CDropped,
-    {
-        let ptr = self.ptr;
-        // `mem::forget` suppresses the storage-only `Drop`; ownership of the now
-        // fully-formed object passes to `CBox`, whose `Drop` runs `T::c_drop`.
-        core::mem::forget(self);
-        CBox { ptr }
-    }
-
-    /// Consume the handle and return the pointer, running no cleanup. Typed
-    /// `*mut MaybeUninit<T>` to make the absent validity claim explicit; the
-    /// caller must free the allocation.
-    ///
-    /// For a construction error path where the slot is incomplete, so
-    /// `assume_init` would be unsound and the allocator's free must run
-    /// directly.
-    #[inline]
-    #[must_use = "the returned pointer owns the allocation; it must be freed"]
-    pub fn into_raw_uninit(self) -> *mut MaybeUninit<T> {
-        let ptr = self.ptr.as_ptr().cast::<MaybeUninit<T>>();
-        core::mem::forget(self);
-        ptr
-    }
-}
-
-// `T: CCell` makes `&T` over a not-yet-formed slot sound (`MaybeUninit`
-// suppresses the validity invariant, `UnsafeCell` the `noalias`), so
-// construction code can initialise fields through the same interior-mutable
-// `&self` accessors a formed `CBox` uses. No `DerefMut`, ever. Reading a field
-// not yet written is still UB unless the allocator zeroed the slot.
-impl<T: CDroppedUninit + CCell> Deref for CBoxUninit<T> {
-    type Target = T;
-
-    #[inline]
-    fn deref(&self) -> &T {
-        // SAFETY: `T: CCell` ⇒ transparent over `UnsafeCell<MaybeUninit<_>>`,
-        // valid for any bit pattern, so `&T` over the slot is sound.
-        unsafe { self.ptr.as_ref() }
-    }
-}
-
-impl<T: CDroppedUninit + CCell> Drop for CBoxUninit<T> {
-    /// Storage-only cleanup for an unconsumed handle — no field teardown, since
-    /// the slot may be partial. `assume_init` / `into_raw_uninit` forget the
-    /// handle, so this never double-frees a graduated object.
-    #[inline]
-    fn drop(&mut self) {
-        // SAFETY: per `from_raw_uninit`, `self.ptr` is a live, uniquely-owned
-        // allocation, and consumers forget us rather than reaching here.
-        unsafe { T::c_drop_uninit(self.ptr) }
-    }
-}
-
-impl<T: CDroppedUninit + CCell> fmt::Debug for CBoxUninit<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("CBoxUninit")
-            .field(&self.ptr.as_ptr())
-            .finish()
-    }
-}
-
-impl<T: CDroppedUninit + CCell> fmt::Pointer for CBoxUninit<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Pointer::fmt(&self.ptr.as_ptr(), f)
     }
@@ -618,7 +528,7 @@ impl<D: CDropped> CrustifyStr<D> {
     #[inline]
     #[must_use]
     pub fn as_ptr(&self) -> *const core::ffi::c_char {
-        CType::cast_into(self.ptr.as_ptr()).cast_const()
+        CType::cast_into(self.ptr.as_ptr())
     }
 
     /// Consume without freeing, surrendering the raw `*mut c_char`. Reclaim it
@@ -627,7 +537,7 @@ impl<D: CDropped> CrustifyStr<D> {
     #[inline]
     #[must_use = "the returned pointer owns the string and must be freed"]
     pub fn into_raw(self) -> *mut core::ffi::c_char {
-        let ptr = CType::cast_into(self.ptr.as_ptr());
+        let ptr = CType::cast_into_mut(self.ptr.as_ptr());
         core::mem::forget(self);
         ptr
     }
@@ -969,13 +879,44 @@ impl<T: CCell, D: CDropper<T>> Drop for CBoxWith<T, D> {
     }
 }
 
-impl<T: CCell, D: CDropper<T>> Deref for CBoxWith<T, D> {
-    type Target = T;
-
+impl<T: CCell, D: CDropper<T>> CBoxWith<T, D> {
+    /// Shared handle to the owned object. See [`CBox::as_ref`].
     #[inline]
-    fn deref(&self) -> &T {
-        // SAFETY: `self.ptr` is non-null and points to a live `T`.
-        unsafe { self.ptr.as_ref() }
+    #[must_use]
+    pub fn as_ref(&self) -> T::Ref<'_> {
+        // SAFETY: `self.ptr` is non-null and addresses a live `T` we own.
+        unsafe { T::ref_from_raw(self.ptr) }
+    }
+
+    /// Exclusive handle to the owned object. See [`CBox::as_mut`].
+    #[inline]
+    #[must_use]
+    pub fn as_mut(&mut self) -> T::Mut<'_> {
+        // SAFETY: as `as_ref`, from an exclusive borrow.
+        unsafe { T::mut_from_raw(self.ptr) }
+    }
+
+    /// Promote to a [`CBox<T>`], swapping this handle's teardown for `T`'s own.
+    ///
+    /// The construction-phase move: hold the allocation under a storage-only
+    /// `D` while filling it, then hand it to the full destructor once formed.
+    /// One-way, and a type change, so a half-built object cannot reach code
+    /// expecting a finished one.
+    ///
+    /// # Safety
+    ///
+    /// The object must satisfy every invariant `T::c_drop` relies on —
+    /// sub-allocations, refcount cells, anything the destructor reads.
+    #[inline]
+    pub unsafe fn into_box(self) -> CBox<T>
+    where
+        T: CDropped,
+    {
+        let ptr = self.ptr;
+        // `mem::forget` suppresses `D`'s teardown; the obligation passes to
+        // `CBox`, whose `Drop` runs `T::c_drop`.
+        core::mem::forget(self);
+        CBox { ptr }
     }
 }
 

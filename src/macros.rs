@@ -1,109 +1,210 @@
 //! Declarative macros defining safe wrapper types and registering lifecycle
 //! traits on them.
 //!
-//! [`define_type!`](crate::define_type) emits the `#[repr(transparent)]`
+//! [`define_ctype!`](crate::define_ctype) emits the `#[repr(transparent)]`
 //! newtype; the `impl_*!` macros bind a C routine to the matching trait:
 //! [`impl_dropped!`](crate::impl_dropped) (a `*_free` or a down-ref),
 //! [`impl_cloned!`](crate::impl_cloned) (a `*_dup` or an `up_ref`, named at the
-//! call site), [`impl_dropped_uninit!`](crate::impl_dropped_uninit) (the
-//! storage-only free), and [`impl_cvalued!`](crate::impl_cvalued) (a by-value
-//! dispose).
+//! call site), and [`impl_cvalued!`](crate::impl_cvalued) (a by-value dispose).
+//! The construction-phase storage free has no macro: write it as a ZST
+//! [`CDropper`](crate::CDropper) and hold the allocation in a
+//! [`CBoxWith`](crate::CBoxWith) until [`into_box`](crate::CBoxWith::into_box).
 
-/// Define a `#[repr(transparent)]` wrapper over a `*-sys` type, using
-/// [`CType<T>`](crate::c_type::CType).
-///
-/// Covers the trivial base case only — a plain `$name(CType<$c_type>)`.
-/// Newtypes with lifetime or type parameters (`BufMemBorrowed<'a>`,
-/// `Stack<T, S>`) are hand-written against
-/// [`CCell`](crate::c_type::CCell); native generics need no macro arm.
-///
-/// Generates the struct, `unsafe impl CCell for $name { type C = $c_type; }`
-/// — which provides the whole seam — and inherent forwarders (`as_ptr` /
-/// `from_ptr` / `uninit` / `zeroed`) so the seam is callable without importing
-/// `CCell`.
-///
-/// Every layer of `$name` → `CType<$c_type>` →
-/// `UnsafeCell<MaybeUninit<$c_type>>` → `$c_type` is `#[repr(transparent)]`,
-/// so `&$name` is ABI-identical to `*const $c_type`, the type embeds by value
-/// in a `#[repr(C)]` parent, and `Option<CBox<$name>>` is a niche `*mut
-/// $c_type`.
-///
-/// **No `Deref`**, and no accessor handing out `&$c_type`: such a reference
-/// re-introduces the `noalias` / `readonly` guarantees `CType`'s `UnsafeCell`
-/// exists to suppress (see [`CType`](crate::c_type), *Scope of `UnsafeCell`
-/// protection*). Project fields through raw pointers off `as_ptr()` inside
-/// typed accessors instead.
-///
-/// ## Example
+/// Define a wrapped `*-sys` type: the layout newtype plus its two borrowed
+/// handles.
 ///
 /// ```ignore
-/// use crustify_prim::define_type;
+/// define_ctype!(SslSession, SslSessionRef, SslSessionMut, ffi::ssl_session_st);
+/// ```
 ///
-/// mod libssl_sys {
-///     #[repr(C)]
-///     pub struct ssl_session_st { pub timeout: u64, /* ... */ }
-/// }
+/// All three names are spelled out because `macro_rules!` cannot concatenate
+/// identifiers; the order is layout, shared, exclusive.
 ///
-/// define_type! {
-///     /// Safe wrapper over the sys-crate `ssl_session_st` struct.
-///     SslSession, libssl_sys::ssl_session_st
-/// }
+/// # What it emits
 ///
-/// impl SslSession {
+/// | Item | Shape | Carries |
+/// |------|-------|---------|
+/// | `$name` | `#[repr(transparent)]` over `CType<$c_type>` | the C layout — embeds by value in a `#[repr(C)]` mirror, and is what `CBox` points at |
+/// | `$rf<'a>` | `#[repr(transparent)]` over `CPtr<'a, $name>`, `Copy` | the shared seam and **all getters** |
+/// | `$mt<'a>` | `#[repr(transparent)]` over `$rf<'a>` | `Deref` to `$rf`, plus the write seam and **all setters** |
+///
+/// plus the [`CCell`](crate::CCell) impl linking them.
+///
+/// # Where accessors go
+///
+/// Getters on `$rf<'a>` taking `&self`, setters on `$mt<'a>` taking
+/// `&mut self`. Both project a raw pointer out of the handle:
+///
+/// ```ignore
+/// impl SslSessionRef<'_> {
 ///     pub fn timeout(&self) -> u64 {
-///         // SAFETY: the struct was initialised by its C constructor before
-///         // any Rust read; the field is read through the raw pointer without
-///         // ever forming a `&ssl_session_st`.
-///         unsafe { (*self.as_ptr()).timeout }
+///         // SAFETY: read through the raw pointer; no reference to the C
+///         // object is formed, so nothing is asserted about its bytes.
+///         unsafe { core::ptr::addr_of!((*self.as_ptr()).timeout).read() }
+///     }
+/// }
+/// impl SslSessionMut<'_> {
+///     pub fn set_timeout(&mut self, v: u64) {
+///         unsafe { core::ptr::addr_of_mut!((*self.as_mut_ptr()).timeout).write(v) }
 ///     }
 /// }
 /// ```
 ///
-/// Attributes (doc comments, `cfg`, etc.) at the call site are forwarded
-/// onto the generated struct.
+/// **Never write an accessor on `$name` itself**, and never take `&$name` /
+/// `&mut $name`: those cover the C object's bytes and would assert `noalias` /
+/// `readonly` / validity over memory C may write. The handles cover one pointer
+/// of Rust stack instead. See the [`c_type`](crate::c_type) module docs.
+///
+/// # Safety
+///
+/// The macro is safe to invoke but emits an `unsafe impl`. You assert that
+/// `$c_type` is the C type `$name` mirrors, and that all-zero is a valid
+/// `$c_type` (see `zeroed` below).
 #[macro_export]
-macro_rules! define_type {
-    ($(#[$attr:meta])* $name:ident, $c_type:ty) => {
+macro_rules! define_ctype {
+    ($(#[$attr:meta])* $name:ident, $rf:ident, $mt:ident, $c_type:ty) => {
         $(#[$attr])*
         #[repr(transparent)]
         pub struct $name($crate::c_type::CType<$c_type>);
 
-        // SAFETY: the struct above is `#[repr(transparent)]` over
-        // `CType<$c_type>` — exactly the invariant `CCell` requires.
+        #[doc = concat!("Shared borrow of a [`", stringify!($name), "`]. `Copy`, like `&T`; the getters live here.")]
+        #[repr(transparent)]
+        #[derive(Clone, Copy)]
+        pub struct $rf<'a>($crate::c_type::CPtr<'a, $name>);
+
+        #[doc = concat!("Exclusive borrow of a [`", stringify!($name), "`]. Derefs to [`", stringify!($rf), "`] for the getters and adds the setters.")]
+        #[repr(transparent)]
+        pub struct $mt<'a>($rf<'a>);
+
+        // SAFETY: `$name` is `#[repr(transparent)]` over `CType<$c_type>`; the
+        // handles are transparent over `CPtr<'a, $name>` and expose no
+        // reference to `$name`; `$rf` has no write operation.
         unsafe impl $crate::c_type::CCell for $name {
             type C = $c_type;
-        }
+            type Ref<'a> = $rf<'a>;
+            type Mut<'a> = $mt<'a>;
 
-        // Forwarders so the seam works without importing `CCell`. The canonical
-        // docs and safety reasoning live on the `CCell` methods.
-        impl $name {
-            /// See [`CCell::as_ptr`](crate::CCell::as_ptr).
             #[inline]
-            pub fn as_ptr(&self) -> *mut $c_type {
-                self.0.get()
+            unsafe fn ref_from_raw<'a>(p: ::core::ptr::NonNull<Self>) -> $rf<'a> {
+                // SAFETY: caller upholds `ref_from_raw`'s contract.
+                $rf(unsafe { $crate::c_type::CPtr::new(p) })
             }
 
-            /// See [`CCell::from_ptr`](crate::CCell::from_ptr).
+            #[inline]
+            unsafe fn mut_from_raw<'a>(p: ::core::ptr::NonNull<Self>) -> $mt<'a> {
+                // SAFETY: caller upholds `mut_from_raw`'s contract.
+                $mt($rf(unsafe { $crate::c_type::CPtr::new(p) }))
+            }
+        }
+
+        impl $name {
+            /// Zero-initialise a value for inline storage
+            /// ([`CVal`](crate::CVal)) or a stack slot.
+            ///
+            /// Valid because `$c_type` is a bindgen `#[repr(C)]` struct over a
+            /// C header, which has no niche types — asserted by invoking
+            /// [`define_ctype!`](crate::define_ctype) on it.
+            #[inline]
+            #[must_use]
+            pub fn zeroed() -> Self {
+                // SAFETY: all-zero is a valid bit pattern for a bindgen C
+                // struct; see `define_ctype!`.
+                Self(unsafe { $crate::c_type::CType::zeroed() })
+            }
+        }
+
+        impl<'a> $rf<'a> {
+            /// Borrow a raw pointer; `None` if null.
             ///
             /// # Safety
             ///
-            /// `ptr` must point to a valid, initialised `$c_type` (or be null);
-            /// the returned reference must not outlive the object.
+            /// `ptr` must address a live, initialised `$c_type` (or be null)
+            /// that outlives `'a`.
             #[inline]
-            pub unsafe fn from_ptr<'a>(ptr: *mut $c_type) -> Option<&'a Self> {
-                // SAFETY: layout-preserving cast per `#[repr(transparent)]`.
-                unsafe { (ptr as *const Self).as_ref() }
+            pub unsafe fn from_ptr(ptr: *mut $c_type) -> ::core::option::Option<Self> {
+                // SAFETY: layout-preserving cast per `#[repr(transparent)]`;
+                // the caller upholds liveness and the lifetime.
+                ::core::ptr::NonNull::new(ptr.cast::<$name>())
+                    .map(|p| $rf(unsafe { $crate::c_type::CPtr::new(p) }))
             }
 
-            /// See [`CCell::uninit`](crate::CCell::uninit).
-            pub fn uninit() -> Self {
-                Self($crate::c_type::CType::uninit())
+            /// Read-only pointer to the C object, for FFI calls taking
+            /// `*const $c_type` and for field reads through `addr_of!`.
+            #[inline]
+            #[must_use]
+            pub fn as_ptr(&self) -> *const $c_type {
+                self.0.as_non_null().as_ptr().cast::<$c_type>()
             }
 
-            /// See [`CCell::zeroed`](crate::CCell::zeroed).
+            /// Type-erased `*const c_void`, for read-only `void *` shims.
             #[inline]
-            pub fn zeroed() -> Self {
-                Self($crate::c_type::CType::zeroed())
+            #[must_use]
+            pub fn as_void_ptr(&self) -> *const ::core::ffi::c_void {
+                self.as_ptr().cast()
+            }
+
+            /// Borrow a type-erased `void *` back; `None` if null. The inbound
+            /// dual of [`as_void_ptr`](Self::as_void_ptr), for C slots that
+            /// hand an opaque pointer back (`SSL_get_ex_data`, `BIO_get_data`,
+            /// a callback's `void *arg`). Ownership is not transferred.
+            ///
+            /// # Safety
+            ///
+            /// As [`from_ptr`](Self::from_ptr), plus: `ptr` must be the pointer
+            /// erased *from this very type*. Nothing in a `void *` records the
+            /// type, so one erased from another reconstitutes as confusion.
+            #[inline]
+            pub unsafe fn from_void_ptr(
+                ptr: *mut ::core::ffi::c_void,
+            ) -> ::core::option::Option<Self> {
+                // SAFETY: the caller asserts `ptr` addresses a live `$c_type`.
+                unsafe { Self::from_ptr(ptr.cast::<$c_type>()) }
+            }
+        }
+
+        impl<'a> $mt<'a> {
+            /// Borrow a raw pointer exclusively; `None` if null.
+            ///
+            /// # Safety
+            ///
+            /// As [`from_ptr`](Self::from_ptr), plus: no other handle to the
+            /// same object may be used while the result lives.
+            #[inline]
+            pub unsafe fn from_ptr(ptr: *mut $c_type) -> ::core::option::Option<Self> {
+                // SAFETY: caller upholds liveness, the lifetime and exclusivity.
+                ::core::ptr::NonNull::new(ptr.cast::<$name>())
+                    .map(|p| $mt($rf(unsafe { $crate::c_type::CPtr::new(p) })))
+            }
+
+            /// Writable pointer to the C object, for FFI calls taking
+            /// `*mut $c_type` and for field writes through `addr_of_mut!`.
+            #[inline]
+            #[must_use]
+            pub fn as_mut_ptr(&mut self) -> *mut $c_type {
+                self.0 .0.as_non_null().as_ptr().cast::<$c_type>()
+            }
+
+            /// Type-erased `*mut c_void`, for writing `void *` shims.
+            #[inline]
+            #[must_use]
+            pub fn as_mut_void_ptr(&mut self) -> *mut ::core::ffi::c_void {
+                self.as_mut_ptr().cast()
+            }
+
+            /// Reborrow shared, for passing where a getter-only handle is
+            /// wanted.
+            #[inline]
+            #[must_use]
+            pub fn as_ref(&self) -> $rf<'_> {
+                self.0
+            }
+        }
+
+        impl<'a> ::core::ops::Deref for $mt<'a> {
+            type Target = $rf<'a>;
+            #[inline]
+            fn deref(&self) -> &$rf<'a> {
+                &self.0
             }
         }
     };
@@ -140,50 +241,6 @@ macro_rules! impl_dropped {
             #[inline]
             unsafe fn c_drop(obj: ::core::ptr::NonNull<Self>) {
                 // SAFETY: caller upholds the `c_drop` contract.
-                unsafe { $free(obj.as_ptr() as *mut $c_type) }
-            }
-        }
-    };
-}
-
-/// Implement [`CDroppedUninit`](crate::CDroppedUninit), registering the
-/// byte-level storage free that [`CBoxUninit`](crate::CBoxUninit) runs to
-/// reclaim an allocation whose construction never completed. It must free only
-/// the storage, never fields — that is
-/// [`CDropped::c_drop`](crate::CDropped::c_drop)'s job on the formed handle.
-///
-/// The one-arg form uses an inherent `Self::free_uninit`; the three-arg form
-/// names the C deallocator, with `::core::ffi::c_void` as the cast type for a
-/// `void*`-taking free:
-///
-/// ```ignore
-/// impl_dropped_uninit!(GitOdb, ::core::ffi::c_void, ffi::git__free);
-/// ```
-///
-/// # Safety
-///
-/// The macro is safe to invoke but emits an `unsafe impl`. You assert that
-/// `$free` frees exactly the raw allocation and touches no fields.
-#[macro_export]
-macro_rules! impl_dropped_uninit {
-    ($name:ident) => {
-        // SAFETY: caller guarantees `free_uninit` is storage-only, with no
-        // field teardown.
-        unsafe impl $crate::traits::CDroppedUninit for $name {
-            #[inline]
-            unsafe fn c_drop_uninit(obj: ::core::ptr::NonNull<Self>) {
-                // SAFETY: caller upholds the `c_drop_uninit` contract.
-                unsafe { Self::free_uninit(obj.as_ptr()) }
-            }
-        }
-    };
-    ($name:ty, $c_type:ty, $free:path) => {
-        // SAFETY: caller guarantees `$free` frees the allocation and not its
-        // fields, and `$name` is layout-compatible with `*mut $c_type`.
-        unsafe impl $crate::traits::CDroppedUninit for $name {
-            #[inline]
-            unsafe fn c_drop_uninit(obj: ::core::ptr::NonNull<Self>) {
-                // SAFETY: caller upholds the `c_drop_uninit` contract.
                 unsafe { $free(obj.as_ptr() as *mut $c_type) }
             }
         }

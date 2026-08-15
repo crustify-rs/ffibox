@@ -19,8 +19,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use crustify_prim::{
-    impl_dropped, CBox, CCell, CCloned, CDropped, CDroppedUninit, CLenDropped, CVal, CValGuard,
-    CValued, CVec, CVoidBox,
+    impl_dropped, CBox, CCell, CCloned, CDropped, CLenDropped, CPtr, CVal, CValGuard, CValued,
+    CVec, CVoidBox,
 };
 
 // ---------------------------------------------------------------------------
@@ -55,7 +55,6 @@ fn lock(m: &'static Mutex<()>) -> MutexGuard<'static, ()> {
 static REFCOUNTED_UP_REF_CALLS: AtomicUsize = AtomicUsize::new(0);
 static REFCOUNTED_DOWN_REF_CALLS: AtomicUsize = AtomicUsize::new(0);
 static REFCOUNTED_FREED: AtomicUsize = AtomicUsize::new(0);
-static REFCOUNTED_UNINIT_FREED: AtomicUsize = AtomicUsize::new(0);
 
 #[repr(C)]
 struct Refcounted {
@@ -95,18 +94,6 @@ unsafe impl CDropped for Refcounted {
     }
 }
 
-// Uninit-phase storage free: a CBoxUninit dropped before `assume_init`
-// (construction failure) reclaims the raw allocation WITHOUT running the
-// down-ref `c_drop` (the refcount isn't established yet). For this Box-backed
-// fixture the storage is the whole object.
-// SAFETY: reclaims the leaked Box exactly once; no field teardown.
-unsafe impl CDroppedUninit for Refcounted {
-    unsafe fn c_drop_uninit(obj: NonNull<Self>) {
-        REFCOUNTED_UNINIT_FREED.fetch_add(1, Ordering::SeqCst);
-        drop(unsafe { Box::from_raw(obj.as_ptr()) });
-    }
-}
-
 fn make_refcounted() -> CBox<Refcounted> {
     let leaked = Box::into_raw(Box::new(Refcounted { rc: Cell::new(1) }));
     // SAFETY: `leaked` is non-null and represents one outstanding refcount.
@@ -121,16 +108,16 @@ fn refcounted_cbox_clone_calls_up_ref() {
     REFCOUNTED_FREED.store(0, Ordering::SeqCst);
 
     let a = make_refcounted();
-    assert_eq!(a.rc.get(), 1);
+    assert_eq!(a.as_ref().rc().get(), 1);
 
     let b = a.clone();
     assert_eq!(REFCOUNTED_UP_REF_CALLS.load(Ordering::SeqCst), 1);
-    assert_eq!(a.rc.get(), 2);
-    assert_eq!(b.rc.get(), 2);
+    assert_eq!(a.as_ref().rc().get(), 2);
+    assert_eq!(b.as_ref().rc().get(), 2);
 
     let c = b.clone();
     assert_eq!(REFCOUNTED_UP_REF_CALLS.load(Ordering::SeqCst), 2);
-    assert_eq!(c.rc.get(), 3);
+    assert_eq!(c.as_ref().rc().get(), 3);
 
     // Pointers should all be equal (same object, just more refs).
     assert_eq!(a.as_ptr(), b.as_ptr());
@@ -218,18 +205,18 @@ fn make_saturating() -> CBox<Saturating> {
 #[test]
 fn try_clone_succeeds_below_overflow() {
     let a = make_saturating();
-    assert_eq!(a.rc.get(), 1);
+    assert_eq!(a.as_ref().rc().get(), 1);
 
     let b = a.try_clone().expect("try_clone should succeed below MAX");
-    assert_eq!(a.rc.get(), 2);
+    assert_eq!(a.as_ref().rc().get(), 2);
     assert_eq!(a.as_ptr(), b.as_ptr()); // same object
 
     let c = a.try_clone().expect("try_clone should succeed at MAX-1");
-    assert_eq!(a.rc.get(), 3);
+    assert_eq!(a.as_ref().rc().get(), 3);
 
     drop(b);
     drop(c);
-    assert_eq!(a.rc.get(), 1);
+    assert_eq!(a.as_ref().rc().get(), 1);
 }
 
 #[test]
@@ -248,7 +235,7 @@ fn try_clone_returns_none_on_overflow() {
     );
 
     // Object is still live and its refcount is unchanged.
-    assert_eq!(a.rc.get(), SATURATING_MAX);
+    assert_eq!(a.as_ref().rc().get(), SATURATING_MAX);
 }
 
 #[test]
@@ -264,9 +251,9 @@ fn try_clone_none_does_not_create_phantom_handle() {
     // If try_clone had created a phantom handle the Drop would decrement
     // one extra time, going below zero and corrupting the counter.
     drop(_c);
-    assert_eq!(a.rc.get(), 2);
+    assert_eq!(a.as_ref().rc().get(), 2);
     drop(_b);
-    assert_eq!(a.rc.get(), 1);
+    assert_eq!(a.as_ref().rc().get(), 1);
     // `a` drops last — object is freed.
 }
 
@@ -275,7 +262,6 @@ fn try_clone_none_does_not_create_phantom_handle() {
 // ---------------------------------------------------------------------------
 
 static BOXED_FREE_CALLS: AtomicUsize = AtomicUsize::new(0);
-static BOXED_UNINIT_FREE_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[repr(C)]
 struct Boxed {
@@ -299,17 +285,6 @@ unsafe impl CDropped for Boxed {
     }
 }
 
-// Uninit-phase storage free: a CBoxUninit dropped before `assume_init` reclaims
-// the raw allocation without `c_drop`'s field teardown (here the fields are
-// inline, so storage-free is the whole reclaim).
-// SAFETY: reclaims the leaked Box exactly once; no field teardown.
-unsafe impl CDroppedUninit for Boxed {
-    unsafe fn c_drop_uninit(obj: NonNull<Self>) {
-        BOXED_UNINIT_FREE_CALLS.fetch_add(1, Ordering::SeqCst);
-        drop(unsafe { Box::from_raw(obj.as_ptr()) });
-    }
-}
-
 fn make_boxed(should_free: bool) -> CBox<Boxed> {
     let leaked = Box::into_raw(Box::new(Boxed {
         payload: 42,
@@ -325,7 +300,7 @@ fn cbox_drop_calls_c_drop() {
     BOXED_FREE_CALLS.store(0, Ordering::SeqCst);
 
     let b = make_boxed(true);
-    assert_eq!(b.payload, 42);
+    assert_eq!(b.as_ref().payload(), 42);
     drop(b);
     assert_eq!(BOXED_FREE_CALLS.load(Ordering::SeqCst), 1);
 }
@@ -429,8 +404,8 @@ fn cbox_clone_invokes_c_clone_and_produces_independent_handle() {
     assert_eq!(DUPABLE_DUP_CALLS.load(Ordering::SeqCst), 1);
     // Distinct allocations — deep clone, not refcount bump.
     assert_ne!(a.as_ptr(), b.as_ptr());
-    assert_eq!(a.payload, 123);
-    assert_eq!(b.payload, 123);
+    assert_eq!(a.as_ref().payload(), 123);
+    assert_eq!(b.as_ref().payload(), 123);
 
     // Each handle owns its own allocation: dropping both calls c_drop twice.
     drop(a);
@@ -447,7 +422,7 @@ fn cbox_try_clone_succeeds_returns_some() {
 
     let a = make_dupable(7);
     let b = a.try_clone().expect("c_clone success path must yield Some");
-    assert_eq!(b.payload, 7);
+    assert_eq!(b.as_ref().payload(), 7);
     assert_ne!(a.as_ptr(), b.as_ptr());
 
     drop(a);
@@ -469,7 +444,7 @@ fn cbox_try_clone_returns_none_on_c_clone_failure() {
         "try_clone must propagate c_clone failure"
     );
     // Original handle is still live and untouched.
-    assert_eq!(a.payload, 99);
+    assert_eq!(a.as_ref().payload(), 99);
 
     drop(a);
     // Only the original is freed — failed clone did not produce a handle.
@@ -595,113 +570,6 @@ fn cvec_is_ptr_plus_usize() {
 }
 
 // ---------------------------------------------------------------------------
-// CBoxUninit — construction-phase handle for owned objects (storage-free Drop; CCell Deref)
-// ---------------------------------------------------------------------------
-
-use core::mem::MaybeUninit;
-use crustify_prim::CBoxUninit;
-
-#[test]
-fn cboxuninit_from_raw_null_returns_none() {
-    let v: Option<CBoxUninit<Boxed>> =
-        unsafe { CBoxUninit::from_raw_uninit(core::ptr::null_mut()) };
-    assert!(v.is_none());
-}
-
-#[test]
-fn cboxuninit_is_pointer_sized() {
-    assert_eq!(
-        core::mem::size_of::<CBoxUninit<Boxed>>(),
-        core::mem::size_of::<*mut Boxed>(),
-    );
-    assert_eq!(
-        core::mem::size_of::<Option<CBoxUninit<Boxed>>>(),
-        core::mem::size_of::<*mut Boxed>(),
-    );
-}
-
-#[test]
-fn cboxuninit_assume_init_promotes_and_c_drop_runs_once() {
-    let _guard = lock(&BOXED_LOCK);
-    BOXED_FREE_CALLS.store(0, Ordering::SeqCst);
-
-    // Simulate a C allocator returning fresh uninit memory.
-    let alloc: *mut MaybeUninit<Boxed> = Box::into_raw(Box::new(MaybeUninit::<Boxed>::uninit()));
-
-    let mut uninit = unsafe { CBoxUninit::from_raw_uninit(alloc) }.unwrap();
-
-    // Initialise via raw pointer projection.
-    unsafe {
-        core::ptr::write(
-            uninit.as_mut_ptr(),
-            Boxed {
-                payload: 7,
-                should_free: true,
-            },
-        );
-    }
-
-    let boxed: CBox<Boxed> = unsafe { uninit.assume_init() };
-    assert_eq!(boxed.payload, 7);
-    assert_eq!(BOXED_FREE_CALLS.load(Ordering::SeqCst), 0);
-
-    drop(boxed);
-    assert_eq!(
-        BOXED_FREE_CALLS.load(Ordering::SeqCst),
-        1,
-        "c_drop must run exactly once after assume_init + drop"
-    );
-}
-
-#[test]
-fn cboxuninit_drop_does_not_call_c_drop() {
-    let _guard = lock(&BOXED_LOCK);
-    // Dropping the uninit handle without consuming it reclaims the storage via
-    // `c_drop_uninit` (RAII on construction failure) but MUST NOT call `c_drop`
-    // — the slot is not fully initialised, so its field teardown is unsound.
-    BOXED_FREE_CALLS.store(0, Ordering::SeqCst);
-    BOXED_UNINIT_FREE_CALLS.store(0, Ordering::SeqCst);
-
-    let alloc: *mut MaybeUninit<Boxed> = Box::into_raw(Box::new(MaybeUninit::<Boxed>::uninit()));
-
-    {
-        let uninit = unsafe { CBoxUninit::from_raw_uninit(alloc) }.unwrap();
-        drop(uninit);
-        // `Drop` reclaimed `alloc` via `c_drop_uninit`; freeing it again would
-        // double-free.
-    }
-
-    assert_eq!(
-        BOXED_FREE_CALLS.load(Ordering::SeqCst),
-        0,
-        "CBoxUninit::drop must NOT call c_drop (slot not fully initialised)"
-    );
-    assert_eq!(
-        BOXED_UNINIT_FREE_CALLS.load(Ordering::SeqCst),
-        1,
-        "CBoxUninit::drop must reclaim storage via c_drop_uninit exactly once"
-    );
-}
-
-#[test]
-fn cboxuninit_into_raw_uninit_releases_pointer() {
-    let _guard = lock(&BOXED_LOCK);
-    BOXED_FREE_CALLS.store(0, Ordering::SeqCst);
-
-    let alloc: *mut MaybeUninit<Boxed> = Box::into_raw(Box::new(MaybeUninit::<Boxed>::uninit()));
-    let uninit = unsafe { CBoxUninit::from_raw_uninit(alloc) }.unwrap();
-    let raw = uninit.into_raw_uninit();
-    assert_eq!(
-        raw, alloc,
-        "into_raw_uninit must return the original pointer"
-    );
-    assert_eq!(BOXED_FREE_CALLS.load(Ordering::SeqCst), 0);
-
-    // Caller is responsible for reclaiming.
-    drop(unsafe { Box::from_raw(raw) });
-}
-
-// ---------------------------------------------------------------------------
 // CValued — by-value owned resource, exercised by CVal
 // ---------------------------------------------------------------------------
 
@@ -740,7 +608,7 @@ fn cvalue_drop_calls_c_dispose_once() {
         should_dispose: true,
     });
     // Deref reaches the inner value's fields.
-    assert_eq!(v.payload, 7);
+    assert_eq!(v.as_ref().payload(), 7);
     drop(v);
     assert_eq!(VALUED_DROP_CALLS.load(Ordering::SeqCst), 1);
 }
@@ -793,7 +661,7 @@ fn cvalguard_disposes_in_place_unless_dismissed() {
     {
         // SAFETY: `embedded` is live and initialised; we accept in-place dispose.
         let g = unsafe { CValGuard::new(&mut embedded) };
-        assert_eq!(g.payload, 9); // Deref reaches the borrowed value
+        assert_eq!(g.as_ref().payload(), 9); // Deref reaches the borrowed value
         g.dismiss();
     }
     assert_eq!(
@@ -947,31 +815,70 @@ fn cown_is_repr_transparent_voidptr() {
     drop(own);
 }
 
-// The mocks above play both wrapper and C type. `CBox`/`CBox`/`CVal` now bound
-// `T: CCell`; each mock is layout-identical to `CType<Self>`, so it stands in as
-// its own `C`. The `CCell` seam is never invoked (the pointers use their own
-// `as_ptr`); these impls only satisfy the marker bound.
-// SAFETY: `#[repr(C)]` mock is layout-compatible with `CType<Self>`.
-unsafe impl CCell for Refcounted {
-    type C = Refcounted;
+// The mocks play both wrapper and C type: each is layout-identical to
+// `CType<Self>`, so it stands in as its own `C`. The handles are the generic
+// mock pair below; the seam is never invoked (the tests project raw pointers
+// directly), so these impls only satisfy the bound.
+
+/// Generic mock shared handle — one pointer, `Copy`, like `&T`.
+#[repr(transparent)]
+pub struct MockRef<'a, T>(CPtr<'a, T>);
+impl<T> Clone for MockRef<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
 }
-// SAFETY: as above.
-unsafe impl CCell for Saturating {
-    type C = Saturating;
+impl<T> Copy for MockRef<'_, T> {}
+impl<T> MockRef<'_, T> {
+    fn as_ptr(&self) -> *mut T {
+        self.0.as_non_null().as_ptr()
+    }
 }
-// SAFETY: as above.
-unsafe impl CCell for Boxed {
-    type C = Boxed;
+
+/// Generic mock exclusive handle — move-only.
+#[repr(transparent)]
+pub struct MockMut<'a, T>(MockRef<'a, T>);
+impl<T> MockMut<'_, T> {
+    fn as_mut_ptr(&mut self) -> *mut T {
+        self.0 .0.as_non_null().as_ptr()
+    }
 }
-// SAFETY: as above.
-unsafe impl CCell for Dupable {
-    type C = Dupable;
+
+macro_rules! mock_ccell {
+    ($($t:ty),* $(,)?) => {$(
+        // SAFETY: the `#[repr(C)]` mock is layout-compatible with `CType<Self>`;
+        // the handles are transparent over `CPtr` and expose no reference to it.
+        unsafe impl CCell for $t {
+            type C = $t;
+            type Ref<'a> = MockRef<'a, $t> where Self: 'a;
+            type Mut<'a> = MockMut<'a, $t> where Self: 'a;
+            unsafe fn ref_from_raw<'a>(p: ::core::ptr::NonNull<Self>) -> MockRef<'a, $t>
+            where Self: 'a { MockRef(unsafe { CPtr::new(p) }) }
+            unsafe fn mut_from_raw<'a>(p: ::core::ptr::NonNull<Self>) -> MockMut<'a, $t>
+            where Self: 'a { MockMut(MockRef(unsafe { CPtr::new(p) })) }
+        }
+    )*};
 }
-// SAFETY: as above.
-unsafe impl CCell for Valued {
-    type C = Valued;
+
+mock_ccell!(Refcounted, Saturating, Boxed, Dupable, Valued, GuardValued);
+
+macro_rules! mock_getter {
+    ($($t:ty => $field:ident : $ret:ty),* $(,)?) => {$(
+        impl MockRef<'_, $t> {
+            fn $field(&self) -> $ret {
+                // SAFETY: the handle borrows a live mock for its lifetime; the
+                // read goes through the raw pointer, forming no reference.
+                unsafe { ::core::ptr::addr_of!((*self.as_ptr()).$field).read() }
+            }
+        }
+    )*};
 }
-// SAFETY: as above.
-unsafe impl CCell for GuardValued {
-    type C = GuardValued;
-}
+
+mock_getter!(
+    Refcounted => rc: Cell<usize>,
+    Saturating => rc: Cell<usize>,
+    Boxed => payload: u32,
+    Dupable => payload: u32,
+    Valued => payload: u32,
+    GuardValued => payload: u32,
+);

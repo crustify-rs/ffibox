@@ -1,4 +1,4 @@
-//! Tests that exercise the `define_type!`, `impl_dropped!`, `impl_cloned!` and
+//! Tests that exercise the `define_ctype!`, `impl_dropped!`, `impl_cloned!` and
 //! `impl_cvalued!` macros — wiring them to mock C-like state and verifying the
 //! trait bindings work end-to-end through `CBox`.
 //!
@@ -12,7 +12,7 @@
 use core::cell::Cell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crustify_prim::{define_type, impl_cloned, impl_cvalued, impl_dropped, CBox, CCell, CVal};
+use crustify_prim::{define_ctype, impl_cloned, impl_cvalued, impl_dropped, CBox, CVal};
 
 // ---------------------------------------------------------------------------
 // Mock C struct + lifecycle functions
@@ -100,13 +100,13 @@ unsafe fn BAR_dup(p: *mut bar_st) -> *mut bar_st {
 // Generate wrappers via the macros
 // ---------------------------------------------------------------------------
 
-define_type!(Foo, foo_st);
+define_ctype!(Foo, FooRef, FooMut, foo_st);
 // SAFETY: `FOO_up_ref`/`FOO_free` form a correct refcount pair for `foo_st` —
 // the down-ref registers as the destructor, the up_ref as the clone.
 impl_dropped!(Foo, foo_st, FOO_free);
 impl_cloned!(Foo, foo_st, up_ref = FOO_up_ref);
 
-define_type!(Bar, bar_st);
+define_ctype!(Bar, BarRef, BarMut, bar_st);
 // SAFETY: `BAR_free` is the correct destructor for `bar_st`, and `BAR_dup`
 // deep-copies into a fresh allocation releasable by it, NULL on failure.
 impl_dropped!(Bar, bar_st, BAR_free);
@@ -204,51 +204,62 @@ fn macros_dup_try_clone_reports_failure_as_none() {
 }
 
 #[test]
-fn define_type_accessors_compile_and_work() {
+fn the_shared_handle_reads_and_the_exclusive_one_writes() {
     let raw = Box::into_raw(Box::new(bar_st { payload: 7 }));
 
-    // from_ptr (shared only — `from_ptr_mut` was intentionally removed)
-    // SAFETY: `raw` is non-null and points to a valid `bar_st`.
-    let r: &Bar = unsafe { Bar::from_ptr(raw) }.unwrap();
-    // SAFETY: read the field through the raw pointer (`Bar::as_ptr`).
+    // SAFETY: `raw` is non-null and addresses a valid `bar_st`.
+    let r: BarRef<'_> = unsafe { BarRef::from_ptr(raw) }.unwrap();
+    // SAFETY: read through the raw pointer; no reference to `Bar` is formed.
     assert_eq!(unsafe { (*r.as_ptr()).payload }, 7);
+    assert_eq!(r.as_ptr(), raw.cast_const());
 
-    // Mutation goes through the shared `&Bar` via `as_ptr()` (the `UnsafeCell`
-    // interior), never `&mut`.
-    // SAFETY: `r` is the sole handle, so the projected write is exclusive.
-    unsafe { (*r.as_ptr()).payload = 99 };
-    // SAFETY: read it back through the same raw pointer.
-    let readback = unsafe { (*r.as_ptr()).payload };
-    assert_eq!(readback, 99);
+    // The shared handle has no write path: `as_ptr` is `*const`. Writing needs
+    // the exclusive handle.
+    // SAFETY: sole handle to the object for the rest of this scope.
+    let mut m: BarMut<'_> = unsafe { BarMut::from_ptr(raw) }.unwrap();
+    // SAFETY: `&mut self` carries write provenance.
+    unsafe { (*m.as_mut_ptr()).payload = 99 };
+    // Getters reach through `Deref` to the shared handle.
+    // SAFETY: written on the line above.
+    assert_eq!(unsafe { (*m.as_ptr()).payload }, 99);
 
-    // `as_ptr` round-trips back to the original `bar_st` pointer.
-    assert_eq!(r.as_ptr(), raw);
+    // The handles are one pointer, never the object.
+    assert_eq!(
+        core::mem::size_of::<BarRef<'_>>(),
+        core::mem::size_of::<*const bar_st>()
+    );
+    assert_eq!(
+        core::mem::size_of::<BarMut<'_>>(),
+        core::mem::size_of::<*const bar_st>()
+    );
 
-    // Reclaim the leak.
     // SAFETY: only one outstanding pointer (`raw`); no aliasing.
     drop(unsafe { Box::from_raw(raw) });
 }
 
 #[test]
-fn define_type_from_ptr_null_returns_none() {
+fn define_ctype_from_ptr_null_returns_none() {
     // SAFETY: passing null is the documented `None` case.
-    let r: Option<&Bar> = unsafe { Bar::from_ptr(core::ptr::null_mut()) };
+    let r: Option<BarRef<'_>> = unsafe { BarRef::from_ptr(core::ptr::null_mut()) };
     assert!(r.is_none());
+    // SAFETY: as above, on the exclusive handle.
+    let m: Option<BarMut<'_>> = unsafe { BarMut::from_ptr(core::ptr::null_mut()) };
+    assert!(m.is_none());
 }
 
 #[test]
 fn define_type_void_ptr_seam_round_trips() {
     let raw = Box::into_raw(Box::new(bar_st { payload: 42 }));
     // SAFETY: `raw` is non-null and points to a valid `bar_st`.
-    let r: &Bar = unsafe { Bar::from_ptr(raw) }.unwrap();
+    let r: BarRef<'_> = unsafe { BarRef::from_ptr(raw) }.unwrap();
 
     // Erase to `void*` and reconstitute — the `as_void_ptr` / `from_void_ptr`
     // pair, standing in for a C slot that stores an opaque pointer.
-    let erased = r.as_void_ptr();
+    let erased = r.as_void_ptr().cast_mut();
     // SAFETY: `erased` was erased from this very `Bar`, which is still live.
-    let back: &Bar = unsafe { Bar::from_void_ptr(erased) }.unwrap();
+    let back: BarRef<'_> = unsafe { BarRef::from_void_ptr(erased) }.unwrap();
 
-    assert_eq!(back.as_ptr(), raw);
+    assert_eq!(back.as_ptr(), raw.cast_const());
     // SAFETY: read the field through the reconstituted borrow.
     assert_eq!(unsafe { (*back.as_ptr()).payload }, 42);
 
@@ -260,14 +271,14 @@ fn define_type_void_ptr_seam_round_trips() {
 #[test]
 fn define_type_from_void_ptr_null_returns_none() {
     // SAFETY: passing null is the documented `None` case.
-    let r: Option<&Bar> = unsafe { Bar::from_void_ptr(core::ptr::null_mut()) };
+    let r: Option<BarRef<'_>> = unsafe { BarRef::from_void_ptr(core::ptr::null_mut()) };
     assert!(r.is_none());
 }
 
 #[test]
-fn define_type_is_repr_transparent() {
-    // Foo is #[repr(transparent)] over UnsafeCell<foo_st>, so it must
-    // have the same size as foo_st.
+fn define_ctype_is_repr_transparent() {
+    // `Foo` is #[repr(transparent)] over `CType<foo_st>` (= foo_st + a ZST), so
+    // it keeps the C layout and embeds by value in a `#[repr(C)]` mirror.
     assert_eq!(core::mem::size_of::<Foo>(), core::mem::size_of::<foo_st>());
     assert_eq!(core::mem::size_of::<Bar>(), core::mem::size_of::<bar_st>());
 }
@@ -294,7 +305,7 @@ unsafe fn QUX_dispose(_p: *mut qux_st) {
     QUX_DISPOSE_CALLS.fetch_add(1, Ordering::SeqCst);
 }
 
-define_type!(Qux, qux_st);
+define_ctype!(Qux, QuxRef, QuxMut, qux_st);
 // SAFETY: `QUX_dispose` disposes `qux_st`'s owned resource without freeing
 // the header; `Qux` is layout-compatible with `*mut qux_st`.
 impl_cvalued!(Qux, qux_st, QUX_dispose);
@@ -306,24 +317,20 @@ fn macros_cvalue_disposes_once_on_drop() {
     // Base `zeroed()` (from define_type!) + CVal: the whole point — no
     // hand-written `<T>Stack` companion, no hand-written `impl Drop`.
     let v = CVal::new(Qux::zeroed());
-    // SAFETY: zeroed `qux_st` is a valid state; read the field through the
-    // raw pointer (`CVal` derefs to `Qux`, whose `as_ptr` yields `*mut qux_st`).
-    assert_eq!(unsafe { (*v.as_ptr()).payload }, 0);
+    // SAFETY: zeroed `qux_st` is a valid state; read through the shared handle
+    // `CVal::as_ref` hands out -- no reference to `Qux` is formed.
+    assert_eq!(unsafe { (*v.as_ref().as_ptr()).payload }, 0);
     drop(v);
     assert_eq!(QUX_DISPOSE_CALLS.load(Ordering::SeqCst), 1);
 }
 
 #[test]
-fn define_type_uninit_and_zeroed_compile() {
-    // Stack-allocate the base type by value via the macro-emitted ctors —
-    // replaces the old `<T>Stack` companion.
-    let a = Qux::uninit();
-    // SAFETY: writing through the init handoff pointer before any read.
-    unsafe { (*a.as_ptr()).payload = 5 };
-    // SAFETY: initialised above; read back through the raw pointer.
-    assert_eq!(unsafe { (*a.as_ptr()).payload }, 5);
-
-    let z = Qux::zeroed();
-    // SAFETY: zeroed `qux_st` is a valid state; read through the raw pointer.
-    assert_eq!(unsafe { (*z.as_ptr()).payload }, 0);
+fn inline_storage_gates_read_against_write_the_ordinary_way() {
+    // `CVal` owns the value inline, so `&self` / `&mut self` do the gating and
+    // the pointer comes from `addr_of!` / `addr_of_mut!` -- no `&Qux` anywhere.
+    let mut v = CVal::new(Qux::zeroed());
+    // SAFETY: zeroed `qux_st` is valid; write through the exclusive handle.
+    unsafe { (*v.as_mut().as_mut_ptr()).payload = 5 };
+    // SAFETY: written on the line above.
+    assert_eq!(unsafe { (*v.as_ref().as_ptr()).payload }, 5);
 }
