@@ -19,8 +19,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use crustify_prim::{
-    impl_dropped, CBox, CCell, CCloned, CDropped, CLenDropped, CPtr, CVal, CValGuard, CValued,
-    CVec, CVoidBox,
+    define_ctype, impl_dropped, CBox, CCell, CCloned, CDropped, CLenDropped, CPtr, CVal, CValGuard,
+    CValued, CVec, CVoidBox,
 };
 
 // ---------------------------------------------------------------------------
@@ -469,18 +469,41 @@ unsafe impl CLenDropped for RecordingFree {
     unsafe fn c_drop_len(ptr: *mut u8, byte_len: usize) {
         CVEC_CLEANUP_CALLS.fetch_add(1, Ordering::SeqCst);
         CVEC_LAST_BYTE_LEN.store(byte_len, Ordering::SeqCst);
-        // SAFETY: tests construct CVec from `Box::into_raw` of a
-        // boxed slice of `byte_len` bytes.
-        let slice = unsafe { core::slice::from_raw_parts_mut(ptr, byte_len) };
-        // SAFETY: same — reclaim the boxed slice we leaked.
-        drop(unsafe { Box::from_raw(slice as *mut [u8]) });
+        // The buffer came from `make_cvec`, which recorded the element layout
+        // so the free can match it. Reconstituting it as `Box<[u8]>` would
+        // deallocate with alignment 1 against an allocation of the element's
+        // alignment.
+        let align = CVEC_ELEM_ALIGN.load(Ordering::SeqCst);
+        if byte_len == 0 || align == 0 {
+            return;
+        }
+        // SAFETY: `byte_len` and `align` are the layout `make_cvec` allocated
+        // with, and `ptr` is that allocation.
+        unsafe {
+            std::alloc::dealloc(
+                ptr,
+                std::alloc::Layout::from_size_align_unchecked(byte_len, align),
+            );
+        }
     }
 }
 
+/// Element alignment of the live mock buffer, so `RecordingFree` can free with
+/// the layout it was allocated with (a C allocator knows this implicitly; the
+/// mock has to record it).
+static CVEC_ELEM_ALIGN: AtomicUsize = AtomicUsize::new(0);
+
 fn make_cvec<T>(elems: Vec<T>) -> CVec<T, RecordingFree> {
-    let boxed = elems.into_boxed_slice();
-    let count = boxed.len();
-    let ptr = Box::into_raw(boxed) as *mut T;
+    let count = elems.len();
+    let layout = std::alloc::Layout::array::<T>(count).expect("layout");
+    CVEC_ELEM_ALIGN.store(layout.align(), Ordering::SeqCst);
+    // SAFETY: `count > 0` in every test, so the layout is non-zero-sized.
+    let ptr = unsafe { std::alloc::alloc(layout) }.cast::<T>();
+    assert!(!ptr.is_null());
+    for (i, e) in elems.into_iter().enumerate() {
+        // SAFETY: `i < count`, writing into freshly allocated storage.
+        unsafe { ptr.add(i).write(e) };
+    }
     // SAFETY: `ptr` is non-null, `count` matches the allocation.
     unsafe { CVec::from_raw_parts(ptr, count) }.unwrap()
 }
@@ -882,3 +905,52 @@ mock_getter!(
     Valued => payload: u32,
     GuardValued => payload: u32,
 );
+
+// ---------------------------------------------------------------------------
+// CVec element kinds: a plain Rust value gets a real slice, a wrapped C object
+// gets handles.
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+pub struct elem_st {
+    pub tag: u32,
+}
+crustify_prim::define_ctype!(Elem, ElemRef, ElemMut, elem_st);
+
+impl ElemRef<'_> {
+    fn tag(&self) -> u32 {
+        // SAFETY: the handle borrows a live `elem_st`; the read goes through the
+        // raw pointer, forming no reference.
+        unsafe { core::ptr::addr_of!((*self.as_ptr()).tag).read() }
+    }
+}
+
+#[test]
+fn cvec_of_plain_values_yields_a_real_slice() {
+    let v: CVec<u32, RecordingFree> = make_cvec(vec![1u32, 2, 3]);
+    // `u32: CElem`, and `CVec` owns the buffer exclusively, so `&[u32]` holds.
+    assert_eq!(v.as_slice(), &[1, 2, 3]);
+    assert_eq!(v.as_slice().iter().sum::<u32>(), 6);
+}
+
+#[test]
+fn cvec_of_wrapped_objects_yields_handles() {
+    // `Elem` implements `CCell`, not `CElem`, so `as_slice()` does not compile
+    // for it -- a `&[Elem]` would be a reference covering the C objects. The
+    // buffer is reached as handles instead.
+    let v: CVec<Elem, RecordingFree> =
+        make_cvec(vec![Elem::zeroed(), Elem::zeroed(), Elem::zeroed()]);
+    let run = v.as_handles();
+    assert_eq!(run.len(), 3);
+    assert!(!run.is_empty());
+    assert!(run.get(3).is_none());
+
+    // Every element reads back through its own handle.
+    assert_eq!(run.get(0).unwrap().tag(), 0);
+    assert_eq!(run.iter().map(|e| e.tag()).sum::<u32>(), 0);
+
+    // Writing goes through the raw pointer the handle projects.
+    // SAFETY: `run` borrows the live buffer; element 1 is in range.
+    unsafe { core::ptr::addr_of_mut!((*run.as_ptr().add(1)).tag).write(7) };
+    assert_eq!(run.iter().map(|e| e.tag()).sum::<u32>(), 7);
+}

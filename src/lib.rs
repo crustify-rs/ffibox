@@ -27,6 +27,8 @@
 //! | [`CVec<T, S>`]      | a length-aware buffer                  | `S: CLenDropped`          |
 //! | [`CVal<T>`]         | a value inline, disposing fields only  | `T: CValued + CCell`      |
 //! | [`CValGuard<'a, T>`]| the same, borrowed and dismissible     | `T: CValued + CCell`      |
+//! | [`CKeepalive<T>`]   | an owner token: teardown only, no access | `T: CDropped + CCell`   |
+//! | [`CTethered<T, O>`] | a view INTO a parent, holding it alive | `O: Owner`                |
 //!
 //! Sole ownership and refcounting share **one** type. [`CBox<T>`] is not "the unique
 //! pointer" — whether it is exclusive or one share of a refcount depends only
@@ -122,6 +124,9 @@
 #![no_std]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+#[cfg(feature = "alloc")]
+extern crate alloc;
+
 #[cfg(feature = "std")]
 extern crate std;
 
@@ -139,7 +144,9 @@ pub mod c_out {
 }
 
 // Re-export the primary items at the crate root for convenience.
-pub use crate::borrowed_refs::COut;
+pub use crate::borrowed_refs::{COut, CSlice};
 pub use crate::c_type::{CCell, CPtr, CType};
-pub use crate::owned_refs::{CBox, CBoxWith, CVal, CValGuard, CVec, CVoidBox, CrustifyStr};
+pub use crate::owned_refs::{
+    CBox, CBoxWith, CKeepalive, CTethered, CVal, CValGuard, CVec, CVoidBox, CrustifyStr,
+};
 pub use crate::traits::{CCloned, CCloner, CDropped, CDropper, CLenCloned, CLenDropped, CValued};

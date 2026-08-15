@@ -266,6 +266,8 @@ when the type has NO refcount.
 | `CCloned` | Handle duplication (`c_clone(ptr) -> ptr`): a deep-copy `*_dup` returning a **new** pointer, **or** an `up_ref` returning the **same** pointer. Either way the result owes one independent `c_drop`. Opt-in `Clone` for a `CBox` or `CrustifyStr` (a NUL string's `strdup`; length recovered by `strlen`, so pointer-only fits). Supertrait `CDropped`. | `CBox` / `CrustifyStr`: `Clone` | `impl_cloned!(N,c,dup = …)` / `impl_cloned!(N,c,up_ref = …)` | `src/traits.rs` |
 | `CValued` | Embedded / by-value teardown for a value that lives **inside** another struct or on the stack (`c_dispose`, no storage of its own to free). | `CVal`, `CValGuard` | `impl_cvalued!(N,c,dispose)` | `src/traits.rs` |
 | `CLenDropped` | Release strategy for an `n`-element buffer (`c_drop_len(ptr, byte_len)`), carried by a ZST strategy type you write — the crate ships none. | `CVec` | — (manual impl) | `src/traits.rs` |
+| `CElem` | Marker: a plain Rust value, every bit pattern of which is valid — integers, floats, raw pointers, arrays, `MaybeUninit<T>`. A `define_ctype!` wrapper implements `CCell` instead, so `&[Foo]` does not typecheck. | `CVec::as_slice` | — (blanket) | `src/traits.rs` |
+| `Owner` | Marker: keeps someone else's C object alive at a stable address, exposing no access to it — the owner half of `CTethered`. | `CTethered<T, O>` | — (manual impl; `CKeepalive` and, with `alloc`, `Arc<O>`) | `src/traits.rs` |
 | `CLenCloned` | Length-aware deep-copy strategy for a buffer (`c_clone_len(ptr, byte_len) -> ptr`, a `memdup`) -- the `CCloned` analogue for `CVec` (its `Clone`), needed because the copy carries the byte length `c_clone` cannot. **Byte copy** (POD elements only). Supertrait `CLenDropped`. | `CVec`: `Clone` | — (manual impl) | `src/traits.rs` |
 
 A fully refcounted, cloneable type pairs `impl_dropped!` (the down-ref, so
@@ -310,10 +312,12 @@ owns* (unique / shared / by value / type-erased) and *which phase of life*
 | `CBox<T>` | unique, typed | fully constructed | `T: CDropped + CCell` (`Clone` iff `T: CCloned`) | `src/owned_refs.rs` |
 | `CVal<T>` | by value (embedded/stack) | fully constructed | `T: CValued + CCell` | `src/owned_refs.rs` |
 | `CValGuard<'a, T>` | borrowed view with teardown, lifetime-bound | fully constructed | `T: CValued + CCell` | `src/owned_refs.rs` |
-| `CVec<T, S>` | length-aware buffer | fully constructed | `S: CLenDropped` | `src/owned_refs.rs` |
+| `CVec<T, S>` | length-aware buffer | fully constructed | `S: CLenDropped`; `as_slice` iff `T: CElem`, `as_handles` iff `T: CCell` | `src/owned_refs.rs` |
 | `CVoidBox<D>` | plain **type-erased** storage | fully constructed | `D: CDropped` | `src/owned_refs.rs` |
 | `CrustifyStr<D>` | owned **NUL-terminated C string** (`char *`); read-only slice views | fully constructed | `D: CDropped` | `src/owned_refs.rs` |
 | `CBoxWith<T, D>` | unique, typed, **+ inline teardown state** | construction **and** fully constructed | `T: CCell`, `D: CDropper<T>` (`Clone` iff `D: CCloner + Clone`; `into_box` iff `T: CDropped`) | `src/owned_refs.rs` |
+| `CKeepalive<T>` | an owner token: teardown only, no access | fully constructed | `T: CDropped + CCell` | `src/owned_refs.rs` |
+| `CTethered<T, O>` | a view INTO a parent, holding it alive | fully constructed | `O: Owner` | `src/owned_refs.rs` |
 
 The wrapper-holding pointers all bound **`T: CCell`** (their `T` is a wrapper —
 automatic for any `define_ctype!` / hand-written wrapper; it also names the
@@ -337,6 +341,7 @@ out-parameter slot.
 
 | Wrapper | Models | Owns? | Source |
 |---------|--------|-------|--------|
+| `CSlice<'a, T>` | a borrowed run of `len` contiguous wrapped C objects, yielded as per-element handles by `get` / `iter`. The slice analogue of a `Ref` handle: `&[T]` over wrapped objects would be a reference covering them. Reached with `CVec::as_handles`. | no (shared borrow) | `src/borrowed_refs.rs` |
 | `COut<'a, T>` | the write-end of a C `*mut T` **out-parameter** — a `&'a mut MaybeUninit<T>` the callee writes once. `c_out::from_ptr` hides the `*mut T → *mut MaybeUninit<T>` cast at the boundary; `Option<COut>` is layout-compat with `*mut T`. | no (borrowed write-slot) | `src/borrowed_refs.rs` |
 
 ---
@@ -424,8 +429,10 @@ without transferring ownership. Orthogonal to the cell.
 
 Crustify is `#![no_std]` by default. The `std` feature (on by default) selects
 `std::process::abort` for the unrecoverable-failure path (`Clone` when the C
-copy routine fails); without it that path is a double-panic. Nothing here
-needs `alloc`.
+copy routine fails); without it that path is a double-panic. One path
+allocates: the `alloc` feature adds `Owner for Arc<O>`, so several `CTethered`
+children can share a parent C does not refcount. A refcounted parent, or a
+single child, stores its `CKeepalive` inline and needs neither.
 
 ```toml
 [dependencies]

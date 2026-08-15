@@ -19,7 +19,9 @@
 //! (length-aware buffer strategies), and the `*With` strategy traits
 //! [`CDropper`] / [`CCloner`] — which also carry the construction phase, a
 //! storage-only [`CDropper`] holding the allocation until
-//! [`CBoxWith::into_box`] promotes it.
+//! [`CBoxWith::into_box`] promotes it. [`Owner`] is the odd one out: no
+//! teardown of its own, just the promise to keep someone else's object alive
+//! for a [`CTethered`](crate::CTethered) child.
 
 use core::ptr::NonNull;
 
@@ -171,6 +173,61 @@ pub unsafe trait CCloned: CDropped {
     unsafe fn c_clone(obj: NonNull<Self>) -> Option<NonNull<Self>>;
 }
 
+/// Element types a [`CVec`] may materialise as a slice: a plain Rust value,
+/// every bit pattern of which is valid.
+///
+/// [`CVec::as_slice`] hands out `&[Self]`, which asserts well-formedness for all
+/// `count` elements at once. This marker carries that claim, checked once at the
+/// type rather than at each view.
+///
+/// | Category | Why it holds |
+/// |---|---|
+/// | integers, floats, raw pointers | no invalid bit patterns |
+/// | [`MaybeUninit<T>`](core::mem::MaybeUninit) | valid for any bits — the escape hatch for a buffer C has not filled |
+/// | arrays of the above, `()` | element-wise |
+///
+/// **A wrapped C type is not one.** A layout newtype from
+/// [`define_ctype!`](crate::define_ctype) implements [`CCell`],
+/// not this, so `&[Foo]` — which would be a reference covering C objects — does
+/// not typecheck. Iterate a buffer of those with
+/// [`CVec::as_handles`](crate::CVec::as_handles) instead.
+///
+/// `bool` and `char` are also excluded: C's `_Bool` may hold a byte outside
+/// `{0, 1}` and a `char` outside the Unicode scalar range, both invalid Rust
+/// values. Use the integer type and convert.
+///
+/// # Safety
+///
+/// Every bit pattern that may appear in a `CVec<Self, _>`'s buffer must be a
+/// valid `Self`. The slice reference is formed over the whole buffer at once, so
+/// a single bad element is undefined behaviour for the entire borrow.
+pub unsafe trait CElem {}
+
+macro_rules! impl_celem_for_primitives {
+    ($($t:ty),* $(,)?) => {$(
+        // SAFETY: no bit pattern of this type is invalid.
+        unsafe impl CElem for $t {}
+    )*};
+}
+
+impl_celem_for_primitives!(
+    u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f32, f64,
+);
+
+// SAFETY: `MaybeUninit<T>` is valid for every bit pattern, which is the whole
+// point of it — the standard escape hatch for a buffer C has not filled.
+unsafe impl<T> CElem for core::mem::MaybeUninit<T> {}
+
+// SAFETY: a raw pointer is valid for every bit pattern, null included.
+unsafe impl<T: ?Sized> CElem for *const T {}
+// SAFETY: as above.
+unsafe impl<T: ?Sized> CElem for *mut T {}
+
+// SAFETY: an array of valid elements is valid.
+unsafe impl<T: CElem, const N: usize> CElem for [T; N] {}
+// SAFETY: a ZST has one bit pattern, the empty one.
+unsafe impl CElem for () {}
+
 // ===========================================================================
 // Length-aware buffer strategies (implemented on a ZST selector, not the
 // element type) — drive CVec's cleanup / clone
@@ -297,3 +354,29 @@ pub unsafe trait CCloner<T>: CDropper<T> {
     /// `ptr` must point to a live instance of `T`.
     unsafe fn c_clone(&self, ptr: NonNull<T>) -> Option<NonNull<T>>;
 }
+
+/// A handle whose sole job is to keep a C object alive for someone else.
+///
+/// Implemented by [`CKeepalive<T>`](crate::owned_refs::CKeepalive), and — with
+/// the `alloc` feature — by `Arc<O>` so several tethered children can share one
+/// parent. It is the owner half of [`CTethered<T, O>`](crate::owned_refs::CTethered):
+/// a child pointing INTO a parent's allocation holds one of these so the parent
+/// cannot be released while the child lives.
+///
+/// The trait has no methods. Its whole content is the guarantee below plus the
+/// `Drop` the implementor already has — which is exactly why an implementor can
+/// be `Send + Sync` where the owning handle it wraps is not: with no way to
+/// reach the pointer through `&self`, a shared reference gives another thread
+/// nothing to race on.
+///
+/// # Safety
+///
+/// - The implementor must keep the owned C object alive for as long as it
+///   itself lives, and release it (exactly once) when the last owner drops.
+/// - The object's ADDRESS must be stable for that whole time. A handle that
+///   owns its C struct **by value** ([`CVal`]) must
+///   never implement this: moving it relocates the object and dangles every
+///   interior pointer a child holds. Only pointer-owning handles qualify.
+/// - No method may hand out access to the object through `&self`; `Send` and
+///   `Sync` are claimed on that basis.
+pub unsafe trait Owner: Send + Sync {}

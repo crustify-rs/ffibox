@@ -32,8 +32,11 @@ use core::fmt;
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 
+use crate::borrowed_refs::CSlice;
 use crate::c_type::{CCell, CType};
-use crate::traits::{CCloned, CCloner, CDropped, CDropper, CLenCloned, CLenDropped, CValued};
+use crate::traits::{
+    CCloned, CCloner, CDropped, CDropper, CElem, CLenCloned, CLenDropped, CValued, Owner,
+};
 
 // ---------------------------------------------------------------------------
 // Abort helper — portable across std and no_std builds
@@ -696,12 +699,31 @@ impl<T, S: CLenDropped> CVec<T, S> {
         self.count.wrapping_mul(core::mem::size_of::<T>())
     }
 
+    /// Consume without running cleanup, returning pointer and element count.
+    #[inline]
+    #[must_use = "the returned pointer owns the allocation and must be freed"]
+    pub fn into_raw_parts(self) -> (*mut T, usize) {
+        let result = (self.ptr.as_ptr(), self.count);
+        core::mem::forget(self);
+        result
+    }
+}
+
+/// Slice views require [`CElem`]: `&[T]` asserts well-formedness for all `count`
+/// elements at once, which the raw-pointer accessors above never do. Sound here
+/// because `CVec` owns the buffer exclusively — `from_raw_parts` requires
+/// transferred unique ownership — so no C alias exists by contract.
+///
+/// For a buffer C has not filled, instantiate as `CVec<MaybeUninit<T>, S>`; for
+/// a buffer of wrapped C objects, use [`as_handles`](CVec::as_handles), since a
+/// `&[Foo]` would be a reference covering those objects.
+impl<T: CElem, S: CLenDropped> CVec<T, S> {
     /// View as an immutable typed slice.
     #[inline]
     #[must_use]
     pub fn as_slice(&self) -> &[T] {
-        // SAFETY: `count` contiguous elements at `ptr` per the invariants; the
-        // slice is bound by `&self`.
+        // SAFETY: `count` contiguous, initialised elements at `ptr` per
+        // `from_raw_parts`, each valid by `T: CElem`; bound by `&self`.
         unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.count) }
     }
 
@@ -712,14 +734,17 @@ impl<T, S: CLenDropped> CVec<T, S> {
         // SAFETY: as `as_slice`, with `&mut self` making it exclusive.
         unsafe { core::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.count) }
     }
+}
 
-    /// Consume without running cleanup, returning pointer and element count.
+/// A buffer of wrapped C objects is reached as handles, not as a slice.
+impl<T: CCell, S: CLenDropped> CVec<T, S> {
+    /// Borrow the buffer as a sequence of shared handles.
     #[inline]
-    #[must_use = "the returned pointer owns the allocation and must be freed"]
-    pub fn into_raw_parts(self) -> (*mut T, usize) {
-        let result = (self.ptr.as_ptr(), self.count);
-        core::mem::forget(self);
-        result
+    #[must_use]
+    pub fn as_handles(&self) -> CSlice<'_, T> {
+        // SAFETY: `count` contiguous, initialised `T` at `ptr` per
+        // `from_raw_parts`; the view is bound by `&self`.
+        unsafe { CSlice::from_raw_parts(self.ptr, self.count) }
     }
 }
 
@@ -957,3 +982,168 @@ impl<T: CCell, D: CDropper<T>> fmt::Pointer for CBoxWith<T, D> {
         fmt::Pointer::fmt(&self.ptr.as_ptr(), f)
     }
 }
+
+// ===========================================================================
+// Keeping a parent alive for a child that outlives its borrow
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// CKeepalive<T> — an owner token: teardown only, no access
+// ---------------------------------------------------------------------------
+
+/// Holds the parent alive for a [`CTethered`] child and does nothing else. The
+/// absence of any way to reach the object — no accessor, no `as_ptr` — is what
+/// earns the `Send + Sync` impls below: a shared `&CKeepalive` gives another
+/// thread nothing to race on.
+///
+/// Takes a [`CBox<T>`] concretely, never a `CVal`: the tethered child holds a
+/// pointer INTO the parent, so the parent's address must be stable, and a
+/// by-value handle relocates the object when it moves.
+///
+/// ```ignore
+/// // A C-refcounted parent needs no allocation: `clone` runs the registered
+/// // up_ref, and the keepalive is stored inline in the child.
+/// let keep = CKeepalive::new(ctx.clone());   // -> SSL_CTX_up_ref
+/// ```
+#[must_use = "dropping a CKeepalive releases the parent it holds"]
+pub struct CKeepalive<T: CDropped + CCell> {
+    _owner: CBox<T>,
+}
+
+impl<T: CDropped + CCell> CKeepalive<T> {
+    /// Take an owning handle and expose nothing but its teardown.
+    ///
+    /// For a C-refcounted parent pass `parent.clone()`, which runs the
+    /// registered [`CCloned::c_clone`] (an `up_ref`); the matching down-ref
+    /// runs when this drops.
+    #[inline]
+    pub fn new(owner: CBox<T>) -> Self {
+        Self { _owner: owner }
+    }
+
+    /// Recover the owning handle, giving up the keepalive.
+    ///
+    /// Every tether still pointing into this parent is invalidated when the
+    /// returned handle drops, so this is for handing ownership onward, not for
+    /// reaching the object while children live.
+    #[inline]
+    pub fn into_inner(self) -> CBox<T> {
+        self._owner
+    }
+}
+
+// SAFETY: `CKeepalive` owns its `CBox<T>` and exposes no `&self` access to the
+// object, so a shared reference carries no capability another thread could
+// misuse. Moving it to another thread moves the sole handle, and the teardown
+// it runs on drop is the registered `c_drop` — which the C library must already
+// tolerate from whichever thread holds the last reference, since that is what a
+// refcount means.
+unsafe impl<T: CDropped + CCell> Send for CKeepalive<T> {}
+// SAFETY: as above — `&CKeepalive` offers nothing but `Drop`, which a shared
+// reference cannot trigger.
+unsafe impl<T: CDropped + CCell> Sync for CKeepalive<T> {}
+
+// SAFETY: it keeps the `CBox` alive for its own lifetime and releases it exactly
+// once on drop; `CBox` owns by pointer, so the object's address is stable; and
+// nothing reaches the object through `&self`.
+unsafe impl<T: CDropped + CCell> Owner for CKeepalive<T> {}
+
+// ---------------------------------------------------------------------------
+// CTethered<T, O> — a view INTO a parent, holding it alive
+// ---------------------------------------------------------------------------
+
+/// A pointer into a parent's allocation, plus a token keeping that parent
+/// alive.
+///
+/// The pattern is a child pointing INTO a parent — a codec context inside a
+/// format context, a certificate inside its store — where the natural signature
+/// `fn child(&self) -> ChildRef<'_>` is too rigid because the child must
+/// outlive the borrow: be moved into a struct, or sent to another thread. This
+/// trades that lifetime for a runtime claim on the parent, so the child is free
+/// to travel and the parent cannot be released underneath it.
+///
+/// **Not a general borrow.** For a borrow whose extent the compiler can see,
+/// use the type's own `Ref<'a>` handle: checked statically, and free. Reach for
+/// a tether only when the borrow has to escape its lexical scope.
+///
+/// It owns nothing itself, so there is no `Drop` impl and no ownership flag to
+/// branch on: dropping the struct drops the `O` field, and that is the entire
+/// release path.
+pub struct CTethered<T: CCell, O: Owner> {
+    ptr: NonNull<T>,
+    _owner: O,
+}
+
+impl<T: CCell, O: Owner> CTethered<T, O> {
+    /// Tie a pointer into `owner`'s allocation to that owner; `None` if null.
+    ///
+    /// # Safety
+    ///
+    /// - `ptr` must be valid (or null) and must point INTO the object `owner`
+    ///   keeps alive, so that holding `owner` keeps `ptr` valid.
+    /// - `ptr` must NOT be separately owned: nothing here frees it, and the
+    ///   parent's teardown is expected to reclaim it.
+    #[inline]
+    pub unsafe fn from_raw(ptr: *mut T::C, owner: O) -> Option<Self> {
+        NonNull::new(ptr.cast::<T>()).map(|ptr| Self { ptr, _owner: owner })
+    }
+
+    /// Shared handle to the tethered object.
+    #[inline]
+    #[must_use]
+    pub fn as_ref(&self) -> T::Ref<'_> {
+        // SAFETY: `ptr` addresses a live object `_owner` keeps alive, per the
+        // `from_raw` contract; the handle is bound to this borrow.
+        unsafe { T::ref_from_raw(self.ptr) }
+    }
+
+    /// Exclusive handle to the tethered object.
+    #[inline]
+    #[must_use]
+    pub fn as_mut(&mut self) -> T::Mut<'_> {
+        // SAFETY: as `as_ref`, from an exclusive borrow of the tether.
+        unsafe { T::mut_from_raw(self.ptr) }
+    }
+
+    /// Raw pointer for passing to C. The tether is retained.
+    #[inline]
+    #[must_use]
+    pub fn as_ptr(&self) -> *mut T::C {
+        self.ptr.as_ptr().cast::<T::C>()
+    }
+
+    /// Borrow the owner token.
+    #[inline]
+    pub fn owner(&self) -> &O {
+        &self._owner
+    }
+
+    /// Drop the view and recover the owner.
+    #[inline]
+    #[must_use]
+    pub fn into_owner(self) -> O {
+        self._owner
+    }
+}
+
+// SAFETY: the tether is a pointer plus an owner token. It hands out handles
+// that reach the object through a raw pointer, so it is `Send`/`Sync` on the
+// same terms as any shared access to a C object: `T: Sync` is what makes that
+// safe to do from another thread, and the owner is `Send + Sync` by `Owner`'s
+// contract.
+unsafe impl<T: CCell + Sync, O: Owner> Send for CTethered<T, O> {}
+// SAFETY: as above — sharing `&CTethered` shares the ability to obtain a shared
+// handle, which `T: Sync` permits.
+unsafe impl<T: CCell + Sync, O: Owner> Sync for CTethered<T, O> {}
+
+// SAFETY: `Arc<O>` keeps `O` alive until the last handle drops, and releases it
+// exactly once, on whichever thread holds that last handle — which is the
+// `Owner` contract. `Arc<O>: Send + Sync` already holds for `O: Send + Sync`,
+// which `Owner` requires, and `Arc` adds no way to reach the object beyond
+// `O`'s own (which is none).
+//
+// This is the only allocating path in the crate: it exists for a parent C does
+// NOT refcount, shared by several children. A refcounted parent — or a single
+// child — stores its `CKeepalive` inline instead.
+#[cfg(feature = "alloc")]
+unsafe impl<O: Owner + ?Sized> Owner for alloc::sync::Arc<O> {}

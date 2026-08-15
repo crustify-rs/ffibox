@@ -6,9 +6,10 @@
   representing a C type's ownership and lifetime in safe Rust. Use when
   wrapping a raw C pointer or by-value C struct, or when porting a C allocator,
   constructor, or destructor — i.e. when deciding among CBox / CBoxWith / CVal /
-  CVec / CVoidBox / CrustifyStr / CValGuard / COut and the traits that drive
-  them (CDropped / CCloned / CValued / CLenDropped, plus the fat-owner
-  strategies CDropper / CCloner). Also covers the three types every wrapped C
+  CVec / CVoidBox / CrustifyStr / CValGuard / CKeepalive / CTethered / CSlice /
+  COut and the traits that drive them (CDropped / CCloned / CValued /
+  CLenDropped / CElem / Owner, plus the fat-owner strategies CDropper /
+  CCloner). Also covers the three types every wrapped C
   type gets — the layout newtype over CType, plus the NRef<'a> / NMut<'a>
   borrowed handles that carry the accessors — emitted together by
   define_ctype!, and the rule they exist for: no reference to a wrapped C
