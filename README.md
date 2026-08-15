@@ -10,10 +10,10 @@ C internals to Rust in place), not just opaque-handle wrapping.
 Wrapping a C API in Rust means re-homing C's ownership and lifecycle
 conventions into RAII. The recurring shapes:
 
-- Refcounted or exclusive ownership with destructor (`up_ref` / `free`).
+- Refcounted or exclusive ownership with FFI destructor (`up_ref` / `free`).
 - Types with multiple or runtime-conditional destructors.
 - By-value object whose teardown disposes fields but not the header.
-- Length-aware buffer or NUL-terminated `char *` accessed in Rust, freed by a C allocator.
+- Owned length-aware buffer or NUL-terminated `char *` with FFI destructor.
 - Type-erased `void *` that stays opaque end to end.
 
 Each shape gets one trait (the per-type lifecycle contract) and one
@@ -285,6 +285,14 @@ object is formed. One-way, and a type change, so a half-built object cannot
 reach code expecting a finished one; bail with `?` before promoting and `D`
 reclaims the allocation without running the real destructor.
 
+**Multi-destructor shapes.** A type has one `CDropped`, so a second teardown for
+the same C type goes on a `CDropper<T>` policy instead — one `D` per destructor,
+and `CBoxWith<T, D>` selects which by its type. Exactly one ever runs:
+`CBoxWith`'s `Drop` calls `D::c_drop`, never `T::c_drop`, so a `T` that also
+implements `CDropped` keeps that for its `CBox` and the two cannot both fire.
+`T: CDropped` is not required at all — a type whose teardowns are all
+alternatives needs only `CCell`. A ZST `D` keeps the handle pointer-sized.
+
 **Value-carried teardown — the `*With` strategies.** When teardown is not
 recoverable from the pointee, bind a
 **policy object** `D` implementing the agent-noun analogue of the base pair:
@@ -295,8 +303,9 @@ separate shared flavour — a refcounted pointee registers the down-ref as
 Each method takes `(&self_state, ptr)`, so `D` carries the `fn` / length / struct
 into `Drop`. These are **hand-implemented on the state type** (no `impl_*!`
 macro) and consumed by `CBoxWith` in Axis 3. Use them when teardown is not
-recoverable from `T` alone: runtime state, or a second policy for one C type.
-Otherwise register a plain `CDropped` and use `CBox`. All in `src/traits.rs`.
+recoverable from `T` alone: runtime state, the construction phase, or a second
+destructor. Otherwise register a plain `CDropped` and use `CBox`. All in
+`src/traits.rs`.
 
 ---
 
@@ -313,9 +322,9 @@ owns* (unique / shared / by value / type-erased) and *which phase of life*
 | `CVal<T>` | by value (embedded/stack) | fully constructed | `T: CValued + CCell` | `src/owned_refs.rs` |
 | `CValGuard<'a, T>` | borrowed view with teardown, lifetime-bound | fully constructed | `T: CValued + CCell` | `src/owned_refs.rs` |
 | `CVec<T, S>` | length-aware buffer | fully constructed | `S: CLenDropped`; `as_slice` iff `T: CElem`, `as_handles` iff `T: CCell` | `src/owned_refs.rs` |
-| `CVoidBox<D>` | plain **type-erased** storage | fully constructed | `D: CDropped` | `src/owned_refs.rs` |
-| `CrustifyStr<D>` | owned **NUL-terminated C string** (`char *`); read-only slice views | fully constructed | `D: CDropped` | `src/owned_refs.rs` |
-| `CBoxWith<T, D>` | unique, typed, **+ inline teardown state** | construction **and** fully constructed | `T: CCell`, `D: CDropper<T>` (`Clone` iff `D: CCloner + Clone`; `into_box` iff `T: CDropped`) | `src/owned_refs.rs` |
+| `CVoidBox<D>` | plain type-erased storage | fully constructed | `D: CDropped` | `src/owned_refs.rs` |
+| `CrustifyStr<D>` | owned NUL-terminated C string (`char *`); read-only slice views | fully constructed | `D: CDropped` | `src/owned_refs.rs` |
+| `CBoxWith<T, D>` | unique, typed, + inline teardown state | construction and fully constructed | `T: CCell`, `D: CDropper<T>` (`Clone` iff `D: CCloner + Clone`; `into_box` iff `T: CDropped`) | `src/owned_refs.rs` |
 | `CKeepalive<T>` | an owner token: teardown only, no access | fully constructed | `T: CDropped + CCell` | `src/owned_refs.rs` |
 | `CTethered<T, O>` | a view INTO a parent, holding it alive | fully constructed | `O: Owner` | `src/owned_refs.rs` |
 
@@ -329,8 +338,8 @@ is a *deleter strategy* (or `T` an *element*), not a wrapper.
 stays pointer-sized). Its `from_raw` takes the extra `dropper` argument
 (`from_raw(*mut T::C, D)`) — the seam point where the policy is fixed;
 `into_raw` hands back `(*mut T::C, D)`. Reach for it when teardown is not
-recoverable from `T` alone: runtime state, or a second policy for one C type
-(a ZST `D` keeps the pointer-compatible layout). Otherwise `CBox`.
+recoverable from `T` alone — runtime state, the construction phase, or a second
+destructor, all in Axis 2. Otherwise `CBox`.
 
 ### Non-owning pointer wrappers
 
@@ -369,7 +378,7 @@ and ignores the ownership axes below:
     `CType<c_void>` field, hand it over with the handle's `as_void_ptr` (the one
     place a bare `CType<T>` is used unwrapped)
   - **erased-but-materializable** (the `void*` is really a `ffi::T`) -> erase a
-    `&Foo` with `as_void_ptr`
+    `FooRef<'a>` with its `as_void_ptr`, and reconstitute with `from_void_ptr`
 - borrowed NUL string (read-only) -> a slice view: `&core::ffi::CStr` / `&str` /
   `&[u8]` (a thin borrowed `const char*` slot is deferred -- no wrapper yet)
 
@@ -382,10 +391,11 @@ plain free and a length-aware clearing free -- no `CLenDropped` needed). Its byt
 read out as a slice view (`as_c_str` / `as_bytes` / `to_str`); it is **read-only**
 (like `core::ffi::CStr`), so the ONLY way to mutate is to drop to the raw `*mut`:
 `into_raw()` -> edit -> `from_raw()`.
-  - A **counted n-element buffer** (you index / read / write elements) -> 
-  `CVec<T, S>` (`S`: your own `CLenDropped` strategy);
-  its elements are themselves by-value (`CVal`) or owned pointers (a nested
-  `CBox` per element).
+  - A **counted n-element buffer** (you index / read / write elements) ->
+  `CVec<T, S>` (`S`: your own `CLenDropped` strategy). Plain Rust elements
+  (`T: CElem`) read out as a real `&[T]` via `as_slice`; wrapped C objects go
+  through `as_handles` -> `CSlice<'a, T>`, since a `&[Foo]` would be a reference
+  covering them.
   - A **singleton** (one value) -> keep going.
 
 **Axis 2.3 Storage -- by value or own pointer?** Lives **by value inside another
@@ -407,11 +417,11 @@ way. Adopt an already-built C pointer via `CBox::from_raw`.
 wrapping site rather than a fixed `*_free`, swap the thin owner for its fat
 sibling: `CBox<T>` -> `CBoxWith<T, D>`, with `D` a strategy carrying the state
 (`CDropper`, plus `CCloner` to clone). Orthogonal to the cell. Reach here when
-teardown is not recoverable from `T` alone: runtime state, or a second policy
-for one C type.
+teardown is not recoverable from `T` alone -- runtime state, the construction
+phase, or a second destructor, all in Axis 2.
 
 **Allocated<->initialized overlay.** When you **allocate + initialize in Rust**
-(porting a ctor), reach the matrix cell through the uninit ladder:
+(porting a ctor), reach the matrix cell through the construction ladder:
 - typed (exclusive **or** shared) -> `CBoxWith<T, StorageFree>` with a ZST
   `CDropper` -> `into_box()` -> `CBox<T>`. One ladder for both: the refcount is
   just a field the initializer sets before promoting.
@@ -420,7 +430,7 @@ for one C type.
 **Boundary overlay.** An owned pointer that **crosses the FFI boundary** (you
 hand C a pointer it will later free, or adopt one C allocated) crosses it on
 the owner's raw seam: `into_raw` surrenders it, `from_raw` adopts it, and
-`CCell::as_void_ptr` / `CCell::from_void_ptr` cross an erased `void *` slot
+the handle's `as_void_ptr` / `from_void_ptr` cross an erased `void *` slot
 without transferring ownership. Orthogonal to the cell.
 
 

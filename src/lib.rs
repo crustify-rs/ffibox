@@ -149,4 +149,6 @@ pub use crate::c_type::{CCell, CPtr, CType};
 pub use crate::owned_refs::{
     CBox, CBoxWith, CKeepalive, CTethered, CVal, CValGuard, CVec, CVoidBox, CrustifyStr,
 };
-pub use crate::traits::{CCloned, CCloner, CDropped, CDropper, CLenCloned, CLenDropped, CValued};
+pub use crate::traits::{
+    CCloned, CCloner, CDropped, CDropper, CElem, CLenCloned, CLenDropped, CValued, Owner,
+};
