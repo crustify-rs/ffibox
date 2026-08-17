@@ -1,14 +1,14 @@
 [package]
-name = "crustify-prim"
+name = "ffibox"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Marius Momeu <marius.momeu@berkeley.edu>", "The Crustify Contributors"]
 license = "MIT OR Apache-2.0"
 description = "Generic smart pointers and traits for building safe Rust wrappers over C types"
-repository = "https://github.com/crustify-rs/crustify-prim"
-documentation = "https://docs.rs/crustify-prim"
-homepage = "https://github.com/crustify-rs/crustify-prim"
+repository = "https://github.com/crustify-rs/ffibox"
+documentation = "https://docs.rs/ffibox"
+homepage = "https://github.com/crustify-rs/ffibox"
 readme = "README.md"
 keywords = ["ffi", "smart-pointer", "raii", "refcount", "c-interop"]
 categories = ["api-bindings", "rust-patterns", "no-std", "memory-management"]

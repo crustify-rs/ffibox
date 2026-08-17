@@ -5,7 +5,7 @@
 
 use core::mem::MaybeUninit;
 
-use crustify_prim::{c_out, COut};
+use ffibox::{c_out, COut};
 
 #[test]
 fn null_pointer_returns_none() {

@@ -1,6 +1,6 @@
-# crustify-prim
+# ffibox
 
-- Skill name: crustify-prim
+- Skill name: ffibox
 - Doc path: README.md
 - Description: Choose and apply the right crustify smart pointer / trait when
   representing a C type's ownership and lifetime in safe Rust. Use when

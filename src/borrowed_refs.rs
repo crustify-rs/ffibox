@@ -33,7 +33,7 @@ use crate::c_type::CCell;
 /// # Typical use
 ///
 /// ```ignore
-/// use crustify_prim::{COut, c_out};
+/// use ffibox::{COut, c_out};
 ///
 /// pub unsafe extern "C" fn my_get_len(out_len: *mut usize) -> i32 {
 ///     if let Some(out) = unsafe { c_out::from_ptr(out_len) } {

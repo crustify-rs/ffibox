@@ -1,4 +1,4 @@
-# crustify-prim
+# ffibox
 
 Generic smart pointers and traits for building safe Rust wrappers over C
 types and pointers. Designed for arbitrary user-space C interop, including the case
@@ -43,7 +43,7 @@ field access projects a raw pointer out of the handle and goes through
 ### CBox
 
 ```rust,ignore
-use crustify_prim::{define_ctype, CBox, CDropped};
+use ffibox::{define_ctype, CBox, CDropped};
 use core::ptr::NonNull;
 
 mod sys {
@@ -89,7 +89,7 @@ p.as_mut().set_x(5);
 ### CVoidBox
 
 ```rust,ignore
-use crustify_prim::{CVoidBox, CDropped};
+use ffibox::{CVoidBox, CDropped};
 use core::ptr::NonNull;
 
 mod sys {
@@ -119,7 +119,7 @@ unsafe { sys::arena_fill(buf.as_ptr(), 64) };
 ### CVal
 
 ```rust,ignore
-use crustify_prim::{define_ctype, CVal, CValued};
+use ffibox::{define_ctype, CVal, CValued};
 use core::ptr::NonNull;
 
 mod sys {
@@ -144,7 +144,7 @@ assert_eq!(unsafe { (*b.as_ref().as_ptr()).len }, 0);
 ### CVec
 
 ```rust,ignore
-use crustify_prim::{CVec, CLenDropped};
+use ffibox::{CVec, CLenDropped};
 use core::mem::size_of;
 
 mod sys {
@@ -446,7 +446,7 @@ single child, stores its `CKeepalive` inline and needs neither.
 
 ```toml
 [dependencies]
-crustify-prim = { version = "0.1", default-features = false }
+ffibox = { version = "0.1", default-features = false }
 ```
 
 ## Comparison with alternative systems

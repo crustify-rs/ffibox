@@ -19,7 +19,7 @@ use core::mem::size_of;
 use core::ops::Deref;
 use core::ptr::{addr_of, addr_of_mut, NonNull};
 use core::sync::atomic::{AtomicUsize, Ordering};
-use crustify_prim::{define_ctype, CBox, CBoxWith, CCell, CDropped, CDropper, CPtr, CType};
+use ffibox::{define_ctype, CBox, CBoxWith, CCell, CDropped, CDropper, CPtr, CType};
 
 #[repr(C)]
 pub struct foo_st {

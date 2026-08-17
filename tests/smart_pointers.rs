@@ -18,7 +18,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
-use crustify_prim::{
+use ffibox::{
     define_ctype, impl_dropped, CBox, CCell, CCloned, CDropped, CLenDropped, CPtr, CVal, CValGuard,
     CValued, CVec, CVoidBox,
 };
@@ -915,7 +915,7 @@ mock_getter!(
 pub struct elem_st {
     pub tag: u32,
 }
-crustify_prim::define_ctype!(Elem, ElemRef, ElemMut, elem_st);
+ffibox::define_ctype!(Elem, ElemRef, ElemMut, elem_st);
 
 impl ElemRef<'_> {
     fn tag(&self) -> u32 {

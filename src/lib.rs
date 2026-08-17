@@ -87,7 +87,7 @@
 //! ## Quick example
 //!
 //! ```ignore
-//! use crustify_prim::{CBox, define_ctype, impl_cloned, impl_dropped};
+//! use ffibox::{CBox, define_ctype, impl_cloned, impl_dropped};
 //!
 //! mod ffi {
 //!     #[repr(C)]

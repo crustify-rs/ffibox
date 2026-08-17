@@ -15,7 +15,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crustify_prim::{CBox, CCloned, CDropped, CKeepalive, CTethered};
+use ffibox::{CBox, CCloned, CDropped, CKeepalive, CTethered};
 
 static FREED: AtomicUsize = AtomicUsize::new(0);
 static UPREFS: AtomicUsize = AtomicUsize::new(0);
@@ -41,11 +41,11 @@ unsafe fn parent_free(p: *mut RawParent) {
     drop(unsafe { Box::from_raw(p) });
 }
 
-crustify_prim::define_ctype! {
+ffibox::define_ctype! {
     /// Wraps: RawParent
     Parent, ParentRef, ParentMut, RawParent
 }
-crustify_prim::define_ctype! {
+ffibox::define_ctype! {
     /// Wraps: RawChild
     Child, ChildRef, ChildMut, RawChild
 }

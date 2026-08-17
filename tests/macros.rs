@@ -12,7 +12,7 @@
 use core::cell::Cell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crustify_prim::{define_ctype, impl_cloned, impl_cvalued, impl_dropped, CBox, CVal};
+use ffibox::{define_ctype, impl_cloned, impl_cvalued, impl_dropped, CBox, CVal};
 
 // ---------------------------------------------------------------------------
 // Mock C struct + lifecycle functions

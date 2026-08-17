@@ -61,11 +61,11 @@ fn abort_process() -> ! {
     struct PanicOnDrop;
     impl Drop for PanicOnDrop {
         fn drop(&mut self) {
-            panic!("crustify_prim: unrecoverable failure in smart-pointer operation — aborting");
+            panic!("ffibox: unrecoverable failure in smart-pointer operation — aborting");
         }
     }
     let _guard = PanicOnDrop;
-    panic!("crustify_prim: unrecoverable failure in smart-pointer operation — aborting");
+    panic!("ffibox: unrecoverable failure in smart-pointer operation — aborting");
 }
 
 // ===========================================================================
