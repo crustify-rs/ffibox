@@ -32,7 +32,7 @@ use core::fmt;
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 
-use crate::borrowed_refs::CSlice;
+use crate::borrowed_refs::{CSlice, CSliceMut};
 use crate::c_type::{CCell, CType};
 use crate::traits::{
     CCloned, CCloner, CDropped, CDropper, CElem, CLenCloned, CLenDropped, CValued, Owner,
@@ -85,8 +85,7 @@ fn abort_process() -> ! {
 /// When the C parent owns teardown, embed the bare `T`, which has no `Drop`.
 ///
 /// Build the inner `T` with `T::zeroed()`, or `T::uninit()` followed by a C
-/// constructor on `T::as_ptr()` (reachable through `Deref`) before reading any
-/// field.
+/// constructor on [`as_ptr`](CVal::as_ptr) before reading any field.
 #[repr(transparent)]
 pub struct CVal<T: CValued + CCell> {
     inner: T,
@@ -95,8 +94,8 @@ pub struct CVal<T: CValued + CCell> {
 impl<T: CValued + CCell> CVal<T> {
     /// Wrap an already-constructed value, e.g.
     /// `CVal::new(GitOidarray::zeroed())`. For the C-init path, pass
-    /// `cv.as_ptr()` (resolved via `Deref` to `T::as_ptr()`, a `*mut C`) to
-    /// the C constructor before reading any field.
+    /// [`cv.as_ptr()`](CVal::as_ptr) — a `*mut C` — to the C constructor
+    /// before reading any field.
     #[inline]
     pub fn new(inner: T) -> Self {
         Self { inner }
@@ -745,6 +744,15 @@ impl<T: CCell, S: CLenDropped> CVec<T, S> {
         // SAFETY: `count` contiguous, initialised `T` at `ptr` per
         // `from_raw_parts`; the view is bound by `&self`.
         unsafe { CSlice::from_raw_parts(self.ptr, self.count) }
+    }
+
+    /// Borrow the buffer as a sequence of exclusive handles.
+    #[inline]
+    #[must_use]
+    pub fn as_handles_mut(&mut self) -> CSliceMut<'_, T> {
+        // SAFETY: as `as_handles`; `&mut self` and `CVec`'s exclusive ownership
+        // of the buffer make this the only route to those objects meanwhile.
+        unsafe { CSliceMut::from_raw_parts(self.ptr, self.count) }
     }
 }
 

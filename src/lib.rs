@@ -144,7 +144,7 @@ pub mod c_out {
 }
 
 // Re-export the primary items at the crate root for convenience.
-pub use crate::borrowed_refs::{COut, CSlice};
+pub use crate::borrowed_refs::{COut, CSlice, CSliceMut};
 pub use crate::c_type::{CCell, CPtr, CType};
 pub use crate::owned_refs::{
     CBox, CBoxWith, CKeepalive, CTethered, CVal, CValGuard, CVec, CVoidBox, CrustifyStr,

@@ -219,9 +219,12 @@ fn the_shared_handle_reads_and_the_exclusive_one_writes() {
     let mut m: BarMut<'_> = unsafe { BarMut::from_ptr(raw) }.unwrap();
     // SAFETY: `&mut self` carries write provenance.
     unsafe { (*m.as_mut_ptr()).payload = 99 };
-    // Getters reach through `Deref` to the shared handle.
+    // Reading through the exclusive handle goes via `as_ref`, which binds the
+    // shared handle to this borrow. There is no `Deref`: its target would carry
+    // the handle's own lifetime, and a `Copy` shared handle would then escape
+    // the reborrow.
     // SAFETY: written on the line above.
-    assert_eq!(unsafe { (*m.as_ptr()).payload }, 99);
+    assert_eq!(unsafe { (*m.as_ref().as_ptr()).payload }, 99);
 
     // The handles are one pointer, never the object.
     assert_eq!(

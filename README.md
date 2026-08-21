@@ -189,8 +189,8 @@ derived sub-types. Hand-write these, implementing the `CCell` contract for
 consistency with the crate's conventions.
 
 **Where accessors go.** Getters on `NRef<'a>` taking `&self`, setters on
-`NMut<'a>` taking `&mut self`; `NMut` derefs to `NRef`, so getters are written
-once. Both project a raw pointer out of the handle:
+`NMut<'a>` taking `&mut self`; `NMut` reaches the getters with `as_ref()`, so
+they are written once. Both project a raw pointer out of the handle:
 
 ```rust,ignore
 impl SslSessionRef<'_> {
@@ -217,9 +217,13 @@ code follows):
   on `CBox` take/return `*mut T::C` (the ffi type `ffi::c`, via `CCell`),
   **not** `*mut Wrapper` — so C interop is cast-free
   (`CBox::from_raw(ffi::X_new())`, `ffi::X_free(b.into_raw())`).
-- **Owning handles hand out handles, not references.** `as_ref()` / `as_mut()`
-  rather than `Deref`: `Deref::Target` cannot name a lifetime taken from
-  `&self`, and a handle carries one.
+- **Every handle is reached by a call, never by `Deref`.** `as_ref()` /
+  `as_mut()` on the owning wrappers, `as_ref()` on `NMut`: `Deref::Target`
+  cannot name a lifetime taken from `&self`, and a handle carries one. A
+  `Deref<Target = NRef<'a>>` would have to name the handle's *own* lifetime, and
+  since `NRef` is `Copy`, `*m` would copy a shared handle out of the reborrow —
+  leaving safe code holding a shared and an exclusive handle to one object at
+  once. The call costs nothing and keeps the borrow attached.
 - **Never take `&Wrapper` or `&mut Wrapper`.** Those cover the C object's bytes
   and would assert `noalias` / `readonly` / validity over memory C may write.
   `&NRef` covers one pointer of Rust stack instead. Read and write fields off
@@ -321,7 +325,7 @@ owns* (unique / shared / by value / type-erased) and *which phase of life*
 | `CBox<T>` | unique, typed | fully constructed | `T: CDropped + CCell` (`Clone` iff `T: CCloned`) | `src/owned_refs.rs` |
 | `CVal<T>` | by value (embedded/stack) | fully constructed | `T: CValued + CCell` | `src/owned_refs.rs` |
 | `CValGuard<'a, T>` | borrowed view with teardown, lifetime-bound | fully constructed | `T: CValued + CCell` | `src/owned_refs.rs` |
-| `CVec<T, S>` | length-aware buffer | fully constructed | `S: CLenDropped`; `as_slice` iff `T: CElem`, `as_handles` iff `T: CCell` | `src/owned_refs.rs` |
+| `CVec<T, S>` | length-aware buffer | fully constructed | `S: CLenDropped`; `as_slice` iff `T: CElem`, `as_handles` / `as_handles_mut` iff `T: CCell` | `src/owned_refs.rs` |
 | `CVoidBox<D>` | plain type-erased storage | fully constructed | `D: CDropped` | `src/owned_refs.rs` |
 | `CrustifyStr<D>` | owned NUL-terminated C string (`char *`); read-only slice views | fully constructed | `D: CDropped` | `src/owned_refs.rs` |
 | `CBoxWith<T, D>` | unique, typed, + inline teardown state | construction and fully constructed | `T: CCell`, `D: CDropper<T>` (`Clone` iff `D: CCloner + Clone`; `into_box` iff `T: CDropped`) | `src/owned_refs.rs` |
@@ -350,7 +354,8 @@ out-parameter slot.
 
 | Wrapper | Models | Owns? | Source |
 |---------|--------|-------|--------|
-| `CSlice<'a, T>` | a borrowed run of `len` contiguous wrapped C objects, yielded as per-element handles by `get` / `iter`. The slice analogue of a `Ref` handle: `&[T]` over wrapped objects would be a reference covering them. Reached with `CVec::as_handles`. | no (shared borrow) | `src/borrowed_refs.rs` |
+| `CSlice<'a, T>` | a borrowed run of `len` contiguous elements as a pointer and a count. Wrapped C objects (`T: CCell`) come out as per-element handles via `get` / `iter`; plain values (`T: CElem`) are copied out via `elem` / `elems` / `copy_to_slice`. The slice analogue of a `Ref` handle. Reached with `CVec::as_handles`. | no (shared borrow) | `src/borrowed_refs.rs` |
+| `CSliceMut<'a, T>` | the same run, exclusively: `get_mut` / `iter_mut` yield handles bound to `&mut self`, `set_elem` / `copy_from_slice` write plain values. Move-only, and reaches the shared view with `as_ref()`. Reached with `CVec::as_handles_mut`. | no (exclusive borrow) | `src/borrowed_refs.rs` |
 | `COut<'a, T>` | the write-end of a C `*mut T` **out-parameter** — a `&'a mut MaybeUninit<T>` the callee writes once. `c_out::from_ptr` hides the `*mut T → *mut MaybeUninit<T>` cast at the boundary; `Option<COut>` is layout-compat with `*mut T`. | no (borrowed write-slot) | `src/borrowed_refs.rs` |
 
 ---
@@ -394,8 +399,14 @@ read out as a slice view (`as_c_str` / `as_bytes` / `to_str`); it is **read-only
   - A **counted n-element buffer** (you index / read / write elements) ->
   `CVec<T, S>` (`S`: your own `CLenDropped` strategy). Plain Rust elements
   (`T: CElem`) read out as a real `&[T]` via `as_slice`; wrapped C objects go
-  through `as_handles` -> `CSlice<'a, T>`, since a `&[Foo]` would be a reference
-  covering them.
+  through `as_handles` / `as_handles_mut` -> `CSlice` / `CSliceMut`, since a
+  `&[Foo]` would be a reference covering them.
+  - A run that lives **inside a C object** takes `CSlice` / `CSliceMut` even
+  when the elements are plain (`T: CElem`): the marker says every bit pattern is
+  a valid `T`, which is what `CVec::as_slice` needs *because `CVec` owns its
+  buffer*. A run C keeps a pointer into is not owned, so a `&[T]` over it would
+  assert `noalias` / `readonly` against a writer Rust cannot see. The owner
+  decides, not the element type.
   - A **singleton** (one value) -> keep going.
 
 **Axis 2.3 Storage -- by value or own pointer?** Lives **by value inside another

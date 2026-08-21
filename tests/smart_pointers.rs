@@ -19,8 +19,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use ffibox::{
-    define_ctype, impl_dropped, CBox, CCell, CCloned, CDropped, CLenDropped, CPtr, CVal, CValGuard,
-    CValued, CVec, CVoidBox,
+    impl_dropped, CBox, CCell, CCloned, CDropped, CLenDropped, CPtr, CSlice,
+    CSliceMut, CVal, CValGuard, CValued, CVec, CVoidBox,
 };
 
 // ---------------------------------------------------------------------------
@@ -953,4 +953,61 @@ fn cvec_of_wrapped_objects_yields_handles() {
     // SAFETY: `run` borrows the live buffer; element 1 is in range.
     unsafe { core::ptr::addr_of_mut!((*run.as_ptr().add(1)).tag).write(7) };
     assert_eq!(run.iter().map(|e| e.tag()).sum::<u32>(), 7);
+}
+
+impl ElemMut<'_> {
+    fn set_tag(&mut self, v: u32) {
+        // SAFETY: the exclusive handle borrows a live `elem_st`; the write goes
+        // through the raw pointer, forming no reference.
+        unsafe { core::ptr::addr_of_mut!((*self.as_mut_ptr()).tag).write(v) }
+    }
+}
+
+#[test]
+fn the_exclusive_run_writes_through_per_element_handles() {
+    let mut v: CVec<Elem, RecordingFree> =
+        make_cvec(vec![Elem::zeroed(), Elem::zeroed(), Elem::zeroed()]);
+    let mut run = v.as_handles_mut();
+    assert_eq!(run.len(), 3);
+    assert!(run.get_mut(3).is_none());
+
+    run.get_mut(1).unwrap().set_tag(7);
+    assert_eq!(run.get(1).unwrap().tag(), 7);
+
+    // Every item of `iter_mut` addresses a distinct element, so holding them at
+    // once is sound -- the same reason `slice::iter_mut` is.
+    for (i, mut e) in run.iter_mut().enumerate() {
+        e.set_tag(i as u32 + 1);
+    }
+    assert_eq!(run.as_ref().iter().map(|e| e.tag()).sum::<u32>(), 6);
+}
+
+#[test]
+fn a_scalar_run_is_read_out_without_forming_a_slice() {
+    // What a wrapper reaches for when the run lives inside a C object rather
+    // than in a Rust-owned buffer: `CElem` makes every bit pattern valid, but
+    // it does not make `&[u32]` sound over memory C writes through a pointer it
+    // kept. Elements are copied out one at a time instead.
+    let mut buf = [1u32, 2, 3];
+    let ptr = core::ptr::NonNull::new(buf.as_mut_ptr()).unwrap();
+
+    // SAFETY: `buf` is live for the rest of the scope and holds 3 `u32`.
+    let run: CSlice<'_, u32> = unsafe { CSlice::from_raw_parts(ptr, 3) };
+    assert_eq!(run.elem(0), Some(1));
+    assert_eq!(run.elem(3), None);
+    assert_eq!(run.elems().sum::<u32>(), 6);
+    let mut out = [0u32; 3];
+    assert!(run.copy_to_slice(&mut out));
+    assert_eq!(out, [1, 2, 3]);
+    assert!(!run.copy_to_slice(&mut [0u32; 2]));
+
+    // SAFETY: as above, and `run` is dead by here, so this is the only view.
+    let mut w: CSliceMut<'_, u32> = unsafe { CSliceMut::from_raw_parts(ptr, 3) };
+    assert!(w.set_elem(0, 10));
+    assert!(!w.set_elem(3, 10));
+    assert_eq!(w.elem(0), Some(10));
+    assert!(w.copy_from_slice(&[4, 5, 6]));
+    assert!(!w.copy_from_slice(&[4, 5]));
+    assert_eq!(w.as_ref().elems().collect::<Vec<_>>(), vec![4, 5, 6]);
+    assert_eq!(buf, [4, 5, 6]);
 }

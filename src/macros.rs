@@ -26,7 +26,7 @@
 /// |------|-------|---------|
 /// | `$name` | `#[repr(transparent)]` over `CType<$c_type>` | the C layout — embeds by value in a `#[repr(C)]` mirror, and is what `CBox` points at |
 /// | `$rf<'a>` | `#[repr(transparent)]` over `CPtr<'a, $name>`, `Copy` | the shared seam and **all getters** |
-/// | `$mt<'a>` | `#[repr(transparent)]` over `$rf<'a>` | `Deref` to `$rf`, plus the write seam and **all setters** |
+/// | `$mt<'a>` | `#[repr(transparent)]` over `$rf<'a>` | the write seam and **all setters**; reaches the getters with `as_ref` |
 ///
 /// plus the [`CCell`](crate::CCell) impl linking them.
 ///
@@ -55,6 +55,34 @@
 /// `readonly` / validity over memory C may write. The handles cover one pointer
 /// of Rust stack instead. See the [`c_type`](crate::c_type) module docs.
 ///
+/// # Reading through an exclusive handle
+///
+/// `$mt` does **not** `Deref` to `$rf`. Spell `m.as_ref().getter()`, or call
+/// the getter directly and let auto-ref borrow the handle for the call.
+///
+/// `Deref::Target` cannot name a lifetime taken from `&self`, so the target
+/// would have to be `$rf<'a>` — the handle's own lifetime. Since `$rf` is
+/// `Copy`, `*m` would then copy a shared handle *out* of the reborrow: the
+/// reborrow ends at the copy, `m` stays usable exclusively, and safe code holds
+/// a shared and an exclusive handle to one object at once — exactly what
+/// [`from_ptr`](Self::from_ptr)'s contract forbids. It is the same reason
+/// [`CBox`](crate::CBox) and [`CVal`](crate::CVal) reach their handles through
+/// `as_ref` / `as_mut` rather than `Deref`.
+///
+/// The cost is one call. The gain is that the shared handle carries the borrow
+/// it came from, so the borrow checker rejects the pair:
+///
+/// ```compile_fail,E0502
+/// # #[repr(C)] pub struct bar_st { pub payload: u64 }
+/// ffibox::define_ctype!(Bar, BarRef, BarMut, bar_st);
+///
+/// fn demo(m: &mut BarMut<'_>) {
+///     let shared = m.as_ref();   // immutable borrow of `*m` starts here
+///     let _write = m.as_mut_ptr();
+///     let _read = shared.as_ptr();   // ... and is still live here
+/// }
+/// ```
+///
 /// # Safety
 ///
 /// The macro is safe to invoke but emits an `unsafe impl`. You assert that
@@ -72,7 +100,7 @@ macro_rules! define_ctype {
         #[derive(Clone, Copy)]
         pub struct $rf<'a>($crate::c_type::CPtr<'a, $name>);
 
-        #[doc = concat!("Exclusive borrow of a [`", stringify!($name), "`]. Derefs to [`", stringify!($rf), "`] for the getters and adds the setters.")]
+        #[doc = concat!("Exclusive borrow of a [`", stringify!($name), "`]. Reaches the getters with [`as_ref`](Self::as_ref); the setters live here.")]
         #[repr(transparent)]
         pub struct $mt<'a>($rf<'a>);
 
@@ -200,13 +228,6 @@ macro_rules! define_ctype {
             }
         }
 
-        impl<'a> ::core::ops::Deref for $mt<'a> {
-            type Target = $rf<'a>;
-            #[inline]
-            fn deref(&self) -> &$rf<'a> {
-                &self.0
-            }
-        }
     };
 }
 
