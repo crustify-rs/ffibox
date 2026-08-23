@@ -275,9 +275,9 @@ pub unsafe trait CLenDropped {
 /// and only on opt-in — a `CLenDropped`-only strategy is deliberately not
 /// cloneable.
 ///
-/// **Shallow**: copies bytes, not elements, so it is sound only for POD `T`
-/// that owns nothing. A buffer of owning elements needs a per-element deep
-/// clone, which this contract does not provide.
+/// This strategy copies bytes, not elements. [`CVec`](crate::CVec) therefore
+/// exposes cloning only when `T: Copy`; a buffer of owning elements needs a
+/// per-element clone contract, which this trait does not provide.
 ///
 /// # Safety
 ///

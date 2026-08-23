@@ -647,6 +647,34 @@ impl<D: CCloned> Clone for CrustifyStr<D> {
 /// with `*mut T` — for that, use a [`CBox`] over a transparent newtype. The
 /// strategy `S` is a compile-time parameter, so plain free, secure zero+free
 /// and zero-only cost nothing at runtime.
+///
+/// Byte-wise cloning is available only for [`Copy`] elements and a strategy
+/// implementing [`CLenCloned`]. Wrapped C objects deliberately do not meet
+/// that bound: duplicating their bytes would duplicate embedded ownership.
+///
+/// ```compile_fail
+/// use core::ptr::NonNull;
+/// use ffibox::{define_ctype, CLenCloned, CLenDropped, CVec};
+///
+/// #[repr(C)]
+/// pub struct RawObject {
+///     owned: *mut u8,
+/// }
+/// define_ctype!(Object, ObjectRef, ObjectMut, RawObject);
+///
+/// struct Memdup;
+/// unsafe impl CLenDropped for Memdup {
+///     unsafe fn c_drop_len(_: *mut u8, _: usize) {}
+/// }
+/// unsafe impl CLenCloned for Memdup {
+///     unsafe fn c_clone_len(_: *mut u8, _: usize) -> Option<NonNull<u8>> {
+///         unimplemented!()
+///     }
+/// }
+///
+/// fn requires_clone<T: Clone>() {}
+/// requires_clone::<CVec<Object, Memdup>>();
+/// ```
 pub struct CVec<T, S: CLenDropped> {
     ptr: NonNull<T>,
     count: usize,
@@ -764,14 +792,16 @@ impl<T, S: CLenDropped> Drop for CVec<T, S> {
     }
 }
 
-// `Clone` only when the strategy registers a copy via `CLenCloned`, so a
-// `CLenDropped`-only strategy fails to compile rather than silently making a
-// shallow, double-freeing copy.
-impl<T, S: CLenCloned> CVec<T, S> {
-    /// Fallible deep clone: byte-copies the buffer via the strategy's
+// `Clone` only when the elements support bitwise duplication and the strategy
+// registers a copy via `CLenCloned`. Owning elements and `CLenDropped`-only
+// strategies fail to compile rather than producing a shallow, double-freeing
+// copy.
+impl<T: Copy, S: CLenCloned> CVec<T, S> {
+    /// Fallible independent clone: byte-copies the elements into a fresh
+    /// allocation via the strategy's
     /// [`CLenCloned::c_clone_len`]. `None` if the C copy fails (e.g. OOM) — use
-    /// where the original C checked a `*_memdup` return. **Shallow**: sound
-    /// only for POD `T` (see [`CLenCloned`]).
+    /// where the original C checked a `*_memdup` return. Element values are
+    /// copied, not recursively cloned; the [`Copy`] bound makes that explicit.
     #[inline]
     pub fn try_clone(&self) -> Option<Self> {
         // SAFETY: `self.ptr` holds `byte_len()` live bytes; `c_clone_len`
@@ -785,7 +815,7 @@ impl<T, S: CLenCloned> CVec<T, S> {
     }
 }
 
-impl<T, S: CLenCloned> Clone for CVec<T, S> {
+impl<T: Copy, S: CLenCloned> Clone for CVec<T, S> {
     #[inline]
     fn clone(&self) -> Self {
         // Abort rather than fabricate a buffer; see `CBox::clone`.
