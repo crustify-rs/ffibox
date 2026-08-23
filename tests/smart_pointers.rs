@@ -19,8 +19,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use ffibox::{
-    impl_dropped, CBox, CCell, CCloned, CDropped, CLenDropped, CPtr, CSlice,
-    CSliceMut, CVal, CValGuard, CValued, CVec, CVoidBox,
+    impl_dropped, CBox, CCell, CCloned, CDropped, CLenDropped, CPtr, CSlice, CSliceMut, CVal,
+    CValGuard, CValued, CVec, CVoidBox,
 };
 
 // ---------------------------------------------------------------------------

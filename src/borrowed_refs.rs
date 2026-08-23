@@ -336,7 +336,8 @@ impl<'a, T: CCell> CSliceMut<'a, T> {
     pub fn iter(&self) -> impl Iterator<Item = T::Ref<'_>> {
         let (ptr, len) = (self.ptr, self.len);
         // SAFETY: `i < len`, per the constructor's contract.
-        (0..len).map(move |i| unsafe { T::ref_from_raw(NonNull::new_unchecked(ptr.as_ptr().add(i))) })
+        (0..len)
+            .map(move |i| unsafe { T::ref_from_raw(NonNull::new_unchecked(ptr.as_ptr().add(i))) })
     }
 
     /// Iterate the run as exclusive handles.
@@ -354,7 +355,8 @@ impl<'a, T: CCell> CSliceMut<'a, T> {
         // SAFETY: `i` is distinct on every step, so no two items address the
         // same element; each is initialised per the constructor and bound by
         // the `&mut self` borrow.
-        (0..len).map(move |i| unsafe { T::mut_from_raw(NonNull::new_unchecked(ptr.as_ptr().add(i))) })
+        (0..len)
+            .map(move |i| unsafe { T::mut_from_raw(NonNull::new_unchecked(ptr.as_ptr().add(i))) })
     }
 
     /// Raw pointer to the first element, for passing the run to C.
