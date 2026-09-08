@@ -392,6 +392,14 @@ impl<T: CDropped + CCell> fmt::Pointer for CBox<T> {
 // Type-erased, string, and buffer owners
 // ===========================================================================
 
+// SAFETY: `CBox` owns its `T` exclusively, exactly as `Box` does, so it is
+// `Send`/`Sync` on `Box`'s terms: moving the box moves the sole owner, and
+// sharing `&CBox` only shares what `T: Sync` already permits. `T` withholds
+// both auto traits until a wrapper opts in with its own safety proof.
+unsafe impl<T: CDropped + CCell + Send> Send for CBox<T> {}
+// SAFETY: as above -- `&CBox<T>` hands out `T::Ref<'_>`, which is shared access.
+unsafe impl<T: CDropped + CCell + Sync> Sync for CBox<T> {}
+
 // ---------------------------------------------------------------------------
 // CVoidBox<D> — type-erased owned FFI pointer (void*) with a static deleter class
 // ---------------------------------------------------------------------------
@@ -1024,6 +1032,13 @@ impl<T: CCell, D: CDropper<T>> fmt::Pointer for CBoxWith<T, D> {
 // ===========================================================================
 // Keeping a parent alive for a child that outlives its borrow
 // ===========================================================================
+
+// SAFETY: `CBoxWith` is a `CBox` plus its teardown state, so both must cross
+// together: `T` on `Box`'s terms, and `D` because the dropper is moved with it
+// and runs `Drop` on whichever thread holds the handle last.
+unsafe impl<T: CCell + Send, D: CDropper<T> + Send> Send for CBoxWith<T, D> {}
+// SAFETY: as above -- sharing the pair shares both halves.
+unsafe impl<T: CCell + Sync, D: CDropper<T> + Sync> Sync for CBoxWith<T, D> {}
 
 // ---------------------------------------------------------------------------
 // CKeepalive<T> — an owner token: teardown only, no access
