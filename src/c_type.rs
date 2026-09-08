@@ -74,6 +74,41 @@ use core::ptr::NonNull;
 pub struct CType<T> {
     value: T,
     _pin: PhantomPinned,
+    /// Opts the wrapper out of the `Send`/`Sync` auto-derive.
+    ///
+    /// A bindgen opaque type is `pub struct git_foo { _unused: [u8; 0] }`,
+    /// which is `Send + Sync`, so without this marker every generated newtype
+    /// would inherit both and a `T: Send` bound on a handle would constrain
+    /// nothing. A raw pointer is the only stable way to withhold an auto trait;
+    /// it is a 1-ZST, so `repr(transparent)` and the layout are unaffected.
+    ///
+    /// A wrapper earns them back by writing the impls itself, with the safety
+    /// proof the translator playbook requires:
+    ///
+    /// ```ignore
+    /// // SAFETY: <why ownership of the C object is thread-mobile>
+    /// unsafe impl Send for Foo {}
+    /// unsafe impl Send for FooMut<'_> {}
+    ///
+    /// // SAFETY: <why concurrent shared access is race-free>
+    /// unsafe impl Sync for Foo {}
+    /// unsafe impl Send for FooRef<'_> {}
+    /// unsafe impl Sync for FooRef<'_> {}
+    /// unsafe impl Sync for FooMut<'_> {}
+    /// ```
+    ///
+    /// `CBox<T>` and `CBoxWith<T, D>` follow from `Foo` alone -- their impls
+    /// are generic. The borrowed handles need their own lines because a
+    /// `where Foo: Sync` clause on a concrete type is a trivial bound and is
+    /// rejected on stable.
+    ///
+    /// The two groups are separate claims. `Send` is about moving ownership.
+    /// `Sync` asserts that concurrent shared access is race-free, which fails
+    /// for any routine that writes through a shared pointer -- a lazily
+    /// initialised cache, a non-atomic refcount, a memoised field. Before
+    /// granting it, audit every operation that takes `FooRef<'_>`; one that
+    /// writes belongs on `FooMut<'_>` instead.
+    _not_send_sync: PhantomData<*const ()>,
 }
 
 impl<T> CType<T> {
@@ -83,6 +118,7 @@ impl<T> CType<T> {
         Self {
             value,
             _pin: PhantomPinned,
+            _not_send_sync: PhantomData,
         }
     }
 
@@ -100,6 +136,7 @@ impl<T> CType<T> {
             // SAFETY: the caller asserts all-zero is a valid bit pattern for `T`.
             value: unsafe { core::mem::MaybeUninit::zeroed().assume_init() },
             _pin: PhantomPinned,
+            _not_send_sync: PhantomData,
         }
     }
 
