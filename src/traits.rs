@@ -1,5 +1,5 @@
 //! The lifecycle **contracts** the owners in [`refs`](crate::refs) run, plus
-//! [`CElem`] (slice-safe buffer elements) and [`CCell`] (the link from a
+//! [`CPlainElem`] (slice-safe buffer elements) and [`CCell`] (the link from a
 //! layout type to its handles).
 //!
 //! The lifecycle traits are implemented on a **policy** — typically a ZST
@@ -28,7 +28,7 @@ use core::ptr::NonNull;
 // Imported so the trait docs' intra-doc links resolve; none of them is named in
 // a signature here.
 #[allow(unused_imports)]
-use crate::refs::{CBox, CStrBox, CVal, CVec};
+use crate::refs::{CBox, CSlice, CStrBox, CVal, CVec};
 #[allow(unused_imports)]
 use crate::shared::{CArc, CGuardedArc, CGuardedRef};
 
@@ -267,35 +267,36 @@ pub unsafe trait CDispose<T> {
 ///
 /// # Safety
 ///
-/// Every bit pattern that may appear in a `CVec<Self, _>`'s buffer must be a
-/// valid `Self`. The slice reference is formed over the whole buffer at once, so
-/// a single bad element is undefined behaviour for the entire borrow.
-pub unsafe trait CElem {}
+/// Every bit pattern must be a valid `Self`, and `Self` must not be a C object
+/// whose bytes C may change behind a reference. A slice reference is formed
+/// over a whole buffer at once, so a single bad element is undefined behaviour
+/// for the entire borrow.
+pub unsafe trait CPlainElem {}
 
-macro_rules! impl_celem_for_primitives {
+macro_rules! impl_cplain_elem_for_primitives {
     ($($t:ty),* $(,)?) => {$(
         // SAFETY: no bit pattern of this type is invalid.
-        unsafe impl CElem for $t {}
+        unsafe impl CPlainElem for $t {}
     )*};
 }
 
-impl_celem_for_primitives!(
+impl_cplain_elem_for_primitives!(
     u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f32, f64,
 );
 
 // SAFETY: `MaybeUninit<T>` is valid for every bit pattern, which is the whole
 // point of it — the standard escape hatch for a buffer C has not filled.
-unsafe impl<T> CElem for core::mem::MaybeUninit<T> {}
+unsafe impl<T> CPlainElem for core::mem::MaybeUninit<T> {}
 
 // SAFETY: a raw pointer is valid for every bit pattern, null included.
-unsafe impl<T: ?Sized> CElem for *const T {}
+unsafe impl<T: ?Sized> CPlainElem for *const T {}
 // SAFETY: as above.
-unsafe impl<T: ?Sized> CElem for *mut T {}
+unsafe impl<T: ?Sized> CPlainElem for *mut T {}
 
 // SAFETY: an array of valid elements is valid.
-unsafe impl<T: CElem, const N: usize> CElem for [T; N] {}
+unsafe impl<T: CPlainElem, const N: usize> CPlainElem for [T; N] {}
 // SAFETY: a ZST has one bit pattern, the empty one.
-unsafe impl CElem for () {}
+unsafe impl CPlainElem for () {}
 
 // ===========================================================================
 // Length-aware buffer policies — drive CVec's cleanup / clone
@@ -324,6 +325,13 @@ unsafe impl CElem for () {}
 ///             libc::free(ptr.cast());
 ///         }
 ///     }
+/// **Any bit pattern is not the same as initialized.** Uninitialized memory is
+/// no bit pattern at all, so it is not a valid `u8` either: a buffer from a
+/// non-zeroing allocator is a `CVec<MaybeUninit<T>, _>` until it is filled,
+/// then [`CVec::assume_init`] turns it into a `CVec<T, _>`. A zeroing
+/// allocator may produce `T` directly, since all-zero is one of the bit
+/// patterns every `CPlainElem` accepts.
+///
 /// }
 /// ```
 pub unsafe trait CLenDrop {

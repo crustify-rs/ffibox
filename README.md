@@ -481,7 +481,7 @@ release it? This is about who *releases* the object, not who allocated it — a
   `strlen` recovers the length, so one `CDrop<c_char>` policy covers a plain
   free and a clearing free alike. Its views are read-only, like `CStr`.
 - **A counted array** → `CVec<T, P>`, one policy per allocator family. Plain
-  elements (`CElem`: integers, floats, raw pointers, `MaybeUninit`) read out as
+  elements (`CPlainElem`: integers, floats, raw pointers, `MaybeUninit`) read out as
   a real `&[T]` because the buffer is exclusively owned; wrapped C objects come
   out as handles through `as_handles` → `CSlice`, since `&[Foo]` would cover
   them. Where C returns NULL with 0 for an empty array, adopt with
@@ -529,7 +529,7 @@ lifetime-carrying layout type — needs this layer.
 |------|------|--------|
 | `CCell` | the linking trait: `type C` (the FFI type), `type Ref<'a>`, `type Mut<'a>`. No methods. Its `unsafe impl` promises that `Self` is layout-compatible with `C`, and that `Ref` / `Mut` are `#[repr(transparent)]` over `CBorrowedPtr<'a, Self>` with no `Drop`, and `Mut` invariant in `Self` (a `PhantomData<&'a mut Self>` field) — ffibox builds handles from that layout, and checks their size at compile time. | `src/traits.rs` |
 | `CBorrowedPtr<'a, T>` | what every handle wraps: one pointer tagged with the borrow's lifetime, `Copy` and covariant like `&'a T`. | `src/refs.rs` |
-| `CElem` | marker for buffer elements every bit pattern of which is valid; a wrapped C type implements `CCell` instead, so `&[Foo]` does not typecheck. | `src/traits.rs` |
+| `CPlainElem` | marker for plain-data elements: every bit pattern is a valid value and there is no C-side identity. It admits `&[T]` from a `CVec` (a wrapped C type implements `CCell` instead, so `&[Foo]` does not typecheck) and makes copies read out of memory C keeps writing sound. Not the same as initialized: an unfilled buffer is `CVec<MaybeUninit<T>, _>` until `assume_init`. | `src/traits.rs` |
 
 **Layout.** With a zero-sized policy, `CBox<Foo, P>` and the arcs are
 pointer-sized and `Option<CBox<Foo, P>>` is a null-niche `*mut ffi::foo`, so it
