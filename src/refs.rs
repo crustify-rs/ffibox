@@ -40,11 +40,11 @@
 use core::ffi::{c_char, c_void};
 use core::fmt;
 use core::marker::PhantomData;
-use core::mem::ManuallyDrop;
+use core::mem::{ManuallyDrop, MaybeUninit};
 use core::ops::{Bound, RangeBounds};
 use core::ptr::NonNull;
 
-use crate::traits::{CCell, CDispose, CDrop, CDupClone, CElem, CLenClone, CLenDrop};
+use crate::traits::{CCell, CDispose, CDrop, CDupClone, CLenClone, CLenDrop, CPlainElem};
 
 // ---------------------------------------------------------------------------
 // CBorrowedPtr — the storage behind every generated handle
@@ -609,7 +609,7 @@ unsafe impl<D: CDrop<c_char> + Sync> Sync for CStrBox<D> {}
 /// Owned C-allocated array of `len` elements, released on drop by the policy's
 /// [`c_drop_len`](CLenDrop::c_drop_len) with the total byte length.
 ///
-/// Plain elements ([`CElem`]) read out as a real `&[T]`, which is sound
+/// Plain elements ([`CPlainElem`]) read out as a real `&[T]`, which is sound
 /// because the buffer is owned exclusively. Wrapped C objects come out as
 /// handles through [`as_handles`](Self::as_handles), since `&[Foo]` would be a
 /// reference covering them.
@@ -822,14 +822,14 @@ impl<T, S: CLenDrop> CVec<T, S> {
     }
 }
 
-impl<T: CElem, S: CLenDrop> CVec<T, S> {
+impl<T: CPlainElem, S: CLenDrop> CVec<T, S> {
     /// The elements as a slice.
     #[inline]
     #[must_use]
     pub fn as_slice(&self) -> &[T] {
         // SAFETY: `len` initialised elements at `data()` per `from_raw_parts`
         // (none, at an aligned dangling pointer, when NULL), each valid by
-        // `T: CElem`, owned exclusively; bound by `&self`.
+        // `T: CPlainElem`, owned exclusively; bound by `&self`.
         unsafe { core::slice::from_raw_parts(self.data().as_ptr(), self.len) }
     }
 
@@ -839,6 +839,39 @@ impl<T: CElem, S: CLenDrop> CVec<T, S> {
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         // SAFETY: as `as_slice`, with `&mut self` making it exclusive.
         unsafe { core::slice::from_raw_parts_mut(self.data().as_ptr(), self.len) }
+    }
+}
+
+impl<T, S: CLenDrop> CVec<MaybeUninit<T>, S> {
+    /// The buffer as initialized elements, once the caller has filled it —
+    /// like `Box<[MaybeUninit<T>]>::assume_init`. The allocation, its length
+    /// and the policy carry over unchanged; an empty NULL buffer stays one.
+    ///
+    /// A buffer from a non-zeroing allocator starts as `MaybeUninit<T>`, since
+    /// uninitialized memory is not a valid `T` — not even a `u8`:
+    ///
+    /// ```ignore
+    /// let mut buf: CVec<MaybeUninit<u8>, AvFree> = alloc_bytes(n)?;
+    /// for b in buf.as_mut_slice() {
+    ///     b.write(0xff);
+    /// }
+    /// // SAFETY: every element was written above.
+    /// let buf: CVec<u8, AvFree> = unsafe { buf.assume_init() };
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// Every one of the `len` elements must be initialized to a valid `T`.
+    #[inline]
+    pub unsafe fn assume_init(self) -> CVec<T, S> {
+        let (ptr, len, policy) = self.into_raw_parts_with();
+        // `MaybeUninit<T>` has `T`'s size and alignment, so the cast keeps the
+        // byte length the policy frees with, and NULL stays NULL.
+        CVec {
+            ptr: NonNull::new(ptr.cast::<T>()),
+            len,
+            policy,
+        }
     }
 }
 
@@ -1209,7 +1242,7 @@ impl<'a, T: CCell> CSlice<'a, T> {
 
 /// A run of plain values is read out element-wise, still without a `&[T]`.
 ///
-/// [`CElem`] is what licenses [`CVec::as_slice`](crate::CVec::as_slice) to hand
+/// [`CPlainElem`] is what licenses [`CVec::as_slice`](crate::CVec::as_slice) to hand
 /// out a real `&[T]`, and it is not enough here — it answers *is every bit
 /// pattern a valid `T`*, while a `&[T]` also asserts `noalias` and `readonly`
 /// over the whole run for the whole borrow. `CVec` earns those by owning its
@@ -1217,7 +1250,7 @@ impl<'a, T: CCell> CSlice<'a, T> {
 /// pointer and may write through it, and no Rust lifetime constrains that. So
 /// the element type is not what decides between `&[T]` and a `CSlice` — the
 /// owner is.
-impl<'a, T: CElem> CSlice<'a, T> {
+impl<'a, T: CPlainElem> CSlice<'a, T> {
     /// Copy element `i` out; `None` if out of range.
     #[inline]
     #[must_use]
@@ -1229,7 +1262,7 @@ impl<'a, T: CElem> CSlice<'a, T> {
             return None;
         }
         // SAFETY: `i < len`, the constructor guarantees an initialised `T`
-        // there, and `T: CElem` makes every bit pattern a valid one. The read
+        // there, and `T: CPlainElem` makes every bit pattern a valid one. The read
         // is a copy — no reference over C's memory is formed.
         Some(unsafe { self.ptr.as_ptr().add(i).read() })
     }
@@ -1492,9 +1525,9 @@ impl<'a, T: CCell> CSliceMut<'a, T> {
 }
 
 /// A run of plain values is read and written element-wise. See the
-/// corresponding [`CSlice`] block for why [`CElem`] does not license a `&[T]`
+/// corresponding [`CSlice`] block for why [`CPlainElem`] does not license a `&[T]`
 /// over storage a C object owns.
-impl<'a, T: CElem> CSliceMut<'a, T> {
+impl<'a, T: CPlainElem> CSliceMut<'a, T> {
     /// Copy element `i` out; `None` if out of range.
     #[inline]
     #[must_use]

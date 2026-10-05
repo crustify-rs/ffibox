@@ -120,5 +120,5 @@ pub struct ReadmeDoctests;
 pub use crate::refs::{CBorrowedPtr, CBox, CSlice, CSliceMut, CStrBox, CVal, CVec, CVoidBox};
 pub use crate::shared::{CArc, CGuardedArc, CGuardedRef, CReadGuard, CWriteGuard};
 pub use crate::traits::{
-    CCell, CDispose, CDrop, CDupClone, CElem, CGuarded, CLenClone, CLenDrop, CRefClone,
+    CCell, CDispose, CDrop, CDupClone, CGuarded, CLenClone, CLenDrop, CPlainElem, CRefClone,
 };

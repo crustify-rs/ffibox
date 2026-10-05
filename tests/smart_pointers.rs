@@ -1105,7 +1105,7 @@ impl ElemRef<'_> {
 fn cvec_of_plain_values_yields_a_real_slice() {
     let _guard = lock(&CVEC_LOCK);
     let v: RecVec<u32> = make_cvec(vec![1u32, 2, 3]);
-    // `u32: CElem`, and the buffer is owned exclusively, so `&[u32]` holds.
+    // `u32: CPlainElem`, and the buffer is owned exclusively, so `&[u32]` holds.
     assert_eq!(v.as_slice(), &[1, 2, 3]);
     assert_eq!(v.as_slice().iter().sum::<u32>(), 6);
 }
@@ -1113,7 +1113,7 @@ fn cvec_of_plain_values_yields_a_real_slice() {
 #[test]
 fn cvec_of_wrapped_objects_yields_handles() {
     let _guard = lock(&CVEC_LOCK);
-    // `Elem` implements `CCell`, not `CElem`, so `as_slice()` does not compile
+    // `Elem` implements `CCell`, not `CPlainElem`, so `as_slice()` does not compile
     // for it -- a `&[Elem]` would be a reference covering the C objects. The
     // buffer is reached as handles instead.
     let mut v: RecVec<Elem> = make_cvec(vec![Elem::zeroed(), Elem::zeroed(), Elem::zeroed()]);
@@ -1164,7 +1164,7 @@ fn the_exclusive_run_writes_through_per_element_handles() {
 #[test]
 fn a_scalar_run_is_read_out_without_forming_a_slice() {
     // What a wrapper reaches for when the run lives inside a C object rather
-    // than in a Rust-owned buffer: `CElem` makes every bit pattern valid, but
+    // than in a Rust-owned buffer: `CPlainElem` makes every bit pattern valid, but
     // it does not make `&[u32]` sound over memory C writes through a pointer it
     // kept. Elements are copied out one at a time instead.
     let mut buf = [1u32, 2, 3];
