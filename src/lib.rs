@@ -25,8 +25,9 @@
 //! |------|------|
 //! | [`define_ctype!`] | per C type: the layout type `Foo` and its handles `FooRef<'a>` / `FooMut<'a>` |
 //! | [`CBox<T, D>`] / [`CVoidBox<D>`] | the sole owner of a C-allocated object / `void *` payload |
-//! | [`CArc<T, D>`] / [`CGuardedArc<T, D>`] | one counted reference to a refcounted object; the guarded one is reached through the object's lock |
-//! | [`CGuardedRef<'a, T>`] | a borrow reached through the object's lock, never released — a C global under its C lock |
+//! | [`CArc<T, D>`] | one counted reference to a refcounted object; [`lock`](CArc::lock) takes the C lock a [`CGuarded`] object carries |
+//! | [`CGuard<'a, T>`] | a held C lock, released on drop; hands out the `FooLocked<'a>` handle |
+//! | [`CGuardedRef<'a, T>`] | a borrow reached only through the object's lock, never released — a C global under its C lock |
 //! | [`CStrBox<D>`] | an owned NUL-terminated `char *` |
 //! | [`CVec<T, S>`] | an owned `(ptr, len)` buffer |
 //! | [`CVal<T, D>`] | a C struct held by value, disposed on drop |
@@ -118,7 +119,8 @@ pub mod traits;
 pub struct ReadmeDoctests;
 
 pub use crate::refs::{CBorrowedPtr, CBox, CSlice, CSliceMut, CStrBox, CVal, CVec, CVoidBox};
-pub use crate::shared::{CArc, CGuardedArc, CGuardedRef, CReadGuard, CWriteGuard};
+pub use crate::shared::{CArc, CGuard, CGuardedRef};
 pub use crate::traits::{
-    CCell, CDispose, CDrop, CDupClone, CGuarded, CLenClone, CLenDrop, CPlainElem, CRefClone,
+    CCell, CDispose, CDrop, CDupClone, CGuarded, CGuardedAll, CLenClone, CLenDrop, CPlainElem,
+    CRefClone, LockFields, LockScope, LockWhole,
 };

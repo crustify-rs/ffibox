@@ -12,7 +12,7 @@ conventions into RAII. The recurring shapes:
 
 - A C-allocated object with a destructor (`free`), and maybe a copy (`dup`).
 - A refcounted object shared by several holders (`up_ref` / `unref`), maybe
-  guarded by its own lock.
+  with a C lock over the state they mutate.
 - Types with multiple or runtime-conditional destructors.
 - A by-value struct whose teardown disposes its fields but not the struct.
 - An owned length-aware buffer or NUL-terminated `char *` with a C destructor.
@@ -30,8 +30,9 @@ No reference to C-owned memory is ever formed. Each C type gets a layout type
 setters; field access projects a raw pointer out of the handle. Ownership
 comes in three shapes: `CBox<Foo, P>` is the sole owner of an object behind a
 pointer and releases it through the policy `P`; `CArc<Foo, P>` is one of
-several counted references and hands out only the shared handle (its
-`CGuardedArc` sibling reaches the object through the object's own lock); and
+several counted references and hands out the shared handle, the exclusive one
+only when the count proves it sole, and — for an object with a C lock — a
+`CGuard` whose `FooLocked<'a>` handle reaches the state that lock protects; and
 `CVal<Foo, P>` holds the object inline and disposes its resources on drop.
 Strings, buffers and borrowed runs get their own types. [Section 1](#1-the-types-you-get) lists them all,
 [section 2](#2-policies--what-teardown-means) covers policies, and
@@ -97,10 +98,10 @@ let q = p.clone();           // point_dup
 `CBox` is a foreign type, so constructors go on the local `Foo` (or in free
 functions) rather than in an `impl CBox<Foo, _>` block.
 
-### A shared object — `CArc` / `CGuardedArc`
+### A shared object — `CArc`, and its lock
 
 ```rust,no_run
-use ffibox::{define_ctype, impl_cdrop, impl_cguarded, impl_crefclone, CArc, CGuardedArc};
+use ffibox::{define_ctype, impl_cdrop, impl_cguarded, impl_crefclone, CArc};
 
 mod sys {
     #[repr(C)] pub struct session_st { _opaque: [u8; 0] }
@@ -112,11 +113,11 @@ mod sys {
         pub fn store_new() -> *mut store_st;
         pub fn store_up_ref(s: *mut store_st) -> i32;      // 1 on success
         pub fn store_free(s: *mut store_st);
-        pub fn store_write_lock(s: *mut store_st) -> i32;  // 1 on success
-        pub fn store_read_lock(s: *mut store_st) -> i32;
+        pub fn store_name(s: *const store_st) -> i32;      // fixed after setup
+        pub fn store_add(s: *mut store_st, v: i32) -> i32; // locks internally
+        pub fn store_lock(s: *mut store_st) -> i32;        // 1 on success
         pub fn store_unlock(s: *mut store_st) -> i32;
-        pub fn store_add(s: *mut store_st, v: i32);
-        pub fn store_len(s: *const store_st) -> usize;
+        pub fn store_len_locked(s: *const store_st) -> usize; // caller holds the lock
     }
 }
 
@@ -131,37 +132,42 @@ pub type SessionArc = CArc<Session, SessionUnref>;
 let a = unsafe { SessionArc::from_c(sys::session_new()) }.unwrap();
 let b = a.clone();                      // session_up_ref; same object
 assert!(SessionArc::ptr_eq(&a, &b));
-let _shared = b.as_ref();               // shared handle only: no `as_mut`
+let _shared = b.as_ref();               // shared handle; no `as_mut`
 
-// Mutated by every holder: each access takes the object's own lock. Routines
-// that report a status are bound with `ok`, so a failure is never discarded.
+// A lock over part of the object. `impl_cguarded!` also defines
+// `StoreLocked`, the handle a held lock grants.
 define_ctype!(Store, StoreRef, StoreMut, sys::store_st);
-// SAFETY: the store's state is only touched under its lock.
+// SAFETY: the state holders mutate is only touched under the store's lock.
 unsafe impl Send for Store {}
 unsafe impl Sync for Store {}
-impl_cguarded!(Store, lock = sys::store_write_lock, unlock = sys::store_unlock,
-               read_lock = sys::store_read_lock, read_unlock = sys::store_unlock,
-               ok = |r| r == 1);
+impl_cguarded!(Store, StoreLocked, lock = sys::store_lock,
+               unlock = sys::store_unlock, ok = |r| r == 1);
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StoreUnref;
 impl_cdrop!(StoreUnref, Store, sys::store_free);
 impl_crefclone!(StoreUnref, Store, sys::store_up_ref, ok = |r| r == 1);
-pub type StoreArc = CGuardedArc<Store, StoreUnref>;
+pub type StoreArc = CArc<Store, StoreUnref>;
 
 impl StoreRef<'_> {
-    pub fn len(&self) -> usize { unsafe { sys::store_len(self.as_ptr()) } }
+    // Fixed state, and routines that take the lock themselves.
+    pub fn name(&self) -> i32 { unsafe { sys::store_name(self.as_ptr()) } }
+    pub fn add(&self, v: i32) -> bool {
+        unsafe { sys::store_add(self.as_ptr().cast_mut(), v) == 1 }
+    }
 }
-impl StoreMut<'_> {
-    pub fn add(&mut self, v: i32) { unsafe { sys::store_add(self.as_mut_ptr(), v) } }
+impl StoreLocked<'_> {
+    // The protected state: reads as well as writes need the lock.
+    pub fn len(&mut self) -> usize { unsafe { sys::store_len_locked(self.as_mut_ptr()) } }
 }
 
 let s = unsafe { StoreArc::from_c(sys::store_new()) }.unwrap();
 let t = s.clone();
-std::thread::spawn(move || t.write().as_mut().add(42));   // write lock
-let n = s.read().as_ref().len();                          // read lock
+std::thread::spawn(move || t.as_ref().add(42));   // locks inside C
+let n = s.lock().as_locked().len();               // locked until the guard drops
+let _ = s.as_ref().name();                        // no lock needed
 ```
 
-### A global behind its lock — `CGuardedRef`
+### A global under one lock — `CGuardedRef`
 
 ```rust,no_run
 use core::ptr::{addr_of, addr_of_mut};
@@ -182,10 +188,11 @@ unsafe impl Send for Registry {}
 unsafe impl Sync for Registry {}
 
 // The lock is a separate global taking no arguments: adapters give it the
-// shape `impl_cguarded!` calls.
+// shape `impl_cguarded!` calls. `all`: it covers the whole object, so the
+// locked handle is `RegistryMut`.
 unsafe fn lock(_: *mut sys::registry_st) -> i32 { unsafe { sys::registry_lock() } }
 unsafe fn unlock(_: *mut sys::registry_st) -> i32 { unsafe { sys::registry_unlock() } }
-impl_cguarded!(Registry, lock = lock, unlock = unlock, ok = |r| r == 0);
+impl_cguarded!(Registry, all, lock = lock, unlock = unlock, ok = |r| r == 0);
 
 impl RegistryRef<'_> {
     pub fn count(&self) -> i32 { unsafe { addr_of!((*self.as_ptr()).count).read() } }
@@ -201,9 +208,9 @@ pub fn registry() -> CGuardedRef<'static, Registry> {
     unsafe { CGuardedRef::from_ptr(addr_of_mut!(sys::registry)) }.unwrap()
 }
 
-let mut w = registry().write();          // registry_lock
-let n = w.as_ref().count();
-w.as_mut().set_count(n + 1);             // registry_unlock when `w` drops
+let mut g = registry().lock();           // registry_lock
+let n = g.as_ref().count();
+g.as_locked().set_count(n + 1);          // registry_unlock when `g` drops
 ```
 
 ### An opaque payload — `CVoidBox`
@@ -323,9 +330,10 @@ rather than repeating it.
 | | `CStrBox<P>` | ffibox | an owned NUL-terminated `char *`; read-only `CStr` / `str` / byte views |
 | | `CVec<T, P>` | ffibox | an owned `(ptr, len)` array, NULL when empty; `&[T]` for plain elements, `CSlice` for wrapped C objects |
 | | `CVoidBox<P>` | ffibox | an owned `void *` that is never looked inside (`CBox<c_void, P>`) |
-| shared owners | `CArc<Foo, P>` | ffibox | one counted reference to a refcounted object; `Clone` through the up_ref; shared handles only, plus `get_mut` / `make_mut` when the count proves it sole or after a copy |
-| | `CGuardedArc<Foo, P>` | ffibox | a `CArc` reached through the object's own lock: `read()` → `CReadGuard`, `write()` → `CWriteGuard`, each unlocking on drop — `Arc<RwLock<_>>` in one type, as the lock lives in the object |
-| guarded borrow | `CGuardedRef<'a, Foo>` | ffibox | an object reached through its own lock and never released, typically a C global under its C lock (`'static`): `read()` / `write()` as on a `CGuardedArc` — `&RwLock<_>` to its `Arc<RwLock<_>>` |
+| per C lock | `FooLocked<'a>` | `impl_cguarded!` | exclusive borrow under the C lock, move-only; getters and setters for the state the lock protects, the unlocked getters through `as_ref()` |
+| shared owner | `CArc<Foo, P>` | ffibox | one counted reference to a refcounted object; `Clone` through the up_ref; the shared handle always, `get_mut` / `make_mut` when the count proves it sole or after a copy, and `lock()` → `CGuard` when `Foo` is `CGuarded` |
+| lock | `CGuard<'a, Foo>` | ffibox | a held C lock, unlocking on drop — `MutexGuard`; `as_locked()` → `FooLocked<'_>`, `as_ref()` → `FooRef<'_>` |
+| guarded borrow | `CGuardedRef<'a, Foo>` | ffibox | an object under one lock covering all of it (`CGuardedAll`), never released — typically a C global (`'static`); only `lock()`, whose `as_locked()` is `FooMut` — `&Mutex<_>` |
 | views | `CSlice<'a, T>` / `CSliceMut<'a, T>` | ffibox | any borrowed run of elements — a buffer's, a struct field's, a getter's — as handles or copies, never a `&[T]` |
 
 A wrapper that needs generic parameters (a lifetime-carrying layout type, or
@@ -339,9 +347,10 @@ contract — see [Under the hood](#4-under-the-hood-hand-written-wrappers).
   `as_ref()`, so they are written once. Both project a raw pointer out of the
   handle and read or write through `addr_of!` / `addr_of_mut!`.
 - **Every holder reaches the handles the same way:** `as_ref()` / `as_mut()` on
-  `Foo`, `CBox`, `CVal`, a `CWriteGuard` and `FooMut` itself (where `as_mut()`
-  is the reborrow `&mut` gets implicitly: `helper(m.as_mut())` keeps `m`);
-  `as_ref()` alone on `CArc` and a `CReadGuard`. `CSliceMut` reborrows the same
+  `Foo`, `CBox`, `CVal` and `FooMut` itself (where `as_mut()` is the reborrow
+  `&mut` gets implicitly: `helper(m.as_mut())` keeps `m`); `as_ref()` alone on
+  `CArc`; `as_ref()` / `as_locked()` on a `CGuard` and on `FooLocked` (where
+  `as_locked()` reborrows). `CSliceMut` reborrows the same
   way, and splits and sub-ranges like `&mut [T]`. Never `Deref`:
   `Deref::Target` cannot name a lifetime taken from `&self`, and since `FooRef`
   is `Copy`, a `Deref<Target = FooRef<'a>>` on `FooMut` would let safe code copy
@@ -363,8 +372,9 @@ contract — see [Under the hood](#4-under-the-hood-hand-written-wrappers).
   `Foo` carries a zero-sized marker withholding `Send` / `Sync`; `CBox`,
   `CVal`, `CVec` and the views over a `Foo` inherit them once the wrapper
   writes `unsafe impl Send / Sync for Foo` with a safety proof, on the terms
-  of their std counterparts — `CBox` like `Box`, while `CArc` and
-  `CGuardedArc` need `Foo: Send + Sync`, like `Arc` and `Arc<RwLock<_>>`.
+  of their std counterparts — `CBox` like `Box`, `CArc` with
+  `Foo: Send + Sync` like `Arc`, and `CGuardedRef` with `Foo: Send` like
+  `&Mutex<_>`.
   Owners that never name a `Foo` — `CStrBox`, `CVoidBox`, and a `CVec` of
   plain elements (`CVec<u8, _>`) — follow their policy alone, and a unit-struct
   policy is `Send + Sync`, so **they cross threads by default**. That is right
@@ -389,11 +399,11 @@ carries `PhantomData<*const ()>` instead (see the conventions in
 |-------|---------|-------|--------|
 | `CDrop<T>` | `c_drop` — a `*_free`, or a refcount down-ref | `impl_cdrop!(P, Foo, f)`; `_str` / `_void` for `c_char` / `c_void` | `CBox`, `CStrBox`, `CArc` |
 | `CDupClone<T>: CDrop<T>` | `c_dup` — a deep copy (a NEW pointer, NULL on failure) | `impl_cdupclone!(P, Foo, f)`; `_str` for `strdup` | `Clone` / `try_clone` |
-| `CRefClone<T>: CDrop<T>` | `c_up_ref` — a refcount increment on the SAME pointer; `c_is_sole_owner` (default `false`) | `impl_crefclone!(P, Foo, f)`; `…, ok = |r| r == 1`, `…, sole = g` | `CArc` / `CGuardedArc` `Clone`, `get_mut`, `make_mut` |
+| `CRefClone<T>: CDrop<T>` | `c_up_ref` — a refcount increment on the SAME pointer; `c_is_sole_owner` (default `false`) | `impl_crefclone!(P, Foo, f)`; `…, ok = |r| r == 1`, `…, sole = g` | `CArc`'s `Clone`, `get_mut`, `make_mut` |
 | `CLenDrop` | `c_drop_len` — a buffer free, given the byte length | `impl_clendrop!(P, f)` | `CVec` |
 | `CLenClone: CLenDrop` | `c_clone_len` — a buffer memdup (`T: Copy` only) | `impl_clenclone!(P, f)` | `CVec`'s `Clone` |
 | `CDispose<T>` | `c_dispose` — `*_uninit` / `*_clear` on a value | `impl_cdispose!(P, Foo, f)` | `CVal` |
-| `CGuarded`, on `Foo` | `c_lock` / `c_unlock`, optionally `c_read_lock` / `c_read_unlock` | `impl_cguarded!(Foo, lock = f, unlock = g)`; `…, ok = |r| r == 0` | the guards of `CGuardedArc` / `CGuardedRef` |
+| `CGuarded`, on `Foo` | `c_lock` / `c_unlock`; the `Locked` handle; the `Scope` it covers | `impl_cguarded!(Foo, FooLocked, lock = f, unlock = g)`; `…, ok = |r| r == 1`; `impl_cguarded!(Foo, all, …)` for `CGuardedAll` | `CArc::lock`, `CGuardedRef::lock` |
 
 **Because the policy is a type parameter, an owner cannot exist without a
 destructor, and one C type can have several.** `CBox<Foo, FooFree>` next to
@@ -408,26 +418,40 @@ box holds its only reference (with the down-ref as `c_drop`); `CArc::from`
 shares it, and `CBox::try_from` (or `try_into_box`) takes it back once the count
 is 1 again.
 
-**Shared and mutable means locked.** A `CArc` has no unlocked write path: its
-exclusive handle needs the count to prove the reference sole (`get_mut`, which
-needs `c_is_sole_owner` — an Acquire read of a count that covers every
-reference, C's own included), or a private copy (`make_mut`, through
-`CDupClone` — never a byte copy, which would duplicate the object's
-sub-allocations, its count and its lock). An object every holder mutates goes
-in a `CGuardedArc`, which has no unlocked path at all: readers take the read
-lock together, a writer takes the write lock alone, and `CGuarded`'s contract
-makes C take the same lock. The exclusive lock must not be reentrant: a second
-`write` on the same thread blocks forever, or panics when the lock reports the
-self-deadlock (`pthread_rwlock_*`'s `EDEADLK`), rather than hand out a second
-handle. A failing C lock call panics, as `std`'s locks do; there is no
-poisoning.
+**Shared and mutable means locked — usually, part of it.** A `CArc` has no
+unlocked write path: its exclusive handle needs the count to prove the
+reference sole (`get_mut`, which needs `c_is_sole_owner` — an Acquire read of
+a count that covers every reference, C's own included), or a private copy
+(`make_mut`, through `CDupClone` — never a byte copy, which would duplicate
+the object's sub-allocations, its count and its lock). A C object rarely locks
+all of itself: it locks the state its holders mutate — a cache, a list of
+backends — and leaves the rest fixed once set up. That is `Arc<T>` with a
+`Mutex` field, not `Arc<Mutex<T>>`, and the handles split the same way:
+
+| State | Handle | Reached through |
+|-------|--------|-----------------|
+| fixed once shared; routines that lock internally | `FooRef` | `CArc::as_ref()`, always |
+| protected by the lock — reads too; routines that need it held | `FooLocked` | `CArc::lock()` → `CGuard::as_locked()` |
+| anything | `FooMut` | `CArc::get_mut()`, sole reference only |
+
+A getter for protected state never goes on `FooRef`: it would race with a
+writer holding the lock through another clone. `CGuarded`'s contract makes C
+take or require the same lock, and makes the layout type invariant in any
+lifetime the protected state can hold (as a `Mutex` field does), so a covariant
+`CArc` cannot shrink one. The lock must not be recursive: a second `lock` on
+the same thread blocks forever, or panics when the lock reports the
+self-deadlock (`EDEADLK`), rather than hand out a second `FooLocked`. A failing
+C lock call panics, as `std`'s locks do; there is no poisoning. An object whose
+lock covers all of it is `CGuardedAll` (`impl_cguarded!(Foo, all, …)`): its
+locked handle is `FooMut`, so it is reached only through a `CGuardedRef`,
+which has no unlocked path, and `CArc::lock` rejects it at compile time.
 
 **Routines are plain paths, type-checked.** Each macro calls the routine with a
 pointer of the exact C type; a routine for the wrong type does not compile.
 Where a call can fail — an up_ref, a lock — the routine either returns `()` or
 is bound with `ok = |r| r == 1` (whatever its success value is); a status code
-is never silently discarded, so `pthread_rwlock_wrlock`'s `EDEADLK` becomes a
-panic rather than a second exclusive handle. A
+is never silently discarded, so `pthread_mutex_lock`'s `EDEADLK` becomes a
+panic rather than a second locked handle. A
 destructor of any other shape — one taking the slot (`ffi::foo_free(&mut p)`),
 a `void *` allocator free, extra arguments — goes behind a small `unsafe fn`
 adapter passed by path. Teardown is unconditional: a gate that suppresses it on
@@ -460,9 +484,9 @@ release it? This is about who *releases* the object, not who allocated it — a
   - one object → `FooRef<'a>` / `FooMut<'a>`, its lifetime tied to whatever
     keeps it alive (a parent's handle, the call);
   - a run of elements → `CSlice<'a, T>` / `CSliceMut<'a, T>`;
-  - an object every access reaches under its own lock — typically a C global
-    and the C lock protecting it → `CGuardedRef<'a, Foo>`, `'static` for a
-    global, with `impl_cguarded!` on `Foo`;
+  - an object every access reaches under one lock covering all of it —
+    typically a C global and the C lock protecting it → `CGuardedRef<'a, Foo>`,
+    `'static` for a global, with `impl_cguarded!(Foo, all, …)`;
   - a NUL string → `&CStr` / `&str` / `&[u8]` tied to the owner's borrow;
   - an out-parameter slot → `&'a mut MaybeUninit<T>` from
     `ptr.cast::<MaybeUninit<T>>().as_mut()`; no ffibox type;
@@ -496,8 +520,7 @@ release it? This is about who *releases* the object, not who allocated it — a
   - address-sensitive (points into itself, or C recorded its address) → not
     inline at all: behind a pointer, as below.
 - **One object behind a pointer** → `CBox<Foo, P>` if this is the only
-  reference, `CArc<Foo, P>` / `CGuardedArc<Foo, P>` if it is one of several
-  counted ones; a type-erased `void *` payload → `CVoidBox<P>`.
+  reference, `CArc<Foo, P>` if it is one of several counted ones; a type-erased `void *` payload → `CVoidBox<P>`.
 
 **Step 3 — Which policy?** (boxes, strings, buffers)
 
@@ -508,8 +531,8 @@ release it? This is about who *releases* the object, not who allocated it — a
 | `foo_unref`, held as the only reference | `impl_cdrop!` with the down-ref; no `Clone` |
 | `foo_unref` + `foo_up_ref`, shared, read-only | `impl_cdrop!` + `impl_crefclone!` → `CArc` |
 | … and a readable count | `impl_crefclone!(…, sole = g)`: `get_mut` without a copy |
-| … mutated by every holder, with a lock | + `impl_cguarded!` on `Foo` → `CGuardedArc` |
-| a global, never freed, under a C lock | no policy: `impl_cguarded!` on `Foo` → `CGuardedRef<'static, Foo>` |
+| … with state every holder mutates under a C lock | + `impl_cguarded!(Foo, FooLocked, …)` → `CArc::lock`; protected getters and setters on `FooLocked` |
+| a global, never freed, under one C lock | no policy: `impl_cguarded!(Foo, all, …)` → `CGuardedRef<'static, Foo>` |
 | a counted reference with no up_ref | `impl_cdrop!` alone → `CArc` without `Clone` |
 | teardown needs runtime state | a hand-written policy; adopt with `from_raw_with` |
 | built in Rust, not by a C constructor | storage-only policy → `with_policy` |

@@ -1,16 +1,17 @@
-//! `CArc` and `CGuardedArc` over a mock refcounted C object with an atomic
-//! count and its own reader/writer lock: cloning through the up_ref, the
-//! sole-owner check behind `get_mut` / `make_mut`, and the guards — including
-//! writers racing on several threads.
+//! `CArc` over a mock refcounted C object with an atomic count and a lock over
+//! one of its fields: cloning through the up_ref, the sole-owner check behind
+//! `get_mut` / `make_mut`, and `lock` — including writers racing on several
+//! threads while readers of the unlocked state run alongside. Then
+//! `CGuardedRef` over a global whose lock covers all of it.
 
 #![allow(non_camel_case_types, missing_docs)]
 
 use core::ptr::{addr_of, addr_of_mut, NonNull};
-use core::sync::atomic::{fence, AtomicIsize, AtomicUsize, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering};
 
 use ffibox::{
     define_ctype, impl_cdrop, impl_cdupclone, impl_cguarded, impl_crefclone, CArc, CBox, CDrop,
-    CGuardedArc, CGuardedRef, CRefClone, CWriteGuard,
+    CGuard, CGuardedRef, CRefClone,
 };
 
 // ---------------------------------------------------------------------------
@@ -20,11 +21,13 @@ use ffibox::{
 #[repr(C)]
 pub struct obj_st {
     rc: AtomicUsize,
-    /// The lock: -1 while a writer holds it, otherwise the reader count.
-    lock: AtomicIsize,
-    read_locks: AtomicUsize,
-    write_locks: AtomicUsize,
+    /// The mutex, and how many times it was taken.
+    held: AtomicBool,
+    locks: AtomicUsize,
+    /// Fixed once the object is shared: read without the lock.
     value: u64,
+    /// Written by every holder after sharing: only under the lock.
+    counter: u64,
     /// Counts frees; each test passes its own counter, so tests share nothing.
     freed: &'static AtomicUsize,
 }
@@ -32,10 +35,10 @@ pub struct obj_st {
 fn obj_new(value: u64, freed: &'static AtomicUsize) -> *mut obj_st {
     Box::into_raw(Box::new(obj_st {
         rc: AtomicUsize::new(1),
-        lock: AtomicIsize::new(0),
-        read_locks: AtomicUsize::new(0),
-        write_locks: AtomicUsize::new(0),
+        held: AtomicBool::new(false),
+        locks: AtomicUsize::new(0),
         value,
+        counter: 0,
         freed,
     }))
 }
@@ -71,70 +74,53 @@ unsafe fn obj_is_sole(p: *mut obj_st) -> bool {
 
 /// # Safety
 ///
-/// `p` must be a live `obj_st` no one writes meanwhile.
-unsafe fn obj_dup(p: *mut obj_st) -> *mut obj_st {
-    // SAFETY: the caller keeps `p` live and quiescent.
-    unsafe { obj_new(addr_of!((*p).value).read(), (*p).freed) }
-}
-
-/// # Safety
-///
 /// `p` must be a live `obj_st`.
-unsafe fn obj_write_lock(p: *mut obj_st) {
-    // References to the atomic fields only: a `&obj_st` would cover `value`,
+unsafe fn obj_lock(p: *mut obj_st) {
+    // References to the atomic fields only: a `&obj_st` would cover `counter`,
     // which the current holder may be writing on another thread — the race
     // ffibox's no-reference rule exists to prevent.
     // SAFETY: the caller keeps `p` live.
-    let (lock, write_locks) = unsafe { (&(*p).lock, &(*p).write_locks) };
-    while lock
-        .compare_exchange_weak(0, -1, Ordering::Acquire, Ordering::Relaxed)
+    let (held, locks) = unsafe { (&(*p).held, &(*p).locks) };
+    while held
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
         std::thread::yield_now();
     }
-    write_locks.fetch_add(1, Ordering::Relaxed);
+    locks.fetch_add(1, Ordering::Relaxed);
 }
 
 /// # Safety
 ///
-/// The caller must hold the write lock on a live `p`.
-unsafe fn obj_write_unlock(p: *mut obj_st) {
+/// The caller must hold the lock on a live `p`.
+unsafe fn obj_unlock(p: *mut obj_st) {
     // SAFETY: the caller keeps `p` live.
-    unsafe { (*p).lock.store(0, Ordering::Release) };
+    unsafe { (*p).held.store(false, Ordering::Release) };
 }
 
+/// A copy routine that, like a C `*_dup` on a locked object, takes the lock
+/// around the state it protects — what `CGuarded`'s contract asks of a
+/// `CDupClone` policy.
+///
 /// # Safety
 ///
 /// `p` must be a live `obj_st`.
-unsafe fn obj_read_lock(p: *mut obj_st) {
-    // The atomic fields only, as in `obj_write_lock`.
-    // SAFETY: the caller keeps `p` live.
-    let (lock, read_locks) = unsafe { (&(*p).lock, &(*p).read_locks) };
-    loop {
-        let n = lock.load(Ordering::Relaxed);
-        if n >= 0
-            && lock
-                .compare_exchange_weak(n, n + 1, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
-        {
-            break;
-        }
-        std::thread::yield_now();
+unsafe fn obj_dup(p: *mut obj_st) -> *mut obj_st {
+    // SAFETY: the caller keeps `p` live; `value` is fixed once shared.
+    let copy = unsafe { obj_new(addr_of!((*p).value).read(), (*p).freed) };
+    // SAFETY: as above; `counter` is read under the lock.
+    unsafe {
+        obj_lock(p);
+        let counter = addr_of!((*p).counter).read();
+        obj_unlock(p);
+        addr_of_mut!((*copy).counter).write(counter);
     }
-    read_locks.fetch_add(1, Ordering::Relaxed);
-}
-
-/// # Safety
-///
-/// The caller must hold a read lock on a live `p`.
-unsafe fn obj_read_unlock(p: *mut obj_st) {
-    // SAFETY: the caller keeps `p` live.
-    unsafe { (*p).lock.fetch_sub(1, Ordering::Release) };
+    copy
 }
 
 define_ctype!(Obj, ObjRef, ObjMut, obj_st);
-// SAFETY: the count and the lock are atomic, and `value` is only written under
-// the write lock or through a sole reference.
+// SAFETY: the count and the lock are atomic, `value` is written only through
+// a sole reference, and `counter` only under the lock or through one.
 unsafe impl Send for Obj {}
 // SAFETY: as above.
 unsafe impl Sync for Obj {}
@@ -142,20 +128,11 @@ unsafe impl Sync for Obj {}
 unsafe impl Send for ObjRef<'_> {}
 // SAFETY: as above.
 unsafe impl Sync for ObjRef<'_> {}
-// SAFETY: `&mut T: Send` follows from `T: Send`.
-unsafe impl Send for ObjMut<'_> {}
-// SAFETY: as above.
-unsafe impl Sync for ObjMut<'_> {}
 
-impl_cguarded!(
-    Obj,
-    lock = obj_write_lock,
-    unlock = obj_write_unlock,
-    read_lock = obj_read_lock,
-    read_unlock = obj_read_unlock,
-);
+impl_cguarded!(Obj, ObjLocked, lock = obj_lock, unlock = obj_unlock);
 
 impl ObjRef<'_> {
+    /// Unlocked state: fixed once the object is shared.
     fn value(&self) -> u64 {
         // SAFETY: a read through the handle's pointer; no reference is formed.
         unsafe { addr_of!((*self.as_ptr()).value).read() }
@@ -164,18 +141,13 @@ impl ObjRef<'_> {
         // SAFETY: an atomic field, read through the handle's pointer.
         unsafe { (*self.as_ptr()).rc.load(Ordering::SeqCst) }
     }
-    fn lock_state(&self) -> isize {
+    fn held(&self) -> bool {
         // SAFETY: as above.
-        unsafe { (*self.as_ptr()).lock.load(Ordering::SeqCst) }
+        unsafe { (*self.as_ptr()).held.load(Ordering::SeqCst) }
     }
-    fn locks(&self) -> (usize, usize) {
+    fn locks(&self) -> usize {
         // SAFETY: as above.
-        unsafe {
-            (
-                (*self.as_ptr()).read_locks.load(Ordering::SeqCst),
-                (*self.as_ptr()).write_locks.load(Ordering::SeqCst),
-            )
-        }
+        unsafe { (*self.as_ptr()).locks.load(Ordering::SeqCst) }
     }
 }
 
@@ -183,6 +155,18 @@ impl ObjMut<'_> {
     fn set_value(&mut self, v: u64) {
         // SAFETY: a write through the exclusive handle's pointer.
         unsafe { addr_of_mut!((*self.as_mut_ptr()).value).write(v) }
+    }
+}
+
+impl ObjLocked<'_> {
+    /// Locked state: read as well as written under the lock.
+    fn counter(&mut self) -> u64 {
+        // SAFETY: the lock is held for the handle's life.
+        unsafe { addr_of!((*self.as_mut_ptr()).counter).read() }
+    }
+    fn set_counter(&mut self, v: u64) {
+        // SAFETY: as above.
+        unsafe { addr_of_mut!((*self.as_mut_ptr()).counter).write(v) }
     }
 }
 
@@ -206,16 +190,10 @@ pub struct ObjDropOnly;
 impl_cdrop!(ObjDropOnly, Obj, obj_unref);
 
 type ObjArc = CArc<Obj, ObjUnref>;
-type ObjGuarded = CGuardedArc<Obj, ObjUnref>;
 
 fn arc(value: u64, freed: &'static AtomicUsize) -> ObjArc {
     // SAFETY: a fresh object whose one reference `obj_unref` releases.
     unsafe { ObjArc::from_c(obj_new(value, freed)) }.unwrap()
-}
-
-fn guarded(value: u64, freed: &'static AtomicUsize) -> ObjGuarded {
-    // SAFETY: as `arc`.
-    unsafe { ObjGuarded::from_c(obj_new(value, freed)) }.unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -340,40 +318,42 @@ fn up_ref_is_settled_by_the_down_ref_through_the_trait() {
 }
 
 // ---------------------------------------------------------------------------
-// CGuardedArc
+// CArc::lock
 // ---------------------------------------------------------------------------
 
 #[test]
-fn as_mut_holds_the_write_lock_until_the_guard_drops() {
+fn lock_holds_the_lock_until_the_guard_drops() {
     static FREED: AtomicUsize = AtomicUsize::new(0);
-    let a = guarded(1, &FREED);
+    let a = arc(1, &FREED);
     let b = a.clone();
     {
-        let mut w = b.write();
-        w.as_mut().set_value(7);
-        assert_eq!(w.as_ref().lock_state(), -1, "write-locked");
-        assert_eq!(w.as_ref().value(), 7);
+        let mut g = b.lock();
+        g.as_locked().set_counter(7);
+        assert!(g.as_ref().held(), "locked");
+        assert!(a.as_ref().held(), "for every clone");
+        assert_eq!(g.as_locked().counter(), 7);
+        assert_eq!(a.as_ref().value(), 1, "unlocked state stays readable");
     }
-    let r = a.read();
-    assert_eq!(r.as_ref().lock_state(), 1, "unlocked, then read-locked");
-    assert_eq!(r.as_ref().value(), 7, "the write is visible from the clone");
-    assert_eq!(r.as_ref().locks(), (1, 1));
-    drop(r);
-    assert_eq!(a.read().as_ref().lock_state(), 1);
+    assert!(!a.as_ref().held(), "the guard unlocked on drop");
+    assert_eq!(a.lock().as_locked().counter(), 7, "visible from the clone");
+    assert_eq!(a.as_ref().locks(), 2);
 }
 
 #[test]
-fn readers_hold_the_lock_together() {
+fn a_locked_handle_reborrows_and_reaches_the_getters() {
     static FREED: AtomicUsize = AtomicUsize::new(0);
-    let a = guarded(1, &FREED);
-    let b = a.clone();
-    let r1 = a.read();
-    let r2 = b.read();
-    assert_eq!(r1.as_ref().lock_state(), 2);
-    assert_eq!(r2.as_ref().value(), 1);
-    drop((r1, r2));
-    let w = a.write();
-    assert_eq!(w.as_ref().lock_state(), -1);
+    let a = arc(3, &FREED);
+    let mut g = a.lock();
+    let mut h = g.as_locked();
+    fn bump(mut h: ObjLocked<'_>) {
+        let v = h.counter();
+        h.set_counter(v + 1);
+    }
+    bump(h.as_locked());
+    bump(h.as_locked());
+    assert_eq!(h.counter(), 2);
+    assert_eq!(h.as_ref().value(), 3);
+    assert_eq!(g.as_ptr(), a.as_ptr());
 }
 
 #[test]
@@ -381,67 +361,62 @@ fn writers_on_many_threads_serialise_through_the_lock() {
     static FREED: AtomicUsize = AtomicUsize::new(0);
     const THREADS: u64 = 8;
     const ROUNDS: u64 = 2_000;
-    let a = guarded(0, &FREED);
+    let a = arc(42, &FREED);
 
     let handles: Vec<_> = (0..THREADS)
         .map(|_| {
             let mine = a.clone();
             std::thread::spawn(move || {
+                let mut seen = 0;
                 for _ in 0..ROUNDS {
-                    let mut w = mine.write();
-                    // A read-modify-write that loses updates without the lock.
-                    let v = w.as_ref().value();
-                    std::hint::spin_loop();
-                    w.as_mut().set_value(v + 1);
+                    {
+                        let mut g = mine.lock();
+                        let mut h = g.as_locked();
+                        // A read-modify-write that loses updates without the lock.
+                        let v = h.counter();
+                        std::hint::spin_loop();
+                        h.set_counter(v + 1);
+                    }
+                    // The unlocked state is read alongside the other writers.
+                    seen += mine.as_ref().value();
                 }
-                // Readers run alongside the other threads' writers.
-                mine.read().as_ref().value()
+                seen
             })
         })
         .collect();
     for h in handles {
-        assert!(h.join().unwrap() <= THREADS * ROUNDS);
+        assert_eq!(h.join().unwrap(), 42 * ROUNDS);
     }
 
-    assert_eq!(a.read().as_ref().value(), THREADS * ROUNDS);
-    assert_eq!(a.read().as_ref().rc(), 1);
+    assert_eq!(a.lock().as_locked().counter(), THREADS * ROUNDS);
+    assert_eq!(a.as_ref().rc(), 1);
     drop(a);
     assert_eq!(FREED.load(Ordering::SeqCst), 1);
 }
 
 #[test]
-fn guarded_make_mut_copies_under_the_read_lock_and_unlocks() {
+fn make_mut_copies_the_locked_state_under_the_lock() {
     static FREED: AtomicUsize = AtomicUsize::new(0);
-    let a = guarded(5, &FREED);
+    let a = arc(5, &FREED);
+    a.lock().as_locked().set_counter(4);
     let mut b = a.clone();
     b.make_mut().set_value(6);
 
-    let r = a.read();
-    assert_eq!(r.as_ref().value(), 5);
-    assert_eq!(r.as_ref().rc(), 1);
-    // One read lock for the copy, one for `r`.
-    assert_eq!(r.as_ref().locks(), (2, 0));
-    assert_eq!(
-        r.as_ref().lock_state(),
-        1,
-        "the copy's read lock was released"
-    );
-    drop(r);
-
+    assert_eq!(a.as_ref().locks(), 2, "the copy took the original's lock");
+    assert!(!a.as_ref().held(), "and released it");
+    assert_eq!(a.as_ref().value(), 5);
+    assert_eq!(b.as_ref().value(), 6);
+    assert_eq!(b.lock().as_locked().counter(), 4);
     assert!(b.get_mut().is_some());
-    assert_eq!(b.read().as_ref().value(), 6);
 }
 
 #[test]
-fn guarded_make_mut_on_a_reference_it_cannot_prove_sole() {
+fn get_mut_reaches_the_locked_state_without_the_lock() {
     static FREED: AtomicUsize = AtomicUsize::new(0);
-    // The blind policy copies even a sole reference, releasing the original —
-    // its last reference — only after unlocking it.
-    // SAFETY: a fresh object whose one reference `obj_unref` releases.
-    let mut a = unsafe { CGuardedArc::<Obj, ObjUnrefBlind>::from_c(obj_new(1, &FREED)) }.unwrap();
-    a.make_mut().set_value(2);
-    assert_eq!(FREED.load(Ordering::SeqCst), 1);
-    assert_eq!(a.read().as_ref().value(), 2);
+    let mut a = arc(1, &FREED);
+    // Sole: no other reference can take the lock, so none is needed.
+    a.get_mut().unwrap().set_value(2);
+    assert_eq!(a.as_ref().locks(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -493,15 +468,12 @@ fn shared_owners_need_send_and_sync_where_a_box_needs_send() {
     <CArc<Mobile, MobileUnref> as AmbiguousIfSend<_>>::check();
     is_send::<ObjArc>();
     is_sync::<ObjArc>();
-    is_send::<ObjGuarded>();
-    is_sync::<ObjGuarded>();
 }
 
 #[test]
 fn guards_stay_on_the_locking_thread() {
-    <CWriteGuard<'_, Obj> as AmbiguousIfSend<_>>::check();
-    <ffibox::CReadGuard<'_, Obj> as AmbiguousIfSend<_>>::check();
-    is_sync::<CWriteGuard<'_, Obj>>();
+    <CGuard<'_, Obj> as AmbiguousIfSend<_>>::check();
+    is_sync::<CGuard<'_, Obj>>();
 }
 
 #[test]
@@ -519,7 +491,8 @@ fn a_drop_only_share_is_held_but_not_cloned() {
 fn a_zst_policy_keeps_the_arcs_pointer_sized() {
     use core::mem::size_of;
     assert_eq!(size_of::<ObjArc>(), size_of::<*mut obj_st>());
-    assert_eq!(size_of::<Option<ObjGuarded>>(), size_of::<*mut obj_st>());
+    assert_eq!(size_of::<Option<ObjArc>>(), size_of::<*mut obj_st>());
+    assert_eq!(size_of::<ObjLocked<'_>>(), size_of::<*mut obj_st>());
 }
 
 /// A lock whose C call always fails.
@@ -530,6 +503,8 @@ pub struct broken_st {
 define_ctype!(Broken, BrokenRef, BrokenMut, broken_st);
 // SAFETY: `c_lock` never succeeds, so no guard is ever handed out.
 unsafe impl ffibox::CGuarded for Broken {
+    type Locked<'a> = BrokenMut<'a>;
+    type Scope = ffibox::LockFields;
     unsafe fn c_lock(_: NonNull<Self>) -> bool {
         false
     }
@@ -552,11 +527,9 @@ unsafe impl CDrop<Broken> for BrokenFree {
 fn a_failing_lock_call_panics_and_leaves_nothing_locked() {
     let raw = Box::into_raw(Box::new([0u8; 1])).cast::<Broken>();
     // SAFETY: a fresh allocation `BrokenFree` releases.
-    let a = unsafe { CGuardedArc::<Broken, BrokenFree>::from_raw(raw) }.unwrap();
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(a.write())));
-    assert!(r.is_err(), "write must panic when the lock call fails");
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(a.read())));
-    assert!(r.is_err(), "read falls back to the failing exclusive lock");
+    let a = unsafe { CArc::<Broken, BrokenFree>::from_raw(raw) }.unwrap();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(a.lock())));
+    assert!(r.is_err(), "lock must panic when the lock call fails");
     drop(a); // the arc itself is still released normally
 }
 
@@ -564,12 +537,11 @@ fn a_failing_lock_call_panics_and_leaves_nothing_locked() {
 // `ok = …`: bound routines that report a status
 // ---------------------------------------------------------------------------
 
-/// A lock that, like glibc's `pthread_rwlock_*`, reports `EDEADLK` instead of
-/// blocking when it is already held, and an up_ref that can fail.
+/// A lock that, like an error-checking `pthread_mutex_*`, reports `EDEADLK`
+/// instead of blocking when it is already held, and an up_ref that can fail.
 #[repr(C)]
 pub struct status_st {
-    /// -1 while a writer holds it, otherwise the reader count.
-    lock: AtomicIsize,
+    held: AtomicBool,
     rc: AtomicUsize,
     /// Whether the next up_ref fails.
     fail_up_ref: bool,
@@ -580,10 +552,10 @@ const EDEADLK: i32 = 35;
 /// # Safety
 ///
 /// `p` must point to a live `status_st`.
-unsafe fn status_write_lock(p: *mut status_st) -> i32 {
+unsafe fn status_lock(p: *mut status_st) -> i32 {
     // SAFETY: the caller keeps `p` live.
-    let lock = unsafe { &(*p).lock };
-    match lock.compare_exchange(0, -1, Ordering::Acquire, Ordering::Relaxed) {
+    let held = unsafe { &(*p).held };
+    match held.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed) {
         Ok(_) => 0,
         Err(_) => EDEADLK, // single-threaded test: held means held by us
     }
@@ -591,28 +563,10 @@ unsafe fn status_write_lock(p: *mut status_st) -> i32 {
 
 /// # Safety
 ///
-/// `p` must point to a live `status_st`.
-unsafe fn status_read_lock(p: *mut status_st) -> i32 {
-    // SAFETY: the caller keeps `p` live.
-    let lock = unsafe { &(*p).lock };
-    if lock.load(Ordering::Relaxed) < 0 {
-        return EDEADLK;
-    }
-    lock.fetch_add(1, Ordering::Acquire);
-    0
-}
-
-/// # Safety
-///
-/// The caller must hold a lock on a live `p`.
+/// The caller must hold the lock on a live `p`.
 unsafe fn status_unlock(p: *mut status_st) -> i32 {
     // SAFETY: the caller keeps `p` live.
-    let lock = unsafe { &(*p).lock };
-    if lock.load(Ordering::Relaxed) < 0 {
-        lock.store(0, Ordering::Release);
-    } else {
-        lock.fetch_sub(1, Ordering::Release);
-    }
+    unsafe { (*p).held.store(false, Ordering::Release) };
     0
 }
 
@@ -620,7 +574,7 @@ unsafe fn status_unlock(p: *mut status_st) -> i32 {
 ///
 /// `p` must point to a live `status_st`.
 unsafe fn status_up_ref(p: *mut status_st) -> i32 {
-    // SAFETY: the caller keeps `p` live; fields only, as in `obj_write_lock`.
+    // SAFETY: the caller keeps `p` live; fields only, as in `obj_lock`.
     let (fail, rc) = unsafe { (addr_of!((*p).fail_up_ref).read(), &(*p).rc) };
     if fail {
         return 0;
@@ -643,7 +597,7 @@ unsafe fn status_unref(p: *mut status_st) {
 
 fn status_new(fail_up_ref: bool) -> *mut status_st {
     Box::into_raw(Box::new(status_st {
-        lock: AtomicIsize::new(0),
+        held: AtomicBool::new(false),
         rc: AtomicUsize::new(1),
         fail_up_ref,
     }))
@@ -652,10 +606,9 @@ fn status_new(fail_up_ref: bool) -> *mut status_st {
 define_ctype!(Status, StatusRef, StatusMut, status_st);
 impl_cguarded!(
     Status,
-    lock = status_write_lock,
+    StatusLocked,
+    lock = status_lock,
     unlock = status_unlock,
-    read_lock = status_read_lock,
-    read_unlock = status_unlock,
     ok = |r| r == 0,
 );
 
@@ -667,18 +620,14 @@ impl_crefclone!(StatusUnref, Status, status_up_ref, ok = |r| r == 1);
 #[test]
 fn a_relock_reported_as_edeadlk_panics_instead_of_aliasing() {
     // SAFETY: a fresh object with one reference `status_unref` releases.
-    let a = unsafe { CGuardedArc::<Status, StatusUnref>::from_c(status_new(false)) }.unwrap();
-    let mut first = a.write();
-    let _held = first.as_mut();
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(a.write())));
-    assert!(r.is_err(), "a second write on this thread must not succeed");
-    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(a.read())));
-    assert!(
-        r.is_err(),
-        "a read under this thread's write lock must not succeed"
-    );
+    let a = unsafe { CArc::<Status, StatusUnref>::from_c(status_new(false)) }.unwrap();
+    let b = a.clone();
+    let mut first = a.lock();
+    let _held = first.as_locked();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(b.lock())));
+    assert!(r.is_err(), "a second lock on this thread must not succeed");
     drop(first);
-    drop(a.read()); // the lock was left consistent
+    drop(b.lock()); // the lock was left consistent
 }
 
 #[test]
@@ -693,18 +642,42 @@ fn a_failed_up_ref_reported_through_ok_is_a_failed_clone() {
 }
 
 // ---------------------------------------------------------------------------
-// `CGuardedRef`: a C global reached through its own lock
+// `CGuardedRef`: a C global reached only through the lock covering all of it
 // ---------------------------------------------------------------------------
+
+// The same C struct, bound as a whole-object lock: no unlocked handle.
+define_ctype!(Reg, RegRef, RegMut, obj_st);
+// SAFETY: every field is reached under the lock, one thread at a time.
+unsafe impl Send for Reg {}
+impl_cguarded!(Reg, all, lock = obj_lock, unlock = obj_unlock);
+
+impl RegRef<'_> {
+    fn value(&self) -> u64 {
+        // SAFETY: a read through the handle's pointer, under the lock.
+        unsafe { addr_of!((*self.as_ptr()).value).read() }
+    }
+    fn locks(&self) -> usize {
+        // SAFETY: an atomic field, read through the handle's pointer.
+        unsafe { (*self.as_ptr()).locks.load(Ordering::SeqCst) }
+    }
+}
+
+impl RegMut<'_> {
+    fn set_value(&mut self, v: u64) {
+        // SAFETY: a write through the exclusive handle's pointer, under the lock.
+        unsafe { addr_of_mut!((*self.as_mut_ptr()).value).write(v) }
+    }
+}
 
 /// A C global as the FFI sees one: a `static mut` reached only by address.
 macro_rules! global_obj {
     ($name:ident) => {
         static mut $name: obj_st = obj_st {
             rc: AtomicUsize::new(1),
-            lock: AtomicIsize::new(0),
-            read_locks: AtomicUsize::new(0),
-            write_locks: AtomicUsize::new(0),
+            held: AtomicBool::new(false),
+            locks: AtomicUsize::new(0),
             value: 0,
+            counter: 0,
             freed: {
                 static NEVER: AtomicUsize = AtomicUsize::new(0);
                 &NEVER
@@ -714,7 +687,7 @@ macro_rules! global_obj {
 }
 
 /// The `'static` view a wrapper would expose for the global.
-fn global_view(p: *mut obj_st) -> CGuardedRef<'static, Obj> {
+fn global_view(p: *mut obj_st) -> CGuardedRef<'static, Reg> {
     // SAFETY: a static lives for the program, and in these tests every access
     // goes through the view, which locks.
     unsafe { CGuardedRef::from_ptr(p) }.expect("a static's address is non-null")
@@ -724,14 +697,11 @@ fn global_view(p: *mut obj_st) -> CGuardedRef<'static, Obj> {
 fn a_global_is_read_and_written_under_its_lock() {
     global_obj!(G);
     let g = global_view(core::ptr::addr_of_mut!(G));
-    g.write().as_mut().set_value(5);
-    let r = g.read(); // `read` takes the view by value: the guard keeps `'static`
+    g.lock().as_locked().set_value(5);
+    let r = g.lock(); // `lock` takes the view by value: the guard keeps `'static`
     assert_eq!(r.as_ref().value(), 5);
-    assert_eq!(r.as_ref().lock_state(), 1, "one reader holds the lock");
+    assert_eq!(r.as_ref().locks(), 2, "every access took the lock");
     drop(r);
-    let state = g.read().as_ref().locks();
-    assert_eq!(state, (2, 1), "every access took the lock");
-    assert_eq!(g.read().as_ref().lock_state(), 1);
     assert_eq!(g.as_c_ptr(), core::ptr::addr_of_mut!(G));
 }
 
@@ -746,11 +716,12 @@ fn copies_of_a_global_view_serialise_writers_across_threads() {
             // `Copy` and `Send`: each thread gets its own copy of the view.
             std::thread::spawn(move || {
                 for _ in 0..ROUNDS {
-                    let mut w = g.write();
+                    let mut l = g.lock();
+                    let mut w = l.as_locked();
                     // A read-modify-write that loses updates without the lock.
                     let v = w.as_ref().value();
                     std::hint::spin_loop();
-                    w.as_mut().set_value(v + 1);
+                    w.set_value(v + 1);
                 }
             })
         })
@@ -758,27 +729,36 @@ fn copies_of_a_global_view_serialise_writers_across_threads() {
     for h in handles {
         h.join().unwrap();
     }
-    assert_eq!(g.read().as_ref().value(), THREADS * ROUNDS);
+    assert_eq!(g.lock().as_ref().value(), THREADS * ROUNDS);
 }
 
 #[test]
 fn a_null_global_is_rejected() {
     // SAFETY: null is rejected before anything is borrowed.
-    assert!(unsafe { CGuardedRef::<Obj>::from_ptr(core::ptr::null_mut()) }.is_none());
+    assert!(unsafe { CGuardedRef::<Reg>::from_ptr(core::ptr::null_mut()) }.is_none());
 }
+
+define_ctype!(StatusAll, StatusAllRef, StatusAllMut, status_st);
+impl_cguarded!(
+    StatusAll,
+    all,
+    lock = status_lock,
+    unlock = status_unlock,
+    ok = |r| r == 0,
+);
 
 #[test]
 fn a_global_relock_reported_through_ok_panics() {
     static mut S: status_st = status_st {
-        lock: AtomicIsize::new(0),
+        held: AtomicBool::new(false),
         rc: AtomicUsize::new(1),
         fail_up_ref: false,
     };
     // SAFETY: a static, reached only through this view.
-    let g = unsafe { CGuardedRef::<Status>::from_ptr(core::ptr::addr_of_mut!(S)) }.unwrap();
-    let held = g.write();
-    let r = std::panic::catch_unwind(|| drop(g.write()));
-    assert!(r.is_err(), "a second write on this thread must not succeed");
+    let g = unsafe { CGuardedRef::<StatusAll>::from_ptr(core::ptr::addr_of_mut!(S)) }.unwrap();
+    let held = g.lock();
+    let r = std::panic::catch_unwind(|| drop(g.lock()));
+    assert!(r.is_err(), "a second lock on this thread must not succeed");
     drop(held);
-    drop(g.write()); // the lock was left consistent
+    drop(g.lock()); // the lock was left consistent
 }
