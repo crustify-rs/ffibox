@@ -316,13 +316,22 @@ pub unsafe trait CDispose<T> {
 ///
 /// | Category | Why it holds |
 /// |---|---|
-/// | integers, floats, raw pointers | no invalid bit patterns |
+/// | integers, floats, thin raw pointers, raw slice and `str` pointers | no invalid bit patterns |
 /// | [`MaybeUninit<T>`](core::mem::MaybeUninit) | valid even uninitialized — the type for a buffer C has not filled |
 /// | arrays of the above, `()` | element-wise |
 ///
 /// `bool` and `char` are excluded: C's `_Bool` may hold a byte outside
 /// `{0, 1}` and a `char` outside the Unicode scalar range, both invalid Rust
 /// values. Use the integer type and convert.
+///
+/// So are pointers to trait objects: the metadata of a `*const dyn Trait` must
+/// be a valid vtable even in a raw pointer, so all-zero bytes, say, are not one
+/// (a safe upcast would load through the NULL vtable).
+///
+/// ```compile_fail,E0277
+/// fn plain<T: ffibox::CPlainElem>() {}
+/// plain::<*const dyn core::fmt::Debug>();
+/// ```
 ///
 /// **Any bit pattern is not the same as initialized.** Uninitialized memory is
 /// no bit pattern at all, so it is not a valid `u8` either: a buffer from a
@@ -354,10 +363,21 @@ impl_cplain_elem_for_primitives!(
 // point of it — the standard escape hatch for a buffer C has not filled.
 unsafe impl<T> CPlainElem for core::mem::MaybeUninit<T> {}
 
-// SAFETY: a raw pointer is valid for every bit pattern, null included.
-unsafe impl<T: ?Sized> CPlainElem for *const T {}
+// SAFETY: a thin raw pointer (`T: Sized`) is valid for every bit pattern, null
+// included. Wide pointers to `dyn Trait` are left out: their metadata must be a
+// valid vtable.
+unsafe impl<T> CPlainElem for *const T {}
 // SAFETY: as above.
-unsafe impl<T: ?Sized> CPlainElem for *mut T {}
+unsafe impl<T> CPlainElem for *mut T {}
+// SAFETY: a raw slice pointer's metadata is a length, valid as any initialized
+// `usize`; its address, as a thin pointer's.
+unsafe impl<T> CPlainElem for *const [T] {}
+// SAFETY: as above.
+unsafe impl<T> CPlainElem for *mut [T] {}
+// SAFETY: as for slices: the metadata is a byte length.
+unsafe impl CPlainElem for *const str {}
+// SAFETY: as above.
+unsafe impl CPlainElem for *mut str {}
 
 // SAFETY: an array of valid elements is valid.
 unsafe impl<T: CPlainElem, const N: usize> CPlainElem for [T; N] {}
