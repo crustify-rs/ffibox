@@ -17,10 +17,7 @@ categories = ["api-bindings", "rust-patterns", "no-std", "memory-management"]
 default = ["std"]
 # Selects `std::process::abort` for the unrecoverable-failure path; without it
 # that path is a double-panic.
-std = ["alloc"]
-# Adds `Owner for Arc<O>`, so several `CTethered` children can share a parent C
-# does not refcount. The only allocating path in the crate.
-alloc = []
+std = []
 
 [package.metadata.docs.rs]
 all-features = true
