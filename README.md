@@ -1,8 +1,8 @@
 # ffibox
 
 Generic smart pointers and traits for building safe Rust wrappers over C
-types and pointers. Designed for arbitrary user-space C interop, including the case
-where you need direct field access and a C-ABI-compatible layout (porting
+types and pointers. Designed for arbitrary user-space C interop, including the
+case where you need direct field access and a C-ABI-compatible layout (porting
 C internals to Rust in place), not just opaque-handle wrapping.
 
 ## Why
@@ -10,61 +10,67 @@ C internals to Rust in place), not just opaque-handle wrapping.
 Wrapping a C API in Rust means re-homing C's ownership and lifecycle
 conventions into RAII. The recurring shapes:
 
-- Refcounted or exclusive ownership with FFI destructor (`up_ref` / `free`).
+- A C-allocated object with a destructor (`free`), and maybe a copy (`dup`).
+- A refcounted object shared by several holders (`up_ref` / `unref`), maybe
+  guarded by its own lock.
 - Types with multiple or runtime-conditional destructors.
-- By-value object whose teardown disposes fields but not the header.
-- Owned length-aware buffer or NUL-terminated `char *` with FFI destructor.
-- Type-erased `void *` that stays opaque end to end.
+- A by-value struct whose teardown disposes its fields but not the struct.
+- An owned length-aware buffer or NUL-terminated `char *` with a C destructor.
+- A type-erased `void *` that stays opaque end to end.
 
-Each shape gets one trait (the per-type lifecycle contract) and one
-wrapper (the handle that enforces it). The wrapper picks which teardown
-runs; the trait is implemented on the wrapped C type or on a strategy ZST.
-
+Each shape gets one owner type, generic over a **policy** — a type you declare
+that names the C routines. `impl_cdrop!` and its siblings bind a C routine to a
+policy; a type alias names the pair: `pub type FooBox = CBox<Foo, FooFree>;`.
 
 ## Mental model in one paragraph
 
-No reference to a wrapped C object is ever formed. Each C type gets three Rust
-types (see `src/c_type.rs`): the layout newtype `Foo`, `#[repr(transparent)]`
-over `CType<ffi::foo>` = `ffi::foo + PhantomPinned`, which embeds by value in a
-`#[repr(C)]` mirror and is what an owning pointer points at; and two borrowed
-handles `FooRef<'a>` / `FooMut<'a>`, each one pointer wide, carrying the getters
-and setters. `&FooRef` covers the handle — Rust-owned stack — so `&self` /
-`&mut self` methods are sound on it and `&mut FooRef` reborrows implicitly;
-field access projects a raw pointer out of the handle and goes through
-`addr_of!` / `addr_of_mut!`. A wrapper carries no lifecycle behaviour by itself
-— you bind that by implementing one of the **trait contracts**, and you choose a
-**pointer type** that consumes that contract. The split below is the three axes:
-*representation* (the three types), *contracts* (what teardown means),
-*pointers* (who owns).
-
+No reference to C-owned memory is ever formed. Each C type gets a layout type
+`Foo` (`#[repr(transparent)]` over `ffi::foo`) and two borrowed handles,
+`FooRef<'a>` / `FooMut<'a>`, each one pointer wide and carrying the getters and
+setters; field access projects a raw pointer out of the handle. Ownership
+comes in three shapes: `CBox<Foo, P>` is the sole owner of an object behind a
+pointer and releases it through the policy `P`; `CArc<Foo, P>` is one of
+several counted references and hands out only the shared handle (its
+`CGuardedArc` sibling reaches the object through the object's own lock); and
+`CVal<Foo, P>` holds the object inline and disposes its resources on drop.
+Strings, buffers and borrowed runs get their own types. [Section 1](#1-the-types-you-get) lists them all,
+[section 2](#2-policies--what-teardown-means) covers policies, and
+[section 3](#3-decision-procedure) walks from a C declaration to the type it
+wants.
 
 ## Examples
 
-### CBox
+Each example is self-contained and compiled as a doctest; the `sys` modules
+declare C routines a real `*-sys` crate would provide.
 
-```rust,ignore
-use ffibox::{define_ctype, CBox, CDropped};
-use core::ptr::NonNull;
+### A boxed object — `CBox`
+
+```rust,no_run
+use ffibox::{define_ctype, impl_cdrop, impl_cdupclone, CBox};
 
 mod sys {
     #[repr(C)] pub struct point_st { pub x: i32, pub y: i32 }
     extern "C" {
         pub fn point_new(x: i32, y: i32) -> *mut point_st;
+        pub fn point_dup(p: *mut point_st) -> *mut point_st;
         pub fn point_free(p: *mut point_st);
     }
 }
 
 define_ctype!(Point, PointRef, PointMut, sys::point_st);
 
-unsafe impl CDropped for Point {
-    unsafe fn c_drop(obj: NonNull<Self>) {
-        unsafe { sys::point_free(obj.as_ptr().cast()) }
-    }
-}
+// The policy: a type you declare, bound to the C routines.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PointFree;
+impl_cdrop!(PointFree, Point, sys::point_free);
+impl_cdupclone!(PointFree, Point, sys::point_dup);
+
+pub type PointBox = CBox<Point, PointFree>;
 
 impl Point {
-    pub fn new(x: i32, y: i32) -> Option<CBox<Self>> {
-        unsafe { CBox::from_raw(sys::point_new(x, y)) }
+    pub fn new(x: i32, y: i32) -> Option<PointBox> {
+        // `from_c` adopts the C type's pointer, no cast.
+        unsafe { PointBox::from_c(sys::point_new(x, y)) }
     }
 }
 
@@ -80,437 +86,472 @@ impl PointMut<'_> {
     }
 }
 
+// Downstream: no `unsafe`, no raw pointer.
 let mut p = Point::new(3, 4).unwrap();
 assert_eq!(p.as_ref().x(), 3);
 p.as_mut().set_x(5);
-// `point_free` runs here.
+let q = p.clone();           // point_dup
+// `point_free` runs twice here.
 ```
 
-### CVoidBox
+`CBox` is a foreign type, so constructors go on the local `Foo` (or in free
+functions) rather than in an `impl CBox<Foo, _>` block.
 
-```rust,ignore
-use ffibox::{CVoidBox, CDropped};
-use core::ptr::NonNull;
+### A shared object — `CArc` / `CGuardedArc`
+
+```rust,no_run
+use ffibox::{define_ctype, impl_cdrop, impl_cguarded, impl_crefclone, CArc, CGuardedArc};
 
 mod sys {
+    #[repr(C)] pub struct session_st { _opaque: [u8; 0] }
+    #[repr(C)] pub struct store_st { _opaque: [u8; 0] }
     extern "C" {
-        pub fn arena_alloc(n: usize) -> *mut core::ffi::c_void;
-        pub fn arena_fill(p: *mut core::ffi::c_void, n: usize);
-        pub fn arena_free(p: *mut core::ffi::c_void);
+        pub fn session_new() -> *mut session_st;
+        pub fn session_up_ref(s: *mut session_st);         // cannot fail
+        pub fn session_free(s: *mut session_st);           // a down-ref
+        pub fn store_new() -> *mut store_st;
+        pub fn store_up_ref(s: *mut store_st) -> i32;      // 1 on success
+        pub fn store_free(s: *mut store_st);
+        pub fn store_write_lock(s: *mut store_st) -> i32;  // 1 on success
+        pub fn store_read_lock(s: *mut store_st) -> i32;
+        pub fn store_unlock(s: *mut store_st) -> i32;
+        pub fn store_add(s: *mut store_st, v: i32);
+        pub fn store_len(s: *const store_st) -> usize;
     }
 }
 
-/// Names the destructor class, not the pointee — the bytes stay opaque.
+// Shared, read-only: the down-ref and the up_ref on one policy.
+define_ctype!(Session, SessionRef, SessionMut, sys::session_st);
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SessionUnref;
+impl_cdrop!(SessionUnref, Session, sys::session_free);
+impl_crefclone!(SessionUnref, Session, sys::session_up_ref);
+pub type SessionArc = CArc<Session, SessionUnref>;
+
+let a = unsafe { SessionArc::from_c(sys::session_new()) }.unwrap();
+let b = a.clone();                      // session_up_ref; same object
+assert!(SessionArc::ptr_eq(&a, &b));
+let _shared = b.as_ref();               // shared handle only: no `as_mut`
+
+// Mutated by every holder: each access takes the object's own lock. Routines
+// that report a status are bound with `ok`, so a failure is never discarded.
+define_ctype!(Store, StoreRef, StoreMut, sys::store_st);
+// SAFETY: the store's state is only touched under its lock.
+unsafe impl Send for Store {}
+unsafe impl Sync for Store {}
+impl_cguarded!(Store, lock = sys::store_write_lock, unlock = sys::store_unlock,
+               read_lock = sys::store_read_lock, read_unlock = sys::store_unlock,
+               ok = |r| r == 1);
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StoreUnref;
+impl_cdrop!(StoreUnref, Store, sys::store_free);
+impl_crefclone!(StoreUnref, Store, sys::store_up_ref, ok = |r| r == 1);
+pub type StoreArc = CGuardedArc<Store, StoreUnref>;
+
+impl StoreRef<'_> {
+    pub fn len(&self) -> usize { unsafe { sys::store_len(self.as_ptr()) } }
+}
+impl StoreMut<'_> {
+    pub fn add(&mut self, v: i32) { unsafe { sys::store_add(self.as_mut_ptr(), v) } }
+}
+
+let s = unsafe { StoreArc::from_c(sys::store_new()) }.unwrap();
+let t = s.clone();
+std::thread::spawn(move || t.write().as_mut().add(42));   // write lock
+let n = s.read().as_ref().len();                          // read lock
+```
+
+### A global behind its lock — `CGuardedRef`
+
+```rust,no_run
+use core::ptr::{addr_of, addr_of_mut};
+use ffibox::{define_ctype, impl_cguarded, CGuardedRef};
+
+mod sys {
+    #[repr(C)] pub struct registry_st { pub count: i32 }
+    extern "C" {
+        pub static mut registry: registry_st;  // a C global
+        pub fn registry_lock() -> i32;         // guards `registry`; 0 on success
+        pub fn registry_unlock() -> i32;
+    }
+}
+
+define_ctype!(Registry, RegistryRef, RegistryMut, sys::registry_st);
+// SAFETY: `registry` is only touched under `registry_lock`.
+unsafe impl Send for Registry {}
+unsafe impl Sync for Registry {}
+
+// The lock is a separate global taking no arguments: adapters give it the
+// shape `impl_cguarded!` calls.
+unsafe fn lock(_: *mut sys::registry_st) -> i32 { unsafe { sys::registry_lock() } }
+unsafe fn unlock(_: *mut sys::registry_st) -> i32 { unsafe { sys::registry_unlock() } }
+impl_cguarded!(Registry, lock = lock, unlock = unlock, ok = |r| r == 0);
+
+impl RegistryRef<'_> {
+    pub fn count(&self) -> i32 { unsafe { addr_of!((*self.as_ptr()).count).read() } }
+}
+impl RegistryMut<'_> {
+    pub fn set_count(&mut self, v: i32) {
+        unsafe { addr_of_mut!((*self.as_mut_ptr()).count).write(v) }
+    }
+}
+
+/// Never freed, so no owner and no policy: a `'static` borrow under the lock.
+pub fn registry() -> CGuardedRef<'static, Registry> {
+    unsafe { CGuardedRef::from_ptr(addr_of_mut!(sys::registry)) }.unwrap()
+}
+
+let mut w = registry().write();          // registry_lock
+let n = w.as_ref().count();
+w.as_mut().set_count(n + 1);             // registry_unlock when `w` drops
+```
+
+### An opaque payload — `CVoidBox`
+
+```rust,no_run
+use ffibox::{impl_cdrop_void, CVoidBox};
+
+mod sys {
+    use core::ffi::c_void;
+    extern "C" {
+        pub fn arena_alloc(n: usize) -> *mut c_void;
+        pub fn arena_fill(p: *mut c_void, n: usize);
+        pub fn arena_free(p: *mut c_void);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ArenaFree;
+impl_cdrop_void!(ArenaFree, sys::arena_free);
 
-unsafe impl CDropped for ArenaFree {
-    unsafe fn c_drop(obj: NonNull<Self>) {
-        unsafe { sys::arena_free(obj.as_ptr().cast()) }
-    }
-}
+/// Arena bytes; the type names the destructor, the bytes stay opaque.
+pub type ArenaBuf = CVoidBox<ArenaFree>;
 
-type ArenaBuf = CVoidBox<ArenaFree>;
-
-let buf: ArenaBuf = unsafe { CVoidBox::from_raw(sys::arena_alloc(64)) }.unwrap();
+let buf = unsafe { ArenaBuf::from_raw(sys::arena_alloc(64)) }.unwrap();
 unsafe { sys::arena_fill(buf.as_ptr(), 64) };
 // `arena_free` runs here.
 ```
 
-### CVal
+### By value — `CVal`
 
-```rust,ignore
-use ffibox::{define_ctype, CVal, CValued};
-use core::ptr::NonNull;
+```rust,no_run
+use ffibox::{define_ctype, impl_cdispose, CVal};
 
 mod sys {
     #[repr(C)] pub struct buf_st { pub ptr: *mut u8, pub len: usize }
-    extern "C" { pub fn buf_dispose(b: *mut buf_st); }
+    #[repr(C)] pub struct rational_st { pub num: i32, pub den: i32 }
+    extern "C" {
+        pub fn buf_init(b: *mut buf_st, n: usize) -> i32;
+        pub fn buf_dispose(b: *mut buf_st);
+    }
 }
 
 define_ctype!(Buf, BufRef, BufMut, sys::buf_st);
-
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BufDispose;
+impl_cdispose!(BufDispose, Buf, sys::buf_dispose);
 // Rust owns the struct BY VALUE; C owns what its fields point at.
-unsafe impl CValued for Buf {
-    unsafe fn c_dispose(this: NonNull<Self>) {
-        unsafe { sys::buf_dispose(this.as_ptr().cast()) }
+pub type BufVal = CVal<Buf, BufDispose>;
+
+let mut b = BufVal::new(Buf::zeroed());
+let mut handle = b.as_mut();      // BufMut<'_>, as on a CBox
+unsafe { sys::buf_init(handle.as_mut_ptr(), 64) };   // C fills Rust's storage
+// `buf_dispose` runs when `b` drops; the struct itself is Rust's storage.
+
+// A resource-free struct needs no wrapper: the `define_ctype!` type is the value.
+define_ctype!(Rational, RationalRef, RationalMut, sys::rational_st);
+impl RationalMut<'_> {
+    pub fn set_num(&mut self, v: i32) {
+        unsafe { core::ptr::addr_of_mut!((*self.as_mut_ptr()).num).write(v) }
     }
 }
-
-let b = CVal::new(Buf::zeroed());
-assert_eq!(unsafe { (*b.as_ref().as_ptr()).len }, 0);
-// `buf_dispose` runs here; the struct itself is dropped inline.
+let mut q = Rational::zeroed();
+q.as_mut().set_num(1);
 ```
 
-### CVec
+### A buffer and a string — `CVec` / `CStrBox`
 
-```rust,ignore
-use ffibox::{CVec, CLenDropped};
-use core::mem::size_of;
+```rust,no_run
+use ffibox::{impl_cdrop_str, impl_cdupclone_str, impl_clendrop, CStrBox, CVec};
 
 mod sys {
+    use core::ffi::c_char;
     extern "C" {
         pub fn oids_new(n: usize) -> *mut u32;
         pub fn oids_free(p: *mut u32, n: usize);
+        pub fn lib_name() -> *mut c_char;
+        pub fn lib_str_free(s: *mut c_char);
+        pub fn lib_strdup(s: *const c_char) -> *mut c_char;
     }
 }
 
-/// Names the allocator strategy: freeing needs the length back.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct OidsFree;
-
-unsafe impl CLenDropped for OidsFree {
-    unsafe fn c_drop_len(ptr: *mut u8, byte_len: usize) {
-        unsafe { sys::oids_free(ptr.cast(), byte_len / size_of::<u32>()) }
-    }
+// Freeing needs the element count back: an adapter, passed by path.
+unsafe fn oids_free(ptr: *mut u8, byte_len: usize) {
+    unsafe { sys::oids_free(ptr.cast(), byte_len / core::mem::size_of::<u32>()) }
 }
+impl_clendrop!(OidsFree, oids_free);
+pub type Oids = CVec<u32, OidsFree>;
 
-let v: CVec<u32, OidsFree> = unsafe { CVec::from_raw_parts(sys::oids_new(3), 3) }.unwrap();
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LibStrFree;
+impl_cdrop_str!(LibStrFree, sys::lib_str_free);     // takes *mut c_char
+impl_cdupclone_str!(LibStrFree, sys::lib_strdup);
+pub type LibStr = CStrBox<LibStrFree>;
+
+let v = unsafe { Oids::from_raw_parts(sys::oids_new(3), 3) }.unwrap();
 assert_eq!(v.as_slice().len(), 3);
-// `oids_free(ptr, 3)` runs here.
+let s = unsafe { LibStr::from_raw(sys::lib_name()) }.unwrap();
+assert_eq!(s.to_str(), Ok("name"));
 ```
 
 ---
 
-## Axis 1 — Type representation
+## 1. The types you get
+
+This is the reference table for what each type is; the rustdoc links here
+rather than repeating it.
+
+| Scope | Type | From | Role |
+|-------|------|------|------|
+| per C type | `Foo` | `define_ctype!` | the layout, the C struct's size: `#[repr(transparent)]` over `ffi::foo`, embeds by value in a `#[repr(C)]` mirror, and is what a `CBox` points at. Never referenced over C-owned memory. Also the value itself when it owns no resources (`AVRational`). |
+| | `FooRef<'a>` | `define_ctype!` | shared borrow, one pointer wide, `Copy`; the getters |
+| | `FooMut<'a>` | `define_ctype!` | exclusive borrow, move-only; the setters, and the getters through `as_ref()` |
+| owners | `CBox<Foo, P>` | ffibox | the sole owner of an object behind a pointer, released by `P` on drop; `Clone` when `P` deep-copies |
+| | `CVal<Foo, P>` | ffibox | an owned value held inline, its resources disposed by `P` on drop |
+| | `CStrBox<P>` | ffibox | an owned NUL-terminated `char *`; read-only `CStr` / `str` / byte views |
+| | `CVec<T, P>` | ffibox | an owned `(ptr, len)` array, NULL when empty; `&[T]` for plain elements, `CSlice` for wrapped C objects |
+| | `CVoidBox<P>` | ffibox | an owned `void *` that is never looked inside (`CBox<c_void, P>`) |
+| shared owners | `CArc<Foo, P>` | ffibox | one counted reference to a refcounted object; `Clone` through the up_ref; shared handles only, plus `get_mut` / `make_mut` when the count proves it sole or after a copy |
+| | `CGuardedArc<Foo, P>` | ffibox | a `CArc` reached through the object's own lock: `read()` → `CReadGuard`, `write()` → `CWriteGuard`, each unlocking on drop — `Arc<RwLock<_>>` in one type, as the lock lives in the object |
+| guarded borrow | `CGuardedRef<'a, Foo>` | ffibox | an object reached through its own lock and never released, typically a C global under its C lock (`'static`): `read()` / `write()` as on a `CGuardedArc` — `&RwLock<_>` to its `Arc<RwLock<_>>` |
+| views | `CSlice<'a, T>` / `CSliceMut<'a, T>` | ffibox | any borrowed run of elements — a buffer's, a struct field's, a getter's — as handles or copies, never a `&[T]` |
+
+A wrapper that needs generic parameters (a lifetime-carrying layout type, or
+derived sub-types over a generic field) is written by hand against the same
+contract — see [Under the hood](#4-under-the-hood-hand-written-wrappers).
+
+### Conventions
+
+- **Accessors live on the handles.** Getters on `FooRef<'a>` taking `&self`,
+  setters on `FooMut<'a>` taking `&mut self`; `FooMut` reaches the getters with
+  `as_ref()`, so they are written once. Both project a raw pointer out of the
+  handle and read or write through `addr_of!` / `addr_of_mut!`.
+- **Every holder reaches the handles the same way:** `as_ref()` / `as_mut()` on
+  `Foo`, `CBox`, `CVal`, a `CWriteGuard` and `FooMut` itself (where `as_mut()`
+  is the reborrow `&mut` gets implicitly: `helper(m.as_mut())` keeps `m`);
+  `as_ref()` alone on `CArc` and a `CReadGuard`. `CSliceMut` reborrows the same
+  way, and splits and sub-ranges like `&mut [T]`. Never `Deref`:
+  `Deref::Target` cannot name a lifetime taken from `&self`, and since `FooRef`
+  is `Copy`, a `Deref<Target = FooRef<'a>>` on `FooMut` would let safe code copy
+  a shared handle out while keeping the exclusive one.
+- **No reference covers C memory.** `&FooRef` covers one pointer of Rust stack,
+  never the object. The one place a reference covers a C struct's bytes is
+  `Foo::as_ref` / `as_mut` on a value Rust holds inline.
+- **Adopting a pointer is `unsafe`; giving one out is not — as on `Box`.**
+  `from_raw*` / `from_c*` are `unsafe`, since they assert ownership of what the
+  pointer addresses; `into_raw*` / `into_c` and `as_ptr` / `as_c_ptr` are safe,
+  since a raw pointer asserts nothing until someone dereferences it. The
+  owners' `from_raw` / `into_raw` / `as_ptr` speak the Rust-side pointee; `CBox`'s `from_c` / `into_c` /
+  `as_c_ptr` speak the C type, so C interop is cast-free. The handles' seams
+  (`from_ptr`, `as_ptr`, `as_mut_ptr`, the `void *` pair) are `pub(crate)`
+  in the crate that invokes `define_ctype!`.
+- **`from_raw*` adopts ownership; `from_ptr*` borrows.** Pick the verb by what
+  you return.
+- **Thread safety is opt-in for wrapped C types, opt-out for raw memory.**
+  `Foo` carries a zero-sized marker withholding `Send` / `Sync`; `CBox`,
+  `CVal`, `CVec` and the views over a `Foo` inherit them once the wrapper
+  writes `unsafe impl Send / Sync for Foo` with a safety proof, on the terms
+  of their std counterparts — `CBox` like `Box`, while `CArc` and
+  `CGuardedArc` need `Foo: Send + Sync`, like `Arc` and `Arc<RwLock<_>>`.
+  Owners that never name a `Foo` — `CStrBox`, `CVoidBox`, and a `CVec` of
+  plain elements (`CVec<u8, _>`) — follow their policy alone, and a unit-struct
+  policy is `Send + Sync`, so **they cross threads by default**. That is right
+  for an allocator any thread may free into (`free`, `OPENSSL_free`,
+  `av_free`); for one that must free on the allocating thread, opt out by
+  giving the policy a `PhantomData<*const ()>` field.
+
+---
+
+## 2. Policies — what teardown means
+
+Every owner's destructor is a **policy**: a type you declare, usually a unit
+struct deriving `Clone, Copy, Debug, Default`, implementing the lifecycle
+traits. Bind a C routine to it with the `impl_*!` macros, or implement the
+traits by hand when teardown needs runtime state. A unit struct is
+`Send + Sync`, which makes a `CStrBox`, `CVoidBox` or plain-element `CVec`
+under it free on whichever thread drops it; a thread-bound allocator's policy
+carries `PhantomData<*const ()>` instead (see the conventions in
+[section 1](#1-the-types-you-get)).
+
+| Trait | Defines | Macro | Drives |
+|-------|---------|-------|--------|
+| `CDrop<T>` | `c_drop` — a `*_free`, or a refcount down-ref | `impl_cdrop!(P, Foo, f)`; `_str` / `_void` for `c_char` / `c_void` | `CBox`, `CStrBox`, `CArc` |
+| `CDupClone<T>: CDrop<T>` | `c_dup` — a deep copy (a NEW pointer, NULL on failure) | `impl_cdupclone!(P, Foo, f)`; `_str` for `strdup` | `Clone` / `try_clone` |
+| `CRefClone<T>: CDrop<T>` | `c_up_ref` — a refcount increment on the SAME pointer; `c_is_sole_owner` (default `false`) | `impl_crefclone!(P, Foo, f)`; `…, ok = |r| r == 1`, `…, sole = g` | `CArc` / `CGuardedArc` `Clone`, `get_mut`, `make_mut` |
+| `CLenDrop` | `c_drop_len` — a buffer free, given the byte length | `impl_clendrop!(P, f)` | `CVec` |
+| `CLenClone: CLenDrop` | `c_clone_len` — a buffer memdup (`T: Copy` only) | `impl_clenclone!(P, f)` | `CVec`'s `Clone` |
+| `CDispose<T>` | `c_dispose` — `*_uninit` / `*_clear` on a value | `impl_cdispose!(P, Foo, f)` | `CVal` |
+| `CGuarded`, on `Foo` | `c_lock` / `c_unlock`, optionally `c_read_lock` / `c_read_unlock` | `impl_cguarded!(Foo, lock = f, unlock = g)`; `…, ok = |r| r == 0` | the guards of `CGuardedArc` / `CGuardedRef` |
+
+**Because the policy is a type parameter, an owner cannot exist without a
+destructor, and one C type can have several.** `CBox<Foo, FooFree>` next to
+`CBox<Foo, FooUnref>`: exactly one ever runs per box, chosen by its type. And
+since each clone trait sits on the same policy as the drop trait, a `*_dup` is
+always settled by its `*_free`.
+
+**`CBox` is a sole owner; `CArc` shares.** `CBox::as_mut` hands out the
+exclusive handle, which is sound only while nothing else uses the object, so
+`CBox` clones only by deep copy. A refcounted object fits a `CBox` while the
+box holds its only reference (with the down-ref as `c_drop`); `CArc::from`
+shares it, and `CBox::try_from` (or `try_into_box`) takes it back once the count
+is 1 again.
+
+**Shared and mutable means locked.** A `CArc` has no unlocked write path: its
+exclusive handle needs the count to prove the reference sole (`get_mut`, which
+needs `c_is_sole_owner` — an Acquire read of a count that covers every
+reference, C's own included), or a private copy (`make_mut`, through
+`CDupClone` — never a byte copy, which would duplicate the object's
+sub-allocations, its count and its lock). An object every holder mutates goes
+in a `CGuardedArc`, which has no unlocked path at all: readers take the read
+lock together, a writer takes the write lock alone, and `CGuarded`'s contract
+makes C take the same lock. The exclusive lock must not be reentrant: a second
+`write` on the same thread blocks forever, or panics when the lock reports the
+self-deadlock (`pthread_rwlock_*`'s `EDEADLK`), rather than hand out a second
+handle. A failing C lock call panics, as `std`'s locks do; there is no
+poisoning.
+
+**Routines are plain paths, type-checked.** Each macro calls the routine with a
+pointer of the exact C type; a routine for the wrong type does not compile.
+Where a call can fail — an up_ref, a lock — the routine either returns `()` or
+is bound with `ok = |r| r == 1` (whatever its success value is); a status code
+is never silently discarded, so `pthread_rwlock_wrlock`'s `EDEADLK` becomes a
+panic rather than a second exclusive handle. A
+destructor of any other shape — one taking the slot (`ffi::foo_free(&mut p)`),
+a `void *` allocator free, extra arguments — goes behind a small `unsafe fn`
+adapter passed by path. Teardown is unconditional: a gate that suppresses it on
+some paths folds into the routine itself.
+
+**Runtime-state policies.** When teardown needs a value chosen at the wrapping
+site (`OPENSSL_sk_pop_free(stack, elem_free_fn)`), write the policy by hand — a
+struct holding the state, implementing `CDrop<T>` (and `CDupClone<T>` + `Clone`
+to clone). Without `Default` there is no `from_raw(ptr)`; adopt with
+`from_raw_with(ptr, ElemFree(f))` and release with `into_raw_with()`. The box
+then carries the state and is no longer pointer-sized.
+
+**The construction phase.** An allocation Rust is still filling in is held as
+`CBox<Foo, StorageFree>` — a hand-written policy that frees the storage and
+touches no field — then promoted with `with_policy(FooFree)`. Bail with `?`
+before promoting and only the storage is freed.
+
+---
+
+## 3. Decision procedure
+
+Walk from a C declaration to the type it wants. Each step narrows one
+dimension; the answer is always a type from [section 1](#1-the-types-you-get).
+
+**Step 1 — Is it owned in Rust?** That is: does dropping the Rust value
+release it? This is about who *releases* the object, not who allocated it — a
+`CBox` usually points at memory C allocated.
+
+- **No — C, or a parent object, releases it.** Borrow it:
+  - one object → `FooRef<'a>` / `FooMut<'a>`, its lifetime tied to whatever
+    keeps it alive (a parent's handle, the call);
+  - a run of elements → `CSlice<'a, T>` / `CSliceMut<'a, T>`;
+  - an object every access reaches under its own lock — typically a C global
+    and the C lock protecting it → `CGuardedRef<'a, Foo>`, `'static` for a
+    global, with `impl_cguarded!` on `Foo`;
+  - a NUL string → `&CStr` / `&str` / `&[u8]` tied to the owner's borrow;
+  - an out-parameter slot → `&'a mut MaybeUninit<T>` from
+    `ptr.cast::<MaybeUninit<T>>().as_mut()`; no ffibox type;
+  - a `void *` → if it is really a `ffi::foo`, erase a `FooRef` with
+    `as_void_ptr` and recover it with `from_void_ptr`; if it is a cookie never
+    looked inside, pass the raw `*mut c_void` through unchanged.
+
+  A borrow that must outlive its parent's scope (stored next to the parent,
+  sent to a thread) cannot be expressed as a lifetime; copy the child into an
+  owned object instead.
+- **Yes** → step 2.
+
+**Step 2 — What shape is the owned thing?**
+
+- **A NUL-terminated string** (`char *`, no stored length) → `CStrBox<P>`.
+  `strlen` recovers the length, so one `CDrop<c_char>` policy covers a plain
+  free and a clearing free alike. Its views are read-only, like `CStr`.
+- **A counted array** → `CVec<T, P>`, one policy per allocator family. Plain
+  elements (`CElem`: integers, floats, raw pointers, `MaybeUninit`) read out as
+  a real `&[T]` because the buffer is exclusively owned; wrapped C objects come
+  out as handles through `as_handles` → `CSlice`, since `&[Foo]` would cover
+  them. Where C returns NULL with 0 for an empty array, adopt with
+  `from_raw_parts_or_empty`; plain `from_raw_parts` treats every NULL as
+  failure.
+- **One object held inline** — a local, a field, an array element, with no
+  pointer of its own:
+  - owns no resources → the `Foo` itself;
+  - owns resources and stands alone → `CVal<Foo, P>`;
+  - embedded in a parent C struct → a bare `Foo`, disposed by the parent's
+    teardown (a `Drop` on it would dispose twice);
+  - address-sensitive (points into itself, or C recorded its address) → not
+    inline at all: behind a pointer, as below.
+- **One object behind a pointer** → `CBox<Foo, P>` if this is the only
+  reference, `CArc<Foo, P>` / `CGuardedArc<Foo, P>` if it is one of several
+  counted ones; a type-erased `void *` payload → `CVoidBox<P>`.
+
+**Step 3 — Which policy?** (boxes, strings, buffers)
+
+| C routines | Policy |
+|------------|--------|
+| `foo_free` | `impl_cdrop!` |
+| `foo_free` + `foo_dup` | `impl_cdrop!` + `impl_cdupclone!` |
+| `foo_unref`, held as the only reference | `impl_cdrop!` with the down-ref; no `Clone` |
+| `foo_unref` + `foo_up_ref`, shared, read-only | `impl_cdrop!` + `impl_crefclone!` → `CArc` |
+| … and a readable count | `impl_crefclone!(…, sole = g)`: `get_mut` without a copy |
+| … mutated by every holder, with a lock | + `impl_cguarded!` on `Foo` → `CGuardedArc` |
+| a global, never freed, under a C lock | no policy: `impl_cguarded!` on `Foo` → `CGuardedRef<'static, Foo>` |
+| a counted reference with no up_ref | `impl_cdrop!` alone → `CArc` without `Clone` |
+| teardown needs runtime state | a hand-written policy; adopt with `from_raw_with` |
+| built in Rust, not by a C constructor | storage-only policy → `with_policy` |
+| destructor of another shape | an `unsafe fn` adapter, passed by path |
+
+An owned pointer crosses the FFI boundary on the owner's raw seam: `into_raw`
+surrenders it to C, `from_raw` adopts one C allocated.
+
+---
+
+## 4. Under the hood (hand-written wrappers)
+
+Only a wrapper `define_ctype!` cannot express — generic parameters, a
+lifetime-carrying layout type — needs this layer.
 
 | Item | Role | Source |
 |------|------|--------|
-| `CType<T>` | The layout newtype: `repr(transparent)` over `T` plus `PhantomPinned`. Keeps the C layout (embeds by value in a `#[repr(C)]` mirror, layout-compat with `*mut T`) and pins the address, since C may have recorded it. | `src/c_type.rs` |
-| `CPtr<'a, T>` | The storage every borrowed handle is transparent over: one pointer tagged with the borrow's lifetime. `Copy` and covariant in `'a`, like `&'a T`; `Option<CPtr>` is a niche `*const T`. | `src/c_type.rs` |
-| `CCell` | The linking trait: `type C` names the wrapped FFI type, `type Ref<'a>` / `type Mut<'a>` name the handles, and the two constructors build them. `define_ctype!` emits it; hand-write it (+ the three structs) for lifetime/generic wrappers. Every wrapper-holding pointer requires it. | `src/c_type.rs` |
+| `CCell` | the linking trait: `type C` (the FFI type), `type Ref<'a>`, `type Mut<'a>`. No methods. Its `unsafe impl` promises that `Self` is layout-compatible with `C`, and that `Ref` / `Mut` are `#[repr(transparent)]` over `CBorrowedPtr<'a, Self>` with no `Drop`, and `Mut` invariant in `Self` (a `PhantomData<&'a mut Self>` field) — ffibox builds handles from that layout, and checks their size at compile time. | `src/traits.rs` |
+| `CBorrowedPtr<'a, T>` | what every handle wraps: one pointer tagged with the borrow's lifetime, `Copy` and covariant like `&'a T`. | `src/refs.rs` |
+| `CElem` | marker for buffer elements every bit pattern of which is valid; a wrapped C type implements `CCell` instead, so `&[Foo]` does not typecheck. | `src/traits.rs` |
 
-| Macro | Generates |
-|-------|-----------|
-| `define_ctype!(N, NRef, NMut, ffi::c)` | the layout newtype, both handles, and the `impl CCell` linking them |
-
-All three names are spelled out because `macro_rules!` cannot concatenate
-identifiers; the order is layout, shared, exclusive. `define_ctype!` does not
-support generic parameters for binding lifetimes to the wrapper or expressing
-derived sub-types. Hand-write these, implementing the `CCell` contract for
-consistency with the crate's conventions.
-
-**Where accessors go.** Getters on `NRef<'a>` taking `&self`, setters on
-`NMut<'a>` taking `&mut self`; `NMut` reaches the getters with `as_ref()`, so
-they are written once. Both project a raw pointer out of the handle:
-
-```rust,ignore
-impl SslSessionRef<'_> {
-    pub fn timeout(&self) -> u64 {
-        unsafe { addr_of!((*self.as_ptr()).timeout).read() }
-    }
-}
-impl SslSessionMut<'_> {
-    pub fn set_timeout(&mut self, v: u64) {
-        unsafe { addr_of_mut!((*self.as_mut_ptr()).timeout).write(v) }
-    }
-}
-```
-
-**Seam + mutability conventions** (the generated surface, and what hand-written
-code follows):
-
-- **`from_raw*` adopts ownership; `from_ptr*` borrows.** `from_raw` /
-  `from_raw_parts` (on `CBox` / `CBoxWith` / `CVoidBox` / `CVec` /
-  `CrustifyStr`) return an *owning* `Self` whose `Drop` frees; `from_ptr` (on a
-  handle, `COut`) returns a *non-owning* handle. Pick the verb by what you
-  return.
-- **The owning seam speaks the raw C type.** `as_ptr` / `into_raw` / `from_raw`
-  on `CBox` take/return `*mut T::C` (the ffi type `ffi::c`, via `CCell`),
-  **not** `*mut Wrapper` — so C interop is cast-free
-  (`CBox::from_raw(ffi::X_new())`, `ffi::X_free(b.into_raw())`).
-- **Every handle is reached by a call, never by `Deref`.** `as_ref()` /
-  `as_mut()` on the owning wrappers, `as_ref()` on `NMut`: `Deref::Target`
-  cannot name a lifetime taken from `&self`, and a handle carries one. A
-  `Deref<Target = NRef<'a>>` would have to name the handle's *own* lifetime, and
-  since `NRef` is `Copy`, `*m` would copy a shared handle out of the reborrow —
-  leaving safe code holding a shared and an exclusive handle to one object at
-  once. The call costs nothing and keeps the borrow attached.
-- **Never take `&Wrapper` or `&mut Wrapper`.** Those cover the C object's bytes
-  and would assert `noalias` / `readonly` / validity over memory C may write.
-  `&NRef` covers one pointer of Rust stack instead. Read and write fields off
-  the handle's raw pointer through `addr_of!` / `addr_of_mut!`; never form a
-  `&ffi::c` or a reference to a field.
-
----
-
-## Axis 2 — Lifetime contracts (the traits)
-
-These say **what teardown means**. Bind one (or more) to a wrapper with the
-matching `impl_*!` macro (all in `src/macros.rs`; each has a one-arg inherent
-form plus the `(N, ffi::c, fn…)` delegating form shown below). The **Bound by**
-column is what the macro enables; the pointer types in Axis 3 require these
-traits as bounds.
-
-The two base lifecycle traits form a **clone/drop x exclusive/shared grid**.
-Each clone trait is a sub-trait of its drop trait — a cloned handle must
-be releasable the same way:
-
-|       | exclusive (unique)            | shared (refcounted)                    |
-|-------|-------------------------------|----------------------------------------|
-| drop  | `CDropped` (`impl_dropped!`) — the `*_free` | `CDropped` (`impl_dropped!`) — the down-ref |
-| clone | `CCloned` (`impl_cloned!(N,c,dup = …)`) — the `*_dup` | `CCloned` (`impl_cloned!(N,c,up_ref = …)`) — the `up_ref` |
-
-Same two traits down both columns: the *column* is a property of the C API you
-register, never of the Rust type you pick. One macro serves both, with the
-mechanism named at the call site (`dup = …` / `up_ref = …`) because the C
-signatures differ — a `*_dup` returns a NEW pointer (NULL on failure), an
-`up_ref` returns `void`/`c_int` and the handle you keep is the ORIGINAL. The
-name is an assertion: nothing is inferred from the return type.
-
-**A type exposing BOTH an `up_ref` and a `*_dup`: the `up_ref` wins.** Bind
-`Clone` to the refcount bump (`up_ref = …`) and leave the deep copy as a plain
-inherent method (`fn dup(&self) -> Option<CBox<Self>>`). `Clone` on a
-refcounted C type means "another handle to the same object" — that is what
-callers and the C API both expect; a `Clone` that silently deep-copied would
-break identity comparisons and double the allocation cost. Use `dup = …` only
-when the type has NO refcount.
-
-| Trait | Contract | Bound by (enables) | Macro | Source |
-|-------|----------|--------------------|-------|--------|
-| `CDropped` | Destructor on a **fully-constructed** value (`c_drop(NonNull<Self>)`) — the `*_free` for a sole owner, the **down-ref** for a refcounted type. | `CBox`, `CVoidBox`, `CCloned` | `impl_dropped!(N,c,free)` | `src/traits.rs` |
-| `CCloned` | Handle duplication (`c_clone(ptr) -> ptr`): a deep-copy `*_dup` returning a **new** pointer, **or** an `up_ref` returning the **same** pointer. Either way the result owes one independent `c_drop`. Opt-in `Clone` for a `CBox` or `CrustifyStr` (a NUL string's `strdup`; length recovered by `strlen`, so pointer-only fits). Supertrait `CDropped`. | `CBox` / `CrustifyStr`: `Clone` | `impl_cloned!(N,c,dup = …)` / `impl_cloned!(N,c,up_ref = …)` | `src/traits.rs` |
-| `CValued` | Embedded / by-value teardown for a value that lives **inside** another struct or on the stack (`c_dispose`, no storage of its own to free). | `CVal`, `CValGuard` | `impl_cvalued!(N,c,dispose)` | `src/traits.rs` |
-| `CLenDropped` | Release strategy for an `n`-element buffer (`c_drop_len(ptr, byte_len)`), carried by a ZST strategy type you write — the crate ships none. | `CVec` | — (manual impl) | `src/traits.rs` |
-| `CElem` | Marker: a plain Rust value, every bit pattern of which is valid — integers, floats, raw pointers, arrays, `MaybeUninit<T>`. A `define_ctype!` wrapper implements `CCell` instead, so `&[Foo]` does not typecheck. | `CVec::as_slice` | — (blanket) | `src/traits.rs` |
-| `Owner` | Marker: keeps someone else's C object alive at a stable address, exposing no access to it — the owner half of `CTethered`. | `CTethered<T, O>` | — (manual impl; `CKeepalive` and, with `alloc`, `Arc<O>`) | `src/traits.rs` |
-| `CLenCloned` | Length-aware deep-copy strategy for a buffer (`c_clone_len(ptr, byte_len) -> ptr`, a `memdup`) -- the `CCloned` analogue for `CVec` (its `Clone`), needed because the copy carries the byte length `c_clone` cannot. **Byte copy** (POD elements only). Supertrait `CLenDropped`. | `CVec`: `Clone` | — (manual impl) | `src/traits.rs` |
-
-A fully refcounted, cloneable type pairs `impl_dropped!` (the down-ref, so
-`CBox` can `Drop`) with `impl_cloned!(…, up_ref = …)` (so it can `Clone`) —
-exactly as a sole-owner type pairs `impl_dropped!` with an optional
-`impl_cloned!(…, dup = …)`. A drop-only shared handle (a received count you cannot clone)
-uses `impl_dropped!` alone; it is simply a `CBox` that is not `Clone`. Teardown is unconditional: a destructor that must be
-suppressed on some paths folds that gate **into `c_drop` / `c_dispose`** itself
-(or defuse via `into_raw` / `CValGuard::dismiss`).
-
-**The construction phase.** An allocation Rust is still filling in is held as
-`CBoxWith<T, D>` with a storage-only `D` — a ZST `CDropper` that reclaims the
-raw allocation and touches no field — then promoted with `into_box()` once the
-object is formed. One-way, and a type change, so a half-built object cannot
-reach code expecting a finished one; bail with `?` before promoting and `D`
-reclaims the allocation without running the real destructor.
-
-**Multi-destructor shapes.** A type has one `CDropped`, so a second teardown for
-the same C type goes on a `CDropper<T>` policy instead — one `D` per destructor,
-and `CBoxWith<T, D>` selects which by its type. Exactly one ever runs:
-`CBoxWith`'s `Drop` calls `D::c_drop`, never `T::c_drop`, so a `T` that also
-implements `CDropped` keeps that for its `CBox` and the two cannot both fire.
-`T: CDropped` is not required at all — a type whose teardowns are all
-alternatives needs only `CCell`. A ZST `D` keeps the handle pointer-sized.
-
-**Value-carried teardown — the `*With` strategies.** When teardown is not
-recoverable from the pointee, bind a
-**policy object** `D` implementing the agent-noun analogue of the base pair:
-`CDropper<T>` (drop) and `CCloner<T>` (clone). As with the base pair there is no
-separate shared flavour — a refcounted pointee registers the down-ref as
-`CDropper::c_drop` and the `up_ref` as `CCloner::c_clone`.
-
-Each method takes `(&self_state, ptr)`, so `D` carries the `fn` / length / struct
-into `Drop`. These are **hand-implemented on the state type** (no `impl_*!`
-macro) and consumed by `CBoxWith` in Axis 3. Use them when teardown is not
-recoverable from `T` alone: runtime state, the construction phase, or a second
-destructor. Otherwise register a plain `CDropped` and use `CBox`. All in
-`src/traits.rs`.
-
----
-
-## Axis 3 — Pointer representation (who owns, and in which phase)
-
-These **take ownership** and run the chosen Axis-2 teardown on `Drop`; each
-requires its lifecycle trait as a bound (the **Requires** column). Pick by *who
-owns* (unique / shared / by value / type-erased) and *which phase of life*
-(allocated-but-uninit vs fully constructed).
-
-| Pointer | Owns | Phase | Requires | Source |
-|---------|------|-------|----------|--------|
-| `CBox<T>` | unique, typed | fully constructed | `T: CDropped + CCell` (`Clone` iff `T: CCloned`) | `src/owned_refs.rs` |
-| `CVal<T>` | by value (embedded/stack) | fully constructed | `T: CValued + CCell` | `src/owned_refs.rs` |
-| `CValGuard<'a, T>` | borrowed view with teardown, lifetime-bound | fully constructed | `T: CValued + CCell` | `src/owned_refs.rs` |
-| `CVec<T, S>` | length-aware buffer | fully constructed | `S: CLenDropped`; `as_slice` iff `T: CElem`, `as_handles` / `as_handles_mut` iff `T: CCell` | `src/owned_refs.rs` |
-| `CVoidBox<D>` | plain type-erased storage | fully constructed | `D: CDropped` | `src/owned_refs.rs` |
-| `CrustifyStr<D>` | owned NUL-terminated C string (`char *`); read-only slice views | fully constructed | `D: CDropped` | `src/owned_refs.rs` |
-| `CBoxWith<T, D>` | unique, typed, + inline teardown state | construction and fully constructed | `T: CCell`, `D: CDropper<T>` (`Clone` iff `D: CCloner + Clone`; `into_box` iff `T: CDropped`) | `src/owned_refs.rs` |
-| `CKeepalive<T>` | an owner token: teardown only, no access | fully constructed | `T: CDropped + CCell` | `src/owned_refs.rs` |
-| `CTethered<T, O>` | a view INTO a parent, holding it alive | fully constructed | `O: Owner` | `src/owned_refs.rs` |
-
-The wrapper-holding pointers all bound **`T: CCell`** (their `T` is a wrapper —
-automatic for any `define_ctype!` / hand-written wrapper; it also names the
-handles `as_ref()` / `as_mut()` hand out). `CVec` / `CVoidBox` / `CrustifyStr` do **not**: their `S` / `D`
-is a *deleter strategy* (or `T` an *element*), not a wrapper.
-
-`CBoxWith` is the **fat** owner: `#[repr(C)]` `{ptr, dropper: D}`, so it is
-**not** layout-compatible with `*mut T::C` when `D` carries state (a ZST `D`
-stays pointer-sized). Its `from_raw` takes the extra `dropper` argument
-(`from_raw(*mut T::C, D)`) — the seam point where the policy is fixed;
-`into_raw` hands back `(*mut T::C, D)`. Reach for it when teardown is not
-recoverable from `T` alone — runtime state, the construction phase, or a second
-destructor, all in Axis 2. Otherwise `CBox`.
-
-### Non-owning pointer wrappers
-
-These represent a raw pointer **without** taking ownership — no teardown, no
-lifecycle contract. The borrowed view of a wrapped C object is its
-`NRef<'a>` / `NMut<'a>` handle (Axis 1); what remains here is the scalar
-out-parameter slot.
-
-| Wrapper | Models | Owns? | Source |
-|---------|--------|-------|--------|
-| `CSlice<'a, T>` | a borrowed run of `len` contiguous elements as a pointer and a count. Wrapped C objects (`T: CCell`) come out as per-element handles via `get` / `iter`; plain values (`T: CElem`) are copied out via `elem` / `elems` / `copy_to_slice`. The slice analogue of a `Ref` handle. Reached with `CVec::as_handles`. | no (shared borrow) | `src/borrowed_refs.rs` |
-| `CSliceMut<'a, T>` | the same run, exclusively: `get_mut` / `iter_mut` yield handles bound to `&mut self`, `set_elem` / `copy_from_slice` write plain values. Move-only, and reaches the shared view with `as_ref()`. Reached with `CVec::as_handles_mut`. | no (exclusive borrow) | `src/borrowed_refs.rs` |
-| `COut<'a, T>` | the write-end of a C `*mut T` **out-parameter** — a `&'a mut MaybeUninit<T>` the callee writes once. `c_out::from_ptr` hides the `*mut T → *mut MaybeUninit<T>` cast at the boundary; `Option<COut>` is layout-compat with `*mut T`. | no (borrowed write-slot) | `src/borrowed_refs.rs` |
-
----
-
-## Decision procedure
-
-Route by **orthogonal axes** -- not first-match. Each axis narrows a different
-dimension: **representation . owned<->borrowed . singleton<->array .
-exclusive<->shared . typed<->erased . allocated<->initialized**.
-
-**Axis 1 -- wrapper shape (`define_ctype!` or hand-written).** Everything typed
-you wrap is either a `define_ctype!(N, NRef, NMut, ffi::c)` triple (see Axis 1
-above) or a hand-written generic mirroring it for (a) a lifetime-carrying
-newtype when it holds a field borrowed for a runtime lifetime, and for (b)
-derived sub-types when it holds a generic (`void *`) field that could be
-monomorphized statically. With the wrapper chosen, route who owns it:
-
-**Axis 2.1 -- owned or borrowed?** Borrowed (non-owning) routes by structural role
-and ignores the ownership axes below:
-- out-parameter write-end -> `COut<'a, T>`
-- self / sibling / parent back-reference -> the type's own `NRef<'a>` handle
-- embedded value with a scope-driven teardown -> `CValGuard`
-- a type-erased `void*` at the C seam:
-  - **genuinely opaque** (an app cookie you never look inside) -> hold a
-    `CType<c_void>` field, hand it over with the handle's `as_void_ptr` (the one
-    place a bare `CType<T>` is used unwrapped)
-  - **erased-but-materializable** (the `void*` is really a `ffi::T`) -> erase a
-    `FooRef<'a>` with its `as_void_ptr`, and reconstitute with `from_void_ptr`
-- borrowed NUL string (read-only) -> a slice view: `&core::ffi::CStr` / `&str` /
-  `&[u8]` (a thin borrowed `const char*` slot is deferred -- no wrapper yet)
-
-Owned -> keep going.
-
-**Axis 2.2 -- singleton, buffer, or string?**
-  - A **NUL-terminated C string** (`char *`, terminator-delimited, no stored length) -> `CrustifyStr<D>`
-(`D: CDropped`; because `strlen` recovers the length, one deleter covers **both** a
-plain free and a length-aware clearing free -- no `CLenDropped` needed). Its bytes
-read out as a slice view (`as_c_str` / `as_bytes` / `to_str`); it is **read-only**
-(like `core::ffi::CStr`), so the ONLY way to mutate is to drop to the raw `*mut`:
-`into_raw()` -> edit -> `from_raw()`.
-  - A **counted n-element buffer** (you index / read / write elements) ->
-  `CVec<T, S>` (`S`: your own `CLenDropped` strategy). Plain Rust elements
-  (`T: CElem`) read out as a real `&[T]` via `as_slice`; wrapped C objects go
-  through `as_handles` / `as_handles_mut` -> `CSlice` / `CSliceMut`, since a
-  `&[Foo]` would be a reference covering them.
-  - A run that lives **inside a C object** takes `CSlice` / `CSliceMut` even
-  when the elements are plain (`T: CElem`): the marker says every bit pattern is
-  a valid `T`, which is what `CVec::as_slice` needs *because `CVec` owns its
-  buffer*. A run C keeps a pointer into is not owned, so a `&[T]` over it would
-  assert `noalias` / `readonly` against a writer Rust cannot see. The owner
-  decides, not the element type.
-  - A **singleton** (one value) -> keep going.
-
-**Axis 2.3 Storage -- by value or own pointer?** Lives **by value inside another
-aggregate** -- a struct field, the stack, OR a by-value element of an array /
-matrix (no owning pointer of its own) -> `CVal<T>` (`impl_cvalued!`). Has its
-**own heap pointer** -> the core matrix below.
-
-**Axis 2.4 Core matrix -- owned heap singleton** (exclusive<->shared X typed<->erased):
-
-|               | **typed `T`** | **type-erased (`void*`)** |
-|---------------|---------------|---------------------------|
-| **exclusive** (`*_free`) | `CBox<T>` (`impl_dropped!` + optional `impl_cloned!(dup = …)`) | `CVoidBox<D>` (`CDropped`) |
-| **shared** (`up_ref` / down-ref) | `CBox<T>` (`impl_dropped!` + `impl_cloned!(up_ref = …)`) | -- rare; raw ptr / `CVoidBox` + manual |
-
-One column of types, two rows of C routines: the typed cell is `CBox<T>` either
-way. Adopt an already-built C pointer via `CBox::from_raw`.
-
-**Runtime-state overlay.** If the cell's teardown needs a value chosen at the
-wrapping site rather than a fixed `*_free`, swap the thin owner for its fat
-sibling: `CBox<T>` -> `CBoxWith<T, D>`, with `D` a strategy carrying the state
-(`CDropper`, plus `CCloner` to clone). Orthogonal to the cell. Reach here when
-teardown is not recoverable from `T` alone -- runtime state, the construction
-phase, or a second destructor, all in Axis 2.
-
-**Allocated<->initialized overlay.** When you **allocate + initialize in Rust**
-(porting a ctor), reach the matrix cell through the construction ladder:
-- typed (exclusive **or** shared) -> `CBoxWith<T, StorageFree>` with a ZST
-  `CDropper` -> `into_box()` -> `CBox<T>`. One ladder for both: the refcount is
-  just a field the initializer sets before promoting.
-- type-erased -> `CVoidBox` owns its own storage (no separate uninit type).
-
-**Boundary overlay.** An owned pointer that **crosses the FFI boundary** (you
-hand C a pointer it will later free, or adopt one C allocated) crosses it on
-the owner's raw seam: `into_raw` surrenders it, `from_raw` adopts it, and
-the handle's `as_void_ptr` / `from_void_ptr` cross an erased `void *` slot
-without transferring ownership. Orthogonal to the cell.
-
-
+**Layout.** With a zero-sized policy, `CBox<Foo, P>` and the arcs are
+pointer-sized and `Option<CBox<Foo, P>>` is a null-niche `*mut ffi::foo`, so it
+substitutes for a raw pointer field in a `#[repr(C)]` struct; `CVal<Foo, P>` is the size of
+`Foo`. The owners are `#[repr(C)]`, not `#[repr(transparent)]` (the compiler
+cannot prove a generic policy is a 1-ZST), so passing one *by value* in place
+of a pointer across an `extern "C"` signature is not ABI-guaranteed. A
+stateful policy makes the owner fat; a buffer is pointer + length, the pointer
+NULL when empty, as C's `{ T *ptr; size_t len; }`.
 
 ## no_std
 
-Crustify is `#![no_std]` by default. The `std` feature (on by default) selects
-`std::process::abort` for the unrecoverable-failure path (`Clone` when the C
-copy routine fails); without it that path is a double-panic. One path
-allocates: the `alloc` feature adds `Owner for Arc<O>`, so several `CTethered`
-children can share a parent C does not refcount. A refcounted parent, or a
-single child, stores its `CKeepalive` inline and needs neither.
+ffibox is `#![no_std]`. The `std` feature (on by default) selects
+`std::process::abort` for the unrecoverable-failure path (`Clone` or
+`make_mut` when the C copy or up_ref fails); without it that path is a
+double-panic. Nothing
+allocates.
 
 ```toml
 [dependencies]
 ffibox = { version = "0.1", default-features = false }
 ```
-
-## Comparison with alternative systems
-
-Two existing systems solve overlapping problems: `foreign-types` (the
-user-space incumbent) and the Linux kernel's Rust-for-Linux (RFL) type
-infrastructure. Crustify sits between them - the breadth of RFL's
-lifecycle modelling, targeting user-space C, and adding in-place field
-access that opaque-handle designs give up.
-
-| Concern                    | `foreign-types`              | Rust-for-Linux            | crustify                       |
-|----------------------------|------------------------------|---------------------------|--------------------------------|
-| Target                     | opaque user-space C libs     | the Linux kernel          | user-space C, incl. internals  |
-| Borrowed view              | `FooRef` ZST at the object's address | `&Opaque<T>`      | `FooRef<'a>` / `FooMut<'a>` handles |
-| Refcounting                | not modelled                 | `ARef<T>` + `AlwaysRefCounted` | `CBox<T>` + `CDropped`/`CCloned` (down-ref / `up_ref`) |
-| Unique owner + destructor  | `Foo`/`FooRef` pair          | `KBox<T>`                 | `CBox<T>` + `CDropped`/`CCloned` (`*_free` / `*_dup`) |
-| Direct field access        | no (opaque by design)        | yes                       | yes (`repr(transparent)` over C struct) |
-| Buffer cleanup strategy    | no                           | `Allocator` (alloc+free)  | `CVec<T,S>` + `CLenDropped` (free-only) |
-| Foreign `void*` slot       | no                           | `ForeignOwnable`          | the handle's `as_void_ptr` / `from_void_ptr` + the owner's `into_raw` / `from_raw` |
-| no_std                     | yes                          | n/a (kernel)              | yes                            |
-
-### foreign-types
-
-The incumbent (used by `rust-openssl` since 2014). Models exactly one
-shape: a unique owner with a destructor, split into an owned/borrowed
-type pair (`Foo` / `FooRef`) where the borrowed tier is an
-`Opaque(UnsafeCell<()>)` ZST standing at the object's address. Being
-zero-sized, it makes fields unreachable - ideal for wrapping opaque
-libraries, unusable for porting C internals where you need to read them; and
-a pointer cast out of a zero-size retag carries no provenance for the
-object's bytes, which Stacked Borrows rejects. Crustify's borrowed tier
-holds the pointer by value instead, so the provenance is the one it was
-handed. No refcounting, no conditional cleanup, no buffer wrapper.
-
-### Rust-for-Linux (RFL)
-
-The kernel's `kernel::{types,sync,alloc,list}` modules. Crustify mirrors
-RFL's design where it makes sense for user space: `CType<T>` plays the
-role of `Opaque<T>` for the layout and `!Unpin`, while the borrow is a
-handle rather than a `&Opaque<T>`, so no reference covers the C object. It
-diverges on the `void *` seam — where RFL abstracts it behind
-`ForeignOwnable`, crustify leaves it on each owner's `into_raw` / `from_raw`
-plus the handle's erased borrow pair, since only one owner shape would ever
-implement such a trait. It diverges on refcounting too:
-where RFL splits `ARef`/`AlwaysRefCounted` from `KBox` and adds `UniqueArc`
-for the pre-publication phase, crustify collapses all three into `CBox<T>` —
-every handle reaches the object through a raw pointer, so a refcounted share
-and a sole owner are the same handle, and the up_ref is just another
-`CCloned::c_clone`.
-Crustify deliberately omits the kernel-specific parts (lock framework,
-intrusive `List<T, ID>`, `pin_init!`, custom allocators, errno types) -
-these are either out of scope for user space or better served by existing
-crates.
 
 ## Maintainers
 

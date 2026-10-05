@@ -1,184 +1,253 @@
-//! Lifecycle and ownership trait **contracts** — the vocabulary that says what
-//! teardown / clone means for a wrapped C type. The owning smart pointers in
-//! [`owned_refs`](crate::owned_refs) consume these as bounds; the `impl_*!`
-//! macros in [`macros`](crate::macros) implement them.
+//! The lifecycle **contracts** the owners in [`refs`](crate::refs) run, plus
+//! [`CElem`] (slice-safe buffer elements) and [`CCell`] (the link from a
+//! layout type to its handles).
 //!
-//! The two base traits form a drop/clone pair, the clone trait a sub-trait of
-//! the drop trait (a cloned handle owes the same teardown):
+//! The lifecycle traits are implemented on a **policy** — typically a ZST
+//! bound to a C routine with an `impl_*!` macro — never on the pointee. That
+//! lets one C type carry several destructors as several owner types, and
+//! pairs each clone routine with the teardown that settles it:
 //!
-//! | Trait        | Registers                               | Enables            |
-//! |--------------|-----------------------------------------|--------------------|
-//! | [`CDropped`] | `c_drop` — a `*_free` **or** a down-ref  | `CBox`, `CVoidBox` |
-//! | [`CCloned`]  | `c_clone` — a `*_dup` **or** an `up_ref` | `Clone for CBox`   |
+//! | Trait | Registers | Drives |
+//! |-------|-----------|--------|
+//! | [`CDrop<T>`] | `c_drop` — a `*_free`, or a refcount down-ref | [`CBox`], [`CStrBox`], [`CArc`] |
+//! | [`CDupClone<T>`] | `c_dup` — a deep copy (`*_dup`, `strdup`) | their `Clone` |
+//! | [`CRefClone<T>`] | `c_up_ref` — a refcount increment; `c_is_sole_owner` | [`CArc`], [`CGuardedArc`] |
+//! | [`CLenDrop`] | `c_drop_len(ptr, byte_len)` | [`CVec`] |
+//! | [`CLenClone`] | `c_clone_len` — a buffer memdup | its `Clone` |
+//! | [`CDispose<T>`] | `c_dispose` — `*_uninit` / `*_clear` on a value | [`CVal`] |
 //!
-//! There is no separate "shared" column: exclusive and refcounted ownership
-//! differ only in *which C routine* you register, not in the handle type. See
-//! [`CCloned`] for the two mechanisms it spans.
+//! Every method takes `&self`, so a policy may carry runtime state (the
+//! element-free function of `OPENSSL_sk_pop_free`). A ZST policy costs nothing.
 //!
-//! Alongside: [`CValued`] (by-value dispose), [`CLenDropped`] / [`CLenCloned`]
-//! (length-aware buffer strategies), and the `*With` strategy traits
-//! [`CDropper`] / [`CCloner`] — which also carry the construction phase, a
-//! storage-only [`CDropper`] holding the allocation until
-//! [`CBoxWith::into_box`] promotes it. [`Owner`] is the odd one out: no
-//! teardown of its own, just the promise to keep someone else's object alive
-//! for a [`CTethered`](crate::CTethered) child.
+//! [`CGuarded`] is the exception: the object's own lock, implemented on the
+//! layout type, which [`CGuardedArc`] and [`CGuardedRef`] take around every
+//! access.
 
 use core::ptr::NonNull;
 
-// Imported so the trait docs' intra-doc links (`[CCell]`, `[CBox]`, `[CVal]`,
-// `[CBoxWith]`, …) resolve; none of them is named in a signature here.
+// Imported so the trait docs' intra-doc links resolve; none of them is named in
+// a signature here.
 #[allow(unused_imports)]
-use crate::c_type::CCell;
+use crate::refs::{CBox, CStrBox, CVal, CVec};
 #[allow(unused_imports)]
-use crate::owned_refs::{CBox, CBoxWith, CVal, CVec};
+use crate::shared::{CArc, CGuardedArc, CGuardedRef};
 
 // ===========================================================================
-// Base lifecycle grid (drop/clone x exclusive/shared) + refcount unifier,
-// uninit-phase free, and by-value dispose
+// Pointer teardown / duplication policies
 // ===========================================================================
 
-/// Destructor for a C-allocated type; the bound that [`CBox<T>`] `Drop`s on.
-/// The clone half is the sub-trait [`CCloned`].
+/// Teardown policy for an owned `*mut T`; the bound [`CBox<T, D>`] and
+/// [`CStrBox<D>`] drop on.
 ///
-/// `c_drop` settles one unit of ownership debt: a plain `*_free`
-/// (`EVP_MD_CTX_free`), a generic allocator free (`OPENSSL_free` on a byte
-/// newtype), or the refcount **down-ref** of a shared type. The wrapper does
-/// not distinguish them.
+/// `c_drop` releases the owner's claim on the object: a plain `*_free`
+/// (`EVP_MD_CTX_free`), a generic allocator free (`OPENSSL_free`), or the
+/// refcount **down-ref** of one counted reference ([`CArc`], or a [`CBox`]
+/// holding the only one).
+///
+/// Implemented on the policy `Self`, not on `T`, so one `T` may have several,
+/// and the owner's type says which runs.
+/// [`impl_cdrop!`](crate::impl_cdrop) binds a C routine; write the impl by
+/// hand when teardown needs runtime state. A destructor that must be
+/// suppressed on some paths folds the gate into `c_drop`.
 ///
 /// # Safety
 ///
-/// - `c_drop` must free the object and every sub-resource it owns.
-/// - Its argument must be valid — from a constructor, or transferred in via
-///   `into_raw`.
+/// `c_drop` must release the object and every sub-resource it owns, exactly
+/// once, using only `self` as extra state.
 ///
 /// # Example
 ///
 /// ```ignore
-/// unsafe impl CDropped for EvpMdCtx {
-///     unsafe fn c_drop(obj: NonNull<Self>) {
+/// pub struct StackPopFree(unsafe extern "C" fn(*mut c_void));
+/// unsafe impl CDrop<Stack> for StackPopFree {
+///     unsafe fn c_drop(&self, ptr: NonNull<Stack>) {
 ///         // SAFETY: caller upholds the trait contract.
-///         unsafe { EVP_MD_CTX_free(obj.as_ptr().cast()) }
+///         unsafe { OPENSSL_sk_pop_free(ptr.as_ptr().cast(), Some(self.0)) }
 ///     }
 /// }
 /// ```
-///
-/// # Conditional teardown
-///
-/// A destructor that must be suppressed on some paths folds the gate **into
-/// `c_drop`** — read the object's own state and return early. For scope-driven
-/// dismissal that is not a property of the object, defuse via
-/// [`CBox::into_raw`].
-pub unsafe trait CDropped {
-    /// Free the object. Called unconditionally by `CBox::drop`.
+pub unsafe trait CDrop<T> {
+    /// Release the object at `ptr`. Called unconditionally by the owner's
+    /// `Drop`.
     ///
     /// # Safety
     ///
-    /// `obj` must point to a live, uniquely-owned instance of `Self`.
-    unsafe fn c_drop(obj: NonNull<Self>);
+    /// `ptr` must address a live `T` whose claim the caller owns.
+    unsafe fn c_drop(&self, ptr: NonNull<T>);
 }
 
-/// Teardown for a C type Rust owns **by value**: disposes owned resources
-/// without freeing the header, which is Rust's inline storage and is released
-/// by [`CVal`].
+/// Deep copy; the bound that gives [`CBox`] and [`CStrBox`] their [`Clone`]
+/// and `try_clone`.
 ///
-/// Contrast [`CDropped`], whose header is heap-allocated and freed via
-/// [`CBox`]. A type may implement both — the wrapper you pick selects which
-/// teardown runs — since a C library commonly exposes both a `*_free`
-/// (storage and fields) and a `*_dispose` / `*_cleanup` (fields only).
-/// Register each under the matching trait; never the same function under both.
+/// A sub-trait of [`CDrop`] on the same policy, so a `*_dup` is always settled
+/// by its `*_free`. A deep copy is what keeps a cloned [`CBox`] the **sole**
+/// owner of its object; a refcount bump is [`CRefClone`], which `CBox` never
+/// uses.
 ///
 /// # Safety
 ///
-/// [`c_dispose`](Self::c_dispose) must release the value's owned resources
-/// exactly once and must **not** free the header, which Rust owns and will
-/// reclaim itself.
-pub unsafe trait CValued {
-    /// Dispose the owned resource. **Does not free the header** (Rust owns it
-    /// by value). Called unconditionally by [`CVal::drop`], exactly once.
-    ///
-    /// # Safety
-    ///
-    /// `this` must point to a live, uniquely-owned, **initialised** instance
-    /// of `Self`.
-    unsafe fn c_dispose(this: NonNull<Self>);
-}
-
-/// Handle duplication; the bound that gives [`CBox<T>`] its [`Clone`] and
-/// [`CBox::try_clone`].
+/// - A `Some` return must be a fresh, fully-initialised object, independent of
+///   `ptr` (no shared mutable state, no aliased sub-allocations beyond what the
+///   C type itself treats as immutable), that this policy's `c_drop` releases.
+/// - `None` must mean the C routine failed.
+/// - `c_dup` must not invalidate `ptr`.
 ///
-/// The contract is stated in terms of *debt*, not allocation:
-/// [`c_clone`](Self::c_clone) returns a pointer owing exactly one
-/// [`CDropped::c_drop`], independent of the original. That covers **both** C
-/// duplication mechanisms with one trait:
-///
-/// | C pattern                              | `c_clone` does                     | Returns          |
-/// |----------------------------------------|------------------------------------|------------------|
-/// | `*_dup` deep-copies (`EVP_PKEY_dup`)   | allocate a fresh object            | the **new** ptr  |
-/// | `*_up_ref` bumps a counter in place    | increment the refcount             | the **same** ptr |
-///
-/// Which applies is a property of the C API, not the Rust handle: both yield a
-/// second `CBox<T>` that must be dropped, and `c_drop` settles the debt either
-/// way. [`impl_cloned!`](crate::impl_cloned) takes the mechanism as a named
-/// argument (`dup = …` / `up_ref = …`) because the C signatures differ — a
-/// dup's return value *is* the new handle, an `up_ref`'s is a status and the
-/// handle to keep is the original.
-///
-/// Sub-trait of [`CDropped`]: every clone owes the same teardown.
-///
-/// **A type exposing both: the `up_ref` wins.** Register the bump as `c_clone`
-/// and leave the deep copy as an inherent method. On a refcounted type `Clone`
-/// means "another handle to the same object" — what the C API and callers
-/// expect; a silently deep-copying `Clone` would break identity comparisons and
-/// double the allocation cost.
-///
-/// # Safety
-///
-/// - A `Some` return must owe **exactly one** `c_drop` beyond the one `obj`
-///   already owes: a fresh fully-initialised allocation for a deep copy, an
-///   actually-incremented count for a bump.
-/// - `None` must mean the C routine failed (a `NULL` dup, a zero `up_ref`
-///   status) — never a dangling, half-initialised, or already-freed pointer.
-/// - `c_clone` must not invalidate `obj`.
-/// - A deep copy must be independent of `obj`: no shared mutable state, no
-///   aliased sub-allocations beyond what the C type itself treats as shared.
-///
-/// # Examples
+/// # Example
 ///
 /// ```ignore
-/// // Deep copy — return the new pointer.
-/// unsafe impl CCloned for EvpPkey {
-///     unsafe fn c_clone(obj: NonNull<Self>) -> Option<NonNull<Self>> {
+/// unsafe impl CDupClone<EvpPkey> for EvpPkeyFree {
+///     unsafe fn c_dup(&self, ptr: NonNull<EvpPkey>) -> Option<NonNull<EvpPkey>> {
 ///         // SAFETY: caller upholds the trait contract.
-///         NonNull::new(unsafe { EVP_PKEY_dup(obj.as_ptr().cast()) }.cast())
-///     }
-/// }
-///
-/// // Refcount bump — return the *same* pointer, `None` on overflow.
-/// unsafe impl CCloned for SslSession {
-///     unsafe fn c_clone(obj: NonNull<Self>) -> Option<NonNull<Self>> {
-///         // SAFETY: caller upholds the trait contract.
-///         (unsafe { SSL_SESSION_up_ref(obj.as_ptr().cast()) } != 0).then_some(obj)
+///         NonNull::new(unsafe { EVP_PKEY_dup(ptr.as_ptr().cast()) }.cast())
 ///     }
 /// }
 /// ```
-pub unsafe trait CCloned: CDropped {
-    /// Duplicate the handle to the C object at `obj` — by deep copy or by
-    /// refcount increment — returning a pointer that owes one independent
-    /// [`CDropped::c_drop`], or `None` on failure.
+pub unsafe trait CDupClone<T>: CDrop<T> {
+    /// Deep-copy the object at `ptr`, or `None` on failure.
     ///
     /// # Safety
     ///
-    /// `obj` must point to a live, valid instance of `Self`. The original
-    /// handle remains valid; this call must not invalidate it.
-    unsafe fn c_clone(obj: NonNull<Self>) -> Option<NonNull<Self>>;
+    /// `ptr` must address a live `T`.
+    unsafe fn c_dup(&self, ptr: NonNull<T>) -> Option<NonNull<T>>;
 }
+
+/// Refcount increment, paired with the down-ref this policy's [`CDrop`]
+/// performs; the bound [`CArc`] and [`CGuardedArc`] clone on.
+/// [`CBox`] never clones through this trait.
+///
+/// [`c_is_sole_owner`](Self::c_is_sole_owner) lets an arc hand out exclusive
+/// access without a lock or a copy (`get_mut`, `make_mut`) when its reference
+/// is provably the only one. The default answers `false`, which is always
+/// sound: `get_mut` then returns `None` and `make_mut` always copies.
+///
+/// # Safety
+///
+/// - A `true` from `c_up_ref` must mean the count was actually incremented,
+///   so the object owes one more `c_drop` of this policy (or a clone of it).
+/// - A `false` from `c_up_ref` must mean the C routine failed and nothing
+///   changed.
+/// - Neither method may invalidate `ptr`.
+/// - A `true` from `c_is_sole_owner` must mean no other reference can reach
+///   the object, now or later: the count is read with at least Acquire
+///   ordering (so a down-ref on another thread happens-before it), and every
+///   reference is counted — weak ones, and any pointer C itself keeps and
+///   could `up_ref` later.
+pub unsafe trait CRefClone<T>: CDrop<T> {
+    /// Increment the reference count of the object at `ptr`.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must address a live `T` whose claim the caller holds.
+    unsafe fn c_up_ref(&self, ptr: NonNull<T>) -> bool;
+
+    /// Whether the caller's reference is the only one. `false` when unsure.
+    ///
+    /// # Safety
+    ///
+    /// As [`c_up_ref`](Self::c_up_ref).
+    #[inline]
+    unsafe fn c_is_sole_owner(&self, ptr: NonNull<T>) -> bool {
+        let _ = ptr;
+        false
+    }
+}
+
+/// The C object's own reader/writer lock, registered on the layout type; the
+/// bound the guards of [`CGuardedArc`] and [`CGuardedRef`] lock through.
+///
+/// The functions take the object's pointer rather than `&self`, because a
+/// `&Foo` would be a reference covering the C object. An object with only a
+/// mutex implements the exclusive pair; the read pair defaults to it.
+/// [`impl_cguarded!`](crate::impl_cguarded) binds C routines.
+///
+/// # Safety
+///
+/// - Every C routine that touches the object's mutable state takes this lock,
+///   so holding it excludes C as well as Rust.
+/// - `c_lock` returns `true` only once no other guard — read or write, on any
+///   thread *including this one* — is held, and blocks until then (or returns
+///   `false`, as for `pthread_rwlock_*`'s `EDEADLK`); a lock that is reentrant
+///   for the exclusive side would hand out two `Mut` handles.
+/// - `c_read_lock` returns `true` only once no write guard is held, on any
+///   thread including this one.
+/// - `false` means the C lock call failed and nothing is held.
+/// - Each unlock is called once, on the thread that took the matching lock.
+pub unsafe trait CGuarded: CCell {
+    /// Take the exclusive lock. `false` if the C call failed.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must address a live `Self`.
+    unsafe fn c_lock(ptr: NonNull<Self>) -> bool;
+
+    /// Release the exclusive lock.
+    ///
+    /// # Safety
+    ///
+    /// The calling thread must hold the exclusive lock on `ptr`.
+    unsafe fn c_unlock(ptr: NonNull<Self>);
+
+    /// Take a shared lock. Defaults to the exclusive one.
+    ///
+    /// # Safety
+    ///
+    /// As [`c_lock`](Self::c_lock).
+    #[inline]
+    unsafe fn c_read_lock(ptr: NonNull<Self>) -> bool {
+        // SAFETY: the caller upholds `c_lock`'s contract.
+        unsafe { Self::c_lock(ptr) }
+    }
+
+    /// Release a shared lock. Defaults to the exclusive one.
+    ///
+    /// # Safety
+    ///
+    /// The calling thread must hold a shared lock on `ptr` taken with
+    /// [`c_read_lock`](Self::c_read_lock).
+    #[inline]
+    unsafe fn c_read_unlock(ptr: NonNull<Self>) {
+        // SAFETY: the caller upholds the contract.
+        unsafe { Self::c_unlock(ptr) }
+    }
+}
+
+/// In-place disposal of a value Rust holds inline; the bound [`CVal<T, D>`]
+/// drops on. Releases what the value's fields own and leaves the value's
+/// storage, which is Rust's, alone: `*_uninit`, `*_clear`, `*_dispose`.
+///
+/// [`impl_cdispose!`](crate::impl_cdispose) binds a C routine.
+///
+/// # Safety
+///
+/// `c_dispose` must release the value's owned resources exactly once, must not
+/// free the value itself, and must accept every value safe code can bring a
+/// `T` to: what a safe constructor produces (all-zero included), and anything
+/// a safe setter on [`T::Mut`](CCell::Mut) then writes into it.
+///
+/// That makes the setters part of this contract. A setter that can leave the
+/// value in a state `c_dispose` cannot handle — an arbitrary pointer in a field
+/// it frees, a length longer than the buffer it clears — must validate its
+/// input or be `unsafe`, or a safe `CVal` would hand that state to the
+/// disposal routine on drop.
+pub unsafe trait CDispose<T> {
+    /// Dispose the resources of the value at `ptr`.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must address a live, initialised `T` the caller owns.
+    unsafe fn c_dispose(&self, ptr: NonNull<T>);
+}
+
+// ===========================================================================
+// Buffer elements
+// ===========================================================================
 
 /// Element types a [`CVec`] may materialise as a slice: a plain Rust value,
 /// every bit pattern of which is valid.
 ///
-/// [`CVec::as_slice`] hands out `&[Self]`, which asserts well-formedness for all
-/// `count` elements at once. This marker carries that claim, checked once at the
-/// type rather than at each view.
+/// [`CVec::as_slice`] hands out `&[Self]`, which asserts well-formedness for
+/// all `count` elements at once. This marker carries that claim, checked once
+/// at the type rather than at each view.
 ///
 /// | Category | Why it holds |
 /// |---|---|
@@ -190,7 +259,7 @@ pub unsafe trait CCloned: CDropped {
 /// [`define_ctype!`](crate::define_ctype) implements [`CCell`],
 /// not this, so `&[Foo]` — which would be a reference covering C objects — does
 /// not typecheck. Iterate a buffer of those with
-/// [`CVec::as_handles`](crate::CVec::as_handles) instead.
+/// [`CVec::as_handles`] instead.
 ///
 /// `bool` and `char` are also excluded: C's `_Bool` may hold a byte outside
 /// `{0, 1}` and a `char` outside the Unicode scalar range, both invalid Rust
@@ -229,154 +298,178 @@ unsafe impl<T: CElem, const N: usize> CElem for [T; N] {}
 unsafe impl CElem for () {}
 
 // ===========================================================================
-// Length-aware buffer strategies (implemented on a ZST selector, not the
-// element type) — drive CVec's cleanup / clone
+// Length-aware buffer policies — drive CVec's cleanup / clone
 // ===========================================================================
 
-/// Byte-buffer cleanup strategy; the bound [`CVec<T, S>`] drops on. Implemented
-/// on a **strategy selector** type (typically a ZST), not on the element type,
-/// so one element type pairs with several policies — plain free, secure
-/// zero-then-free, zero-only — at zero runtime cost. The crate ships none.
+/// Byte-buffer cleanup policy; the bound [`CVec<T, S>`] drops on. Like
+/// [`CDrop`], implemented on a policy (typically a ZST), not on the element
+/// type, so one element type pairs with several policies — plain free, secure
+/// zero-then-free, zero-only — at zero runtime cost.
 ///
 /// # Safety
 ///
-/// - `c_drop_len` must handle the `byte_len`-byte buffer at `ptr` under
-///   whatever allocator and cleanup policy the strategy represents.
-/// - `ptr` must be valid and `byte_len` must equal the original allocation's
-///   byte size.
+/// `c_drop_len` must release the buffer at `ptr` exactly once, under whatever
+/// allocator and cleanup policy `self` represents, touching at most `byte_len`
+/// bytes of it, and must be sound for every `byte_len` its method contract
+/// admits.
 ///
 /// # Example
 ///
 /// ```ignore
 /// pub struct SecureFree;
-/// unsafe impl CLenDropped for SecureFree {
-///     unsafe fn c_drop_len(ptr: *mut u8, byte_len: usize) {
+/// unsafe impl CLenDrop for SecureFree {
+///     unsafe fn c_drop_len(&self, ptr: *mut u8, byte_len: usize) {
 ///         unsafe {
 ///             explicit_bzero(ptr.cast(), byte_len);
 ///             libc::free(ptr.cast());
 ///         }
 ///     }
 /// }
-/// pub type SecretKey = CVec<u8, SecureFree>;
 /// ```
-pub unsafe trait CLenDropped {
-    /// Free the `byte_len`-byte buffer at `ptr`.
+pub unsafe trait CLenDrop {
+    /// Free the buffer at `ptr`, whose first `byte_len` bytes are in use.
     ///
     /// # Safety
     ///
-    /// `ptr` must point to a valid allocation of at least `byte_len`
-    /// bytes, allocated by the allocator this strategy targets.
-    unsafe fn c_drop_len(ptr: *mut u8, byte_len: usize);
+    /// - `ptr` must be a live allocation the caller owns, from the allocator
+    ///   this policy targets.
+    /// - `byte_len` must not exceed the allocation's size, and must equal it
+    ///   exactly when the policy's free takes a size (`OPENSSL_clear_free`, a
+    ///   sized deallocator) — passing less there frees the wrong amount, or
+    ///   leaves the tail uncleared.
+    unsafe fn c_drop_len(&self, ptr: *mut u8, byte_len: usize);
 }
 
-/// Deep-copy strategy for a length-aware buffer (a `memdup`): the length-aware
-/// analogue of [`CCloned`], needed because a buffer copy carries a byte length
-/// that a pointer-only `c_clone` cannot. Gives [`CVec<T, S>`] its [`Clone`],
-/// and only on opt-in — a `CLenDropped`-only strategy is deliberately not
-/// cloneable.
+/// Deep-copy policy for a length-aware buffer (a `memdup`): the length-aware
+/// analogue of [`CDupClone`], needed because a buffer copy carries a byte length
+/// that a pointer-only `c_dup` cannot. Gives [`CVec<T, S>`] its [`Clone`],
+/// and only on opt-in — a `CLenDrop`-only policy is deliberately not cloneable.
 ///
-/// This strategy copies bytes, not elements. [`CVec`](crate::CVec) therefore
-/// exposes cloning only when `T: Copy`; a buffer of owning elements needs a
+/// This policy copies bytes, not elements. [`CVec`] therefore exposes
+/// cloning only when `T: Copy`; a buffer of owning elements needs a
 /// per-element clone contract, which this trait does not provide.
 ///
 /// # Safety
 ///
 /// `c_clone_len` must return a fresh, uniquely-owned allocation of `byte_len`
-/// bytes byte-copied from `ptr` and releasable by this strategy's
-/// [`CLenDropped`] impl — or `None` on allocation failure. It must not
-/// invalidate `ptr`.
-pub unsafe trait CLenCloned: CLenDropped {
+/// bytes byte-copied from `ptr` and releasable by this policy's [`CLenDrop`]
+/// impl — or `None` on allocation failure. It must not invalidate `ptr`.
+pub unsafe trait CLenClone: CLenDrop {
     /// Byte-copy the `byte_len`-byte buffer at `ptr` into a fresh allocation,
     /// or `None` on failure.
     ///
     /// # Safety
     ///
     /// `ptr` must point to a live allocation of at least `byte_len` bytes
-    /// compatible with this strategy's allocator.
-    unsafe fn c_clone_len(ptr: *mut u8, byte_len: usize) -> Option<NonNull<u8>>;
+    /// compatible with this policy's allocator.
+    unsafe fn c_clone_len(&self, ptr: *mut u8, byte_len: usize) -> Option<NonNull<u8>>;
 }
 
-// ===========================================================================
-// Stateful (`*With`) teardown strategies — agent-noun analogues of the base
-// pair, implemented on the state object `D`, driving CBoxWith
-// ===========================================================================
+// ---------------------------------------------------------------------------
+// CCell — the link from a layout newtype to its handles
+// ---------------------------------------------------------------------------
 
-/// Exclusive drop **strategy** carried as a value: the fat-owner analogue of
-/// [`CDropped`]. Implemented by a policy object `D` (a `fn`, a length, any
-/// struct, or a ZST) stored inline on [`CBoxWith<T, D>`]; `c_drop` receives it
-/// (`&self`) alongside the pointer, so teardown can use runtime data a
-/// zero-state [`CDropped`] cannot carry (e.g. `OPENSSL_sk_pop_free(ptr, fn)`).
+/// A `#[repr(transparent)]` newtype over a C type (`Self::C`), together with
+/// the borrowed handles that carry its accessors.
 ///
-/// Use this when teardown is not recoverable from `T` alone: runtime state, or
-/// a second policy for one C type. Otherwise register a plain [`CDropped`] and
-/// use [`CBox`].
+/// A **linking** trait, not an access trait: it names the wrapped C type and
+/// the two handle types, and has no methods — nothing on it is callable, so
+/// implementing it exposes no constructor. ffibox builds the handles from a
+/// pointer itself, relying on the layout the contract below guarantees. The seam (`as_ptr` / `as_mut_ptr` /
+/// `from_ptr`) lives on the handles as inherent methods, because that is where
+/// a `&self` receiver is sound — `&FooRef` covers one pointer of Rust stack
+/// where `&Foo` would cover the C object.
+///
+/// Implemented by [`define_ctype!`](crate::define_ctype) for the trivial base
+/// case, or by hand for lifetime- / type-generic newtypes.
 ///
 /// # Safety
 ///
-/// - `c_drop` must release `ptr` and everything it owns, exactly once, using
-///   only `self` as extra state.
-/// - `ptr` must be valid (from a constructor or [`CBoxWith::into_raw`]).
-pub unsafe trait CDropper<T> {
-    /// Free the object at `ptr`, using `self` as teardown state.
-    ///
-    /// # Safety
-    ///
-    /// `ptr` must point to a live, uniquely-owned instance of `T`.
-    unsafe fn c_drop(&self, ptr: NonNull<T>);
-}
+/// - `Self` MUST be layout-compatible with `Self::C`: `#[repr(transparent)]`
+///   over it, any other fields zero-sized.
+/// - [`Ref<'a>`](CCell::Ref) and [`Mut<'a>`](CCell::Mut) MUST each be
+///   `#[repr(transparent)]` over
+///   [`CBorrowedPtr<'a, Self>`](crate::CBorrowedPtr) — directly, or `Mut` over
+///   `Ref` — with every other field zero-sized and no `Drop`: ffibox builds
+///   them from a `CBorrowedPtr` by layout alone. They borrow the pointee for
+///   `'a` and MUST NOT hand out a reference to `Self`.
+/// - `Ref` MUST NOT offer any operation that writes through the pointer — that
+///   is `Mut`'s job, and the split is what keeps a shared borrow shared.
+/// - `Mut<'a>` MUST be invariant in `Self`, as `&'a mut Self` is. A
+///   [`CBorrowedPtr`](crate::CBorrowedPtr) alone is covariant, like `&'a T`, so
+///   add a `PhantomData<&'a mut Self>` field. This matters only when `Self`
+///   has lifetime or type parameters (what [`define_ctype!`](crate::define_ctype)
+///   emits has none, and carries the marker anyway): without it,
+///   `Mut<'a>` over `Holder<'static>` would coerce to one over
+///   `Holder<'short>`, whose setter could store a `'short` borrow that the
+///   `'static` owner later reads.
+///
+/// ```compile_fail
+/// use core::marker::PhantomData;
+/// use ffibox::{CBorrowedPtr, CCell};
+///
+/// #[repr(C)]
+/// pub struct holder_st { p: *const u32 }
+/// /// Holds a `&'x u32` in a C field.
+/// #[repr(transparent)]
+/// pub struct Holder<'x>(holder_st, PhantomData<&'x u32>);
+/// #[repr(transparent)]
+/// #[derive(Clone, Copy)]
+/// pub struct HolderRef<'a, 'x>(CBorrowedPtr<'a, Holder<'x>>);
+/// #[repr(transparent)]
+/// pub struct HolderMut<'a, 'x>(HolderRef<'a, 'x>, PhantomData<&'a mut Holder<'x>>);
+///
+/// unsafe impl<'x> CCell for Holder<'x> {
+///     type C = holder_st;
+///     type Ref<'a> = HolderRef<'a, 'x> where Self: 'a;
+///     type Mut<'a> = HolderMut<'a, 'x> where Self: 'a;
+/// }
+///
+/// // Rejected thanks to the marker; without it, this compiles.
+/// fn shrink<'a, 's>(m: HolderMut<'a, 'static>) -> HolderMut<'a, 's> {
+///     m
+/// }
+/// ```
+///
+/// The handle size is checked at compile time wherever ffibox builds a handle,
+/// so an impl whose `Ref` or `Mut` is not pointer-sized fails the build:
+///
+/// ```compile_fail,E0080
+/// use core::ptr::NonNull;
+/// use ffibox::{CBorrowedPtr, CCell, CSlice};
+///
+/// #[repr(C)]
+/// pub struct raw_st { x: u8 }
+/// #[repr(transparent)]
+/// pub struct Foo(raw_st);
+/// #[derive(Clone, Copy)]
+/// pub struct FooRef<'a>(CBorrowedPtr<'a, Foo>, u64); // not transparent
+/// pub struct FooMut<'a>(CBorrowedPtr<'a, Foo>);
+///
+/// unsafe impl CCell for Foo {
+///     type C = raw_st;
+///     type Ref<'a> = FooRef<'a>;
+///     type Mut<'a> = FooMut<'a>;
+/// }
+///
+/// let mut v = Foo(raw_st { x: 0 });
+/// let run = unsafe { CSlice::from_raw_parts(NonNull::from(&mut v), 1) };
+/// let _ = run.get(0); // instantiates the handle conversion for `Foo`
+/// ```
+pub unsafe trait CCell: Sized {
+    /// The wrapped C FFI type (e.g. `ffi::stack_st`).
+    type C;
 
-/// Handle duplication carrying runtime **state** — the fat-owner analogue of
-/// [`CCloned`] and a sub-trait of [`CDropper`] (a clone owes the same
-/// teardown). Gives [`CBoxWith<T, D>`] its `Clone` when additionally
-/// `D: Clone`.
-///
-/// Spans the same two mechanisms as [`CCloned`]: a deep copy returning a new
-/// pointer, or an `up_ref` returning the same one. A refcounted pointee needs
-/// no separate strategy type — register the down-ref as
-/// [`CDropper::c_drop`] and the bump here.
-///
-/// As with [`CDropper`]: a `T` with one recoverable policy belongs in a plain
-/// [`CCloned`] on a [`CBox`].
-///
-/// # Safety
-///
-/// A `Some` return must owe **exactly one** [`CDropper::c_drop`] beyond the one
-/// `ptr` already owes — a fresh, uniquely-owned allocation for a deep copy, an
-/// actually-incremented count for a bump — and must be releasable by this same
-/// strategy. `None` must mean the C routine failed. `c_clone` must not
-/// invalidate `ptr`.
-pub unsafe trait CCloner<T>: CDropper<T> {
-    /// Duplicate the handle at `ptr`, using `self` as state; `None` on
-    /// failure.
+    /// The shared borrowed handle — `Copy`, getters only.
     ///
-    /// # Safety
-    ///
-    /// `ptr` must point to a live instance of `T`.
-    unsafe fn c_clone(&self, ptr: NonNull<T>) -> Option<NonNull<T>>;
-}
+    /// `Self: 'a` because a handle borrows the object: a generic wrapper's
+    /// parameters must outlive the borrow, exactly as `&'a T` requires.
+    type Ref<'a>: Copy
+    where
+        Self: 'a;
 
-/// A handle whose sole job is to keep a C object alive for someone else.
-///
-/// Implemented by [`CKeepalive<T>`](crate::owned_refs::CKeepalive), and — with
-/// the `alloc` feature — by `Arc<O>` so several tethered children can share one
-/// parent. It is the owner half of [`CTethered<T, O>`](crate::owned_refs::CTethered):
-/// a child pointing INTO a parent's allocation holds one of these so the parent
-/// cannot be released while the child lives.
-///
-/// The trait has no methods. Its whole content is the guarantee below plus the
-/// `Drop` the implementor already has — which is exactly why an implementor can
-/// be `Send + Sync` where the owning handle it wraps is not: with no way to
-/// reach the pointer through `&self`, a shared reference gives another thread
-/// nothing to race on.
-///
-/// # Safety
-///
-/// - The implementor must keep the owned C object alive for as long as it
-///   itself lives, and release it (exactly once) when the last owner drops.
-/// - The object's ADDRESS must be stable for that whole time. A handle that
-///   owns its C struct **by value** ([`CVal`]) must
-///   never implement this: moving it relocates the object and dangles every
-///   interior pointer a child holds. Only pointer-owning handles qualify.
-/// - No method may hand out access to the object through `&self`; `Send` and
-///   `Sync` are claimed on that basis.
-pub unsafe trait Owner: Send + Sync {}
+    /// The exclusive borrowed handle — move-only, getters plus setters.
+    type Mut<'a>
+    where
+        Self: 'a;
+}

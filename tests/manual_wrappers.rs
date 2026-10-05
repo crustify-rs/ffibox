@@ -16,10 +16,11 @@
 
 use core::marker::PhantomData;
 use core::mem::size_of;
-use core::ops::Deref;
 use core::ptr::{addr_of, addr_of_mut, NonNull};
 use core::sync::atomic::{AtomicUsize, Ordering};
-use ffibox::{define_ctype, CBox, CBoxWith, CCell, CDropped, CDropper, CPtr, CType};
+use std::sync::Mutex;
+
+use ffibox::{define_ctype, impl_cdrop, CBorrowedPtr, CBox, CCell, CDrop};
 
 #[repr(C)]
 pub struct foo_st {
@@ -29,6 +30,25 @@ pub struct foo_st {
 
 // Base case — via the macro.
 define_ctype!(FooFull, FooFullRef, FooFullMut, foo_st);
+
+static FULL_FREES: AtomicUsize = AtomicUsize::new(0);
+
+/// Mock full destructor for a formed `foo_st`.
+///
+/// # Safety
+///
+/// `p` must be a live, uniquely-owned `Box<foo_st>` allocation.
+unsafe fn foo_full_free(p: *mut foo_st) {
+    FULL_FREES.fetch_add(1, Ordering::SeqCst);
+    // SAFETY: the caller transfers the `Box` allocation.
+    drop(unsafe { Box::from_raw(p) });
+}
+
+/// The full destructor, run once the object is formed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FooFullFree;
+impl_cdrop!(FooFullFree, FooFull, foo_full_free);
+pub type FooFullOwned = CBox<FooFull, FooFullFree>;
 
 // --- Hand-written type-generic wrapper: the STACK_OF shape Stack<T, S> ---
 #[repr(C)]
@@ -43,12 +63,12 @@ pub struct X509;
 pub struct X509Free;
 
 #[repr(transparent)]
-pub struct Stack<T, S>(CType<stack_st>, PhantomData<(T, S)>);
+pub struct Stack<T, S>(stack_st, PhantomData<(*const (), T, S)>);
 
 /// The hand-written shared handle. The generic parameters ride along, so
 /// borrowing a pointer cannot lose the element type or the free strategy.
 #[repr(transparent)]
-pub struct StackRef<'a, T, S>(CPtr<'a, Stack<T, S>>);
+pub struct StackRef<'a, T, S>(CBorrowedPtr<'a, Stack<T, S>>);
 impl<T, S> Clone for StackRef<'_, T, S> {
     fn clone(&self) -> Self {
         *self
@@ -58,10 +78,10 @@ impl<T, S> Copy for StackRef<'_, T, S> {}
 
 /// The hand-written exclusive handle.
 #[repr(transparent)]
-pub struct StackMut<'a, T, S>(StackRef<'a, T, S>);
+pub struct StackMut<'a, T, S>(StackRef<'a, T, S>, PhantomData<&'a mut Stack<T, S>>);
 
-// SAFETY: `Stack` is `#[repr(transparent)]` over `CType<stack_st>`; both handles
-// are transparent over `CPtr<'a, Stack<T, S>>` and expose no reference to
+// SAFETY: `Stack` is `#[repr(transparent)]` over `stack_st`; both handles
+// are transparent over `CBorrowedPtr<'a, Stack<T, S>>` and expose no reference to
 // `Stack`; the shared one has no write path.
 unsafe impl<T, S> CCell for Stack<T, S> {
     type C = stack_st;
@@ -73,31 +93,19 @@ unsafe impl<T, S> CCell for Stack<T, S> {
         = StackMut<'a, T, S>
     where
         Self: 'a;
-
-    unsafe fn ref_from_raw<'a>(p: NonNull<Self>) -> StackRef<'a, T, S>
-    where
-        Self: 'a,
-    {
-        StackRef(unsafe { CPtr::new(p) })
-    }
-    unsafe fn mut_from_raw<'a>(p: NonNull<Self>) -> StackMut<'a, T, S>
-    where
-        Self: 'a,
-    {
-        StackMut(StackRef(unsafe { CPtr::new(p) }))
-    }
 }
 
 impl<T, S> Stack<T, S> {
     /// All-zero is a valid `stack_st` (an `i32` and a raw pointer).
     fn zeroed() -> Self {
-        Self(unsafe { CType::zeroed() }, PhantomData)
+        // SAFETY: all-zero is a valid `stack_st`.
+        Self(unsafe { core::mem::zeroed() }, PhantomData)
     }
 }
 
 impl<'a, T, S> StackRef<'a, T, S> {
     unsafe fn from_ptr(p: *mut stack_st) -> Option<Self> {
-        NonNull::new(p.cast::<Stack<T, S>>()).map(|p| StackRef(unsafe { CPtr::new(p) }))
+        NonNull::new(p.cast::<Stack<T, S>>()).map(|p| StackRef(unsafe { CBorrowedPtr::new(p) }))
     }
     fn as_ptr(&self) -> *const stack_st {
         self.0.as_non_null().as_ptr().cast()
@@ -109,19 +117,18 @@ impl<'a, T, S> StackRef<'a, T, S> {
 }
 
 impl<'a, T, S> StackMut<'a, T, S> {
+    /// Reborrow shared, bound to `&self`. Not `Deref`: its `Target` would have
+    /// to be `StackRef<'a, _, _>`, and since that is `Copy`, `*m` would copy a
+    /// shared handle out that outlives the borrow while `m` keeps writing.
+    fn as_ref(&self) -> StackRef<'_, T, S> {
+        self.0
+    }
     fn as_mut_ptr(&mut self) -> *mut stack_st {
         self.0 .0.as_non_null().as_ptr().cast()
     }
     /// A setter: `&mut self` on the HANDLE — one pointer of Rust stack.
     fn set_num(&mut self, v: i32) {
         unsafe { addr_of_mut!((*self.as_mut_ptr()).num).write(v) }
-    }
-}
-
-impl<'a, T, S> Deref for StackMut<'a, T, S> {
-    type Target = StackRef<'a, T, S>;
-    fn deref(&self) -> &StackRef<'a, T, S> {
-        &self.0
     }
 }
 
@@ -149,7 +156,7 @@ fn layout_and_niche() {
         size_of::<Option<StackRef<'_, X509, Borrowed>>>(),
         size_of::<*const stack_st>()
     );
-    assert_eq!(size_of::<Option<CBox<FooFull>>>(), size_of::<*mut foo_st>());
+    assert_eq!(size_of::<Option<FooFullOwned>>(), size_of::<*mut foo_st>());
 }
 
 // Covariance: a longer borrow is usable where a shorter one is expected, just
@@ -168,11 +175,13 @@ fn the_hand_written_seam_reads_and_writes() {
     let r: StackRef<'_, X509, Borrowed> = unsafe { StackRef::from_ptr(raw) }.unwrap();
     assert_eq!(r.num(), 3);
 
-    let mut m: StackMut<'_, X509, Borrowed> =
-        unsafe { Stack::mut_from_raw(NonNull::new(raw.cast()).unwrap()) };
+    let mut m: StackMut<'_, X509, Borrowed> = StackMut(
+        StackRef(unsafe { CBorrowedPtr::new(NonNull::new(raw.cast()).unwrap()) }),
+        PhantomData,
+    );
     m.set_num(7);
-    // Getters reach through `Deref` to the shared handle.
-    assert_eq!(m.num(), 7);
+    // Getters reach the shared handle through `as_ref`, bound to the borrow.
+    assert_eq!(m.as_ref().num(), 7);
 
     // `zeroed` builds a value for inline storage; the pointer to it comes from
     // `addr_of_mut!`, never `&mut`.
@@ -192,7 +201,7 @@ fn owning_handles_hand_out_handles_not_references() {
         a: 1,
         p: core::ptr::null_mut(),
     }));
-    let mut b = unsafe { CBox::<FooFull>::from_raw(raw) }.unwrap();
+    let mut b = unsafe { FooFullOwned::from_c(raw) }.unwrap();
 
     // `as_ref` / `as_mut` replace `Deref`: the handle carries the lifetime,
     // which `Deref::Target` could not name.
@@ -206,78 +215,80 @@ fn owning_handles_hand_out_handles_not_references() {
 }
 
 // ---------------------------------------------------------------------------
-// CBoxWith<T, D> — the fat owner, and now the construction-phase handle too
+// CBox<T, D> with a stateful policy, and the construction-phase handle
 // ---------------------------------------------------------------------------
 
 static POP_FREE_CALLS: AtomicUsize = AtomicUsize::new(0);
-static ELEM_FN_SEEN: AtomicUsize = AtomicUsize::new(0);
+static ELEM_FREE_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-extern "C" fn x509_free_mock(_p: *mut core::ffi::c_void) {}
+extern "C" fn x509_free_mock(_p: *mut core::ffi::c_void) {
+    ELEM_FREE_CALLS.fetch_add(1, Ordering::SeqCst);
+}
 
-/// The dropper IS the runtime state: the caller-supplied element-free fn.
+/// The policy IS the runtime state: the caller-supplied element-free fn.
 #[derive(Clone, Copy)]
 pub struct ElemFree(unsafe extern "C" fn(*mut core::ffi::c_void));
 
-// SAFETY: stand-in for `OPENSSL_sk_pop_free(ptr, self.0)` — records the call and
-// the fn it carried, then reclaims the Box-backed mock allocation exactly once.
-unsafe impl CDropper<Stack<X509, Borrowed>> for ElemFree {
+// SAFETY: stand-in for `OPENSSL_sk_pop_free(ptr, self.0)` — calls the fn it
+// carried once, as for a one-element stack, then reclaims the Box-backed mock
+// allocation exactly once.
+unsafe impl CDrop<Stack<X509, Borrowed>> for ElemFree {
     unsafe fn c_drop(&self, ptr: NonNull<Stack<X509, Borrowed>>) {
         POP_FREE_CALLS.fetch_add(1, Ordering::SeqCst);
-        ELEM_FN_SEEN.store(self.0 as usize, Ordering::SeqCst);
+        // SAFETY: the carried element free accepts any element pointer.
+        unsafe { (self.0)(core::ptr::null_mut()) };
         drop(unsafe { Box::from_raw(ptr.as_ptr().cast::<stack_st>()) });
     }
 }
 
+// A hand-written, stateful policy: no `Default`, so the box is built with
+// `from_c_with`, which takes the policy value.
+pub type StackOwned = CBox<Stack<X509, Borrowed>, ElemFree>;
+
 #[test]
-fn cboxwith_runs_dropper_with_runtime_state() {
+fn stateful_policy_runs_with_runtime_state() {
     POP_FREE_CALLS.store(0, Ordering::SeqCst);
-    ELEM_FN_SEEN.store(0, Ordering::SeqCst);
+    ELEM_FREE_CALLS.store(0, Ordering::SeqCst);
 
     let raw = Box::into_raw(Box::new(stack_st {
         num: 0,
         data: core::ptr::null_mut(),
     }));
     // The free fn is fixed HERE, at the seam — the whole point of the fat owner.
-    let owned = unsafe {
-        CBoxWith::<Stack<X509, Borrowed>, ElemFree>::from_raw(raw, ElemFree(x509_free_mock))
-    }
-    .unwrap();
+    let owned = unsafe { StackOwned::from_c_with(raw, ElemFree(x509_free_mock)) }.unwrap();
+    assert_eq!(owned.as_ref().num(), 0);
     drop(owned);
 
     assert_eq!(POP_FREE_CALLS.load(Ordering::SeqCst), 1);
-    let expected: unsafe extern "C" fn(*mut core::ffi::c_void) = x509_free_mock;
+    // Observed by its call, not its address: two pointers to one fn need not
+    // compare equal (and under Miri they do not).
     assert_eq!(
-        ELEM_FN_SEEN.load(Ordering::SeqCst),
-        expected as usize,
-        "the dropper must carry the runtime free fn into teardown",
+        ELEM_FREE_CALLS.load(Ordering::SeqCst),
+        1,
+        "the policy must carry the runtime free fn into teardown",
     );
 }
 
 // The construction phase `CBoxUninit` used to model: hold the allocation under
-// a storage-only dropper while filling it, then promote. One-way, and a type
+// a storage-only policy while filling it, then promote. One-way, and a type
 // change, so a half-built object cannot reach code expecting a formed one.
 static STORAGE_FREES: AtomicUsize = AtomicUsize::new(0);
-static FULL_FREES: AtomicUsize = AtomicUsize::new(0);
+// Serialises the tests that reset and read `STORAGE_FREES` / `FULL_FREES`.
+static CONSTRUCTION_LOCK: Mutex<()> = Mutex::new(());
 
 pub struct StorageFree;
 // SAFETY: reclaims exactly the raw allocation, touching no field — the
 // construction-phase contract.
-unsafe impl CDropper<FooFull> for StorageFree {
+unsafe impl CDrop<FooFull> for StorageFree {
     unsafe fn c_drop(&self, ptr: NonNull<FooFull>) {
         STORAGE_FREES.fetch_add(1, Ordering::SeqCst);
         drop(unsafe { Box::from_raw(ptr.as_ptr().cast::<foo_st>()) });
     }
 }
-// SAFETY: the full destructor, run once the object is formed.
-unsafe impl CDropped for FooFull {
-    unsafe fn c_drop(obj: NonNull<Self>) {
-        FULL_FREES.fetch_add(1, Ordering::SeqCst);
-        drop(unsafe { Box::from_raw(obj.as_ptr().cast::<foo_st>()) });
-    }
-}
 
 #[test]
 fn construction_phase_promotes_with_exactly_one_teardown() {
+    let _guard = CONSTRUCTION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     STORAGE_FREES.store(0, Ordering::SeqCst);
     FULL_FREES.store(0, Ordering::SeqCst);
 
@@ -285,11 +296,11 @@ fn construction_phase_promotes_with_exactly_one_teardown() {
         a: 0,
         p: core::ptr::null_mut(),
     }));
-    let mut slot = unsafe { CBoxWith::<FooFull, StorageFree>::from_raw(raw, StorageFree) }.unwrap();
+    let mut slot = unsafe { CBox::<FooFull, StorageFree>::from_c_with(raw, StorageFree) }.unwrap();
     unsafe { addr_of_mut!((*slot.as_mut().as_mut_ptr()).a).write(42) };
 
-    // Promote: the storage dropper is forgotten, `FooFull::c_drop` takes over.
-    let formed: CBox<FooFull> = unsafe { slot.into_box() };
+    // Promote: the storage policy is swapped out, `FooFullFree` takes over.
+    let (formed, StorageFree): (FooFullOwned, _) = unsafe { slot.with_policy(FooFullFree) };
     assert_eq!(
         unsafe { addr_of!((*formed.as_ref().as_ptr()).a).read() },
         42
@@ -307,6 +318,7 @@ fn construction_phase_promotes_with_exactly_one_teardown() {
 
 #[test]
 fn construction_phase_bails_with_storage_only_teardown() {
+    let _guard = CONSTRUCTION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     STORAGE_FREES.store(0, Ordering::SeqCst);
     FULL_FREES.store(0, Ordering::SeqCst);
 
@@ -315,7 +327,7 @@ fn construction_phase_bails_with_storage_only_teardown() {
         p: core::ptr::null_mut(),
     }));
     {
-        let _slot = unsafe { CBoxWith::<FooFull, StorageFree>::from_raw(raw, StorageFree) };
+        let _slot = unsafe { CBox::<FooFull, StorageFree>::from_c_with(raw, StorageFree) };
         // dropped without promoting — the construction-failure path
     }
     assert_eq!(STORAGE_FREES.load(Ordering::SeqCst), 1);
@@ -327,15 +339,19 @@ fn construction_phase_bails_with_storage_only_teardown() {
 }
 
 #[test]
-fn cboxwith_layout_thin_vs_fat() {
-    // A ZST dropper keeps the fat owner pointer-sized, with the niche.
+fn owned_ptr_layout_thin_vs_fat() {
+    // A ZST policy keeps the owner pointer-sized, with the niche.
     assert_eq!(
-        size_of::<CBoxWith<FooFull, StorageFree>>(),
+        size_of::<CBox<FooFull, StorageFree>>(),
+        size_of::<*mut foo_st>()
+    );
+    assert_eq!(
+        size_of::<Option<CBox<FooFull, StorageFree>>>(),
         size_of::<*mut foo_st>()
     );
     // With real state it is genuinely ptr + inline state (here a fn pointer).
     assert_eq!(
-        size_of::<CBoxWith<Stack<X509, Borrowed>, ElemFree>>(),
+        size_of::<CBox<Stack<X509, Borrowed>, ElemFree>>(),
         size_of::<*mut stack_st>() + size_of::<ElemFree>(),
     );
 }
