@@ -11,7 +11,7 @@
 //! |-------|-----------|--------|
 //! | [`CDrop<T>`] | `c_drop` — a `*_free`, or a refcount down-ref | [`CBox`], [`CStrBox`], [`CArc`] |
 //! | [`CDupClone<T>`] | `c_dup` — a deep copy (`*_dup`, `strdup`) | their `Clone` |
-//! | [`CRefClone<T>`] | `c_up_ref` — a refcount increment; `c_is_sole_owner` | [`CArc`], [`CGuardedArc`] |
+//! | [`CRefClone<T>`] | `c_up_ref` — a refcount increment; `c_is_sole_owner` | [`CArc`] |
 //! | [`CLenDrop`] | `c_drop_len(ptr, byte_len)` | [`CVec`] |
 //! | [`CLenClone`] | `c_clone_len` — a buffer memdup | its `Clone` |
 //! | [`CDispose<T>`] | `c_dispose` — `*_uninit` / `*_clear` on a value | [`CVal`] |
@@ -19,9 +19,9 @@
 //! Every method takes `&self`, so a policy may carry runtime state (the
 //! element-free function of `OPENSSL_sk_pop_free`). A ZST policy costs nothing.
 //!
-//! [`CGuarded`] is the exception: the object's own lock, implemented on the
-//! layout type, which [`CGuardedArc`] and [`CGuardedRef`] take around every
-//! access.
+//! [`CGuarded`] is the exception: the C lock protecting the object,
+//! implemented on the layout type, which [`CArc::lock`] and
+//! [`CGuardedRef::lock`] take to hand out a [`CGuard`].
 
 use core::ptr::NonNull;
 
@@ -30,7 +30,7 @@ use core::ptr::NonNull;
 #[allow(unused_imports)]
 use crate::refs::{CBox, CSlice, CStrBox, CVal, CVec};
 #[allow(unused_imports)]
-use crate::shared::{CArc, CGuardedArc, CGuardedRef};
+use crate::shared::{CArc, CGuard, CGuardedRef};
 
 // ===========================================================================
 // Pointer teardown / duplication policies
@@ -112,7 +112,7 @@ pub unsafe trait CDupClone<T>: CDrop<T> {
 }
 
 /// Refcount increment, paired with the down-ref this policy's [`CDrop`]
-/// performs; the bound [`CArc`] and [`CGuardedArc`] clone on.
+/// performs; the bound [`CArc`] clones on.
 /// [`CBox`] never clones through this trait.
 ///
 /// [`c_is_sole_owner`](Self::c_is_sole_owner) lets an arc hand out exclusive
@@ -152,63 +152,117 @@ pub unsafe trait CRefClone<T>: CDrop<T> {
     }
 }
 
-/// The C object's own reader/writer lock, registered on the layout type; the
-/// bound the guards of [`CGuardedArc`] and [`CGuardedRef`] lock through.
+/// The C lock that protects part or all of an object, registered on the
+/// layout type: what [`CArc::lock`] and [`CGuardedRef::lock`] take, handing
+/// out a [`CGuard`] that unlocks on drop.
+///
+/// A C object usually locks only the state it mutates after it is shared — a
+/// cache, a list of backends — while the rest is fixed once set up. The three
+/// handles split along that line:
+///
+/// | Handle | Reached through | Touches |
+/// |--------|-----------------|---------|
+/// | [`Ref`](CCell::Ref) | [`CArc::as_ref`], unconditionally | state nobody writes once the object is shared, and C routines that take this lock themselves |
+/// | [`Locked`](Self::Locked) | [`CGuard::as_locked`], under the lock | the state this lock protects — reads as well as writes — and C routines that require the caller to hold it |
+/// | [`Mut`](CCell::Mut) | [`CArc::get_mut`], when the reference is provably sole | anything; no other reference exists |
+///
+/// A getter for lock-protected state therefore lives on `Locked`, never on
+/// `Ref`: a `Ref` read races with a writer holding the lock through another
+/// clone. Where one lock covers the whole object, [`CGuardedAll`] makes
+/// `Locked` the `Mut` handle.
 ///
 /// The functions take the object's pointer rather than `&self`, because a
-/// `&Foo` would be a reference covering the C object. An object with only a
-/// mutex implements the exclusive pair; the read pair defaults to it.
-/// [`impl_cguarded!`](crate::impl_cguarded) binds C routines.
+/// `&Foo` would be a reference covering the C object.
+/// [`impl_cguarded!`](crate::impl_cguarded) binds C routines and defines the
+/// `Locked` handle.
 ///
 /// # Safety
 ///
-/// - Every C routine that touches the object's mutable state takes this lock,
-///   so holding it excludes C as well as Rust.
-/// - `c_lock` returns `true` only once no other guard — read or write, on any
-///   thread *including this one* — is held, and blocks until then (or returns
-///   `false`, as for `pthread_rwlock_*`'s `EDEADLK`); a lock that is reentrant
-///   for the exclusive side would hand out two `Mut` handles.
-/// - `c_read_lock` returns `true` only once no write guard is held, on any
-///   thread including this one.
+/// - Every C routine that touches the protected state either takes this lock
+///   or requires its caller to hold it, so holding it excludes C as well as
+///   Rust.
+/// - `c_lock` returns `true` only once no other holder — on any thread,
+///   *including this one* — has the lock, and blocks until then (or returns
+///   `false`, as for `pthread_mutex_*`'s `EDEADLK`). A recursive lock would
+///   hand out two `Locked` handles on one thread.
 /// - `false` means the C lock call failed and nothing is held.
-/// - Each unlock is called once, on the thread that took the matching lock.
+/// - `c_unlock` is called once per successful `c_lock`, on the same thread.
+/// - [`Locked<'a>`](Self::Locked) is `#[repr(transparent)]` over
+///   [`CBorrowedPtr<'a, Self>`](crate::CBorrowedPtr) (pointer-sized; checked
+///   at compile time), has no `Drop`, and is invariant in `Self`, as `Mut` is.
+/// - `Self` is invariant in every parameter the protected state can hold, as
+///   a Rust type with a `Mutex` field is. A [`CArc`] is covariant like `Arc`,
+///   so a clone of a `CArc<Foo<'static>>` could otherwise shrink to
+///   `Foo<'short>` and store a `'short` borrow through its locked handle for
+///   the `'static` original to read. A type with no parameters, as
+///   [`define_ctype!`](crate::define_ctype) generates, meets this trivially.
+/// - A [`CDupClone`] policy for `Self` takes this lock itself around the
+///   protected state it copies: [`CArc::make_mut`] copies through a shared
+///   reference while other clones may hold the lock.
 pub unsafe trait CGuarded: CCell {
-    /// Take the exclusive lock. `false` if the C call failed.
+    /// The handle a held lock grants: exclusive over the state the lock
+    /// protects, move-only like [`Mut`](CCell::Mut).
+    type Locked<'a>
+    where
+        Self: 'a;
+
+    /// What the lock covers: [`LockFields`], part of the object, reached
+    /// through [`CArc::lock`]; or [`LockWhole`], all of it, which only a
+    /// [`CGuardedAll`] type declares and only a [`CGuardedRef`] reaches — a
+    /// `CArc` also hands out an unlocked [`Ref`](CCell::Ref), so `CArc::lock`
+    /// does not accept it.
+    type Scope: LockScope;
+
+    /// Take the lock. `false` if the C call failed.
     ///
     /// # Safety
     ///
     /// `ptr` must address a live `Self`.
     unsafe fn c_lock(ptr: NonNull<Self>) -> bool;
 
-    /// Release the exclusive lock.
+    /// Release the lock.
     ///
     /// # Safety
     ///
-    /// The calling thread must hold the exclusive lock on `ptr`.
+    /// The calling thread must hold the lock on `ptr`.
     unsafe fn c_unlock(ptr: NonNull<Self>);
+}
 
-    /// Take a shared lock. Defaults to the exclusive one.
-    ///
-    /// # Safety
-    ///
-    /// As [`c_lock`](Self::c_lock).
-    #[inline]
-    unsafe fn c_read_lock(ptr: NonNull<Self>) -> bool {
-        // SAFETY: the caller upholds `c_lock`'s contract.
-        unsafe { Self::c_lock(ptr) }
-    }
+/// A [`CGuarded`] lock that covers the whole object — `Mutex<T>` rather than a
+/// lock over some fields. Its [`Locked`](CGuarded::Locked) handle is the
+/// [`Mut`](CCell::Mut) handle, so a held [`CGuard`] reaches every getter and
+/// setter; the object is reached only through a [`CGuardedRef`], typically a C
+/// global under its C lock.
+///
+/// [`impl_cguarded!`](crate::impl_cguarded)`(Foo, all, …)` implements both
+/// traits.
+///
+/// # Safety
+///
+/// - Nothing reaches the object's state without this lock — not C, and not a
+///   Rust handle built from the raw pointer.
+/// - `Self::Locked<'a>` is `Self::Mut<'a>`.
+pub unsafe trait CGuardedAll: CGuarded<Scope = LockWhole> {}
 
-    /// Release a shared lock. Defaults to the exclusive one.
-    ///
-    /// # Safety
-    ///
-    /// The calling thread must hold a shared lock on `ptr` taken with
-    /// [`c_read_lock`](Self::c_read_lock).
-    #[inline]
-    unsafe fn c_read_unlock(ptr: NonNull<Self>) {
-        // SAFETY: the caller upholds the contract.
-        unsafe { Self::c_unlock(ptr) }
-    }
+/// [`CGuarded::Scope`] of a lock over part of the object — a cache, a list —
+/// reached through [`CArc::lock`].
+#[derive(Debug)]
+pub enum LockFields {}
+
+/// [`CGuarded::Scope`] of a lock over the whole object ([`CGuardedAll`]),
+/// reached through [`CGuardedRef::lock`].
+#[derive(Debug)]
+pub enum LockWhole {}
+
+/// The two [`CGuarded::Scope`]s, [`LockFields`] and [`LockWhole`]. Sealed.
+pub trait LockScope: sealed::Sealed {}
+impl LockScope for LockFields {}
+impl LockScope for LockWhole {}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::LockFields {}
+    impl Sealed for super::LockWhole {}
 }
 
 /// In-place disposal of a value Rust holds inline; the bound [`CVal<T, D>`]
@@ -242,28 +296,40 @@ pub unsafe trait CDispose<T> {
 // Buffer elements
 // ===========================================================================
 
-/// Element types a [`CVec`] may materialise as a slice: a plain Rust value,
-/// every bit pattern of which is valid.
+/// Plain-data elements: values with no C-side identity, every bit pattern of
+/// which is a valid `Self`. The bound on the two element paths that bypass
+/// handles.
 ///
-/// [`CVec::as_slice`] hands out `&[Self]`, which asserts well-formedness for
-/// all `count` elements at once. This marker carries that claim, checked once
-/// at the type rather than at each view.
+/// It does two jobs:
+///
+/// - **It admits a real slice.** [`CVec::as_slice`] / `as_mut_slice` hand out
+///   `&[Self]` / `&mut [Self]`. A wrapped C type is a C *object*, whose bytes C
+///   may change behind a reference, so it implements [`CCell`] and not this:
+///   `&[Foo]` does not typecheck, and a buffer of those is reached through
+///   [`CVec::as_handles`] instead. Rust has no negative bounds, so this
+///   allowlist is what keeps C objects out of slices.
+/// - **It makes reads of memory C writes sound.** [`CSlice::elem`] and its
+///   siblings copy values out of runs inside C objects, which C may overwrite
+///   at any time. A constructor's one-time promise cannot cover what C writes
+///   later; this trait does, because whatever bits C stores are a valid
+///   `Self`.
 ///
 /// | Category | Why it holds |
 /// |---|---|
 /// | integers, floats, raw pointers | no invalid bit patterns |
-/// | [`MaybeUninit<T>`](core::mem::MaybeUninit) | valid for any bits — the escape hatch for a buffer C has not filled |
+/// | [`MaybeUninit<T>`](core::mem::MaybeUninit) | valid even uninitialized — the type for a buffer C has not filled |
 /// | arrays of the above, `()` | element-wise |
 ///
-/// **A wrapped C type is not one.** A layout newtype from
-/// [`define_ctype!`](crate::define_ctype) implements [`CCell`],
-/// not this, so `&[Foo]` — which would be a reference covering C objects — does
-/// not typecheck. Iterate a buffer of those with
-/// [`CVec::as_handles`] instead.
-///
-/// `bool` and `char` are also excluded: C's `_Bool` may hold a byte outside
+/// `bool` and `char` are excluded: C's `_Bool` may hold a byte outside
 /// `{0, 1}` and a `char` outside the Unicode scalar range, both invalid Rust
 /// values. Use the integer type and convert.
+///
+/// **Any bit pattern is not the same as initialized.** Uninitialized memory is
+/// no bit pattern at all, so it is not a valid `u8` either: a buffer from a
+/// non-zeroing allocator is a `CVec<MaybeUninit<T>, _>` until it is filled,
+/// then [`CVec::assume_init`] turns it into a `CVec<T, _>`. A zeroing
+/// allocator may produce `T` directly, since all-zero is one of the bit
+/// patterns every `CPlainElem` accepts.
 ///
 /// # Safety
 ///
@@ -325,13 +391,6 @@ unsafe impl CPlainElem for () {}
 ///             libc::free(ptr.cast());
 ///         }
 ///     }
-/// **Any bit pattern is not the same as initialized.** Uninitialized memory is
-/// no bit pattern at all, so it is not a valid `u8` either: a buffer from a
-/// non-zeroing allocator is a `CVec<MaybeUninit<T>, _>` until it is filled,
-/// then [`CVec::assume_init`] turns it into a `CVec<T, _>`. A zeroing
-/// allocator may produce `T` directly, since all-zero is one of the bit
-/// patterns every `CPlainElem` accepts.
-///
 /// }
 /// ```
 pub unsafe trait CLenDrop {

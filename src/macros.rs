@@ -15,7 +15,7 @@
 //! | [`impl_clendrop!`](crate::impl_clendrop) | [`CLenDrop`](crate::CLenDrop) | a buffer free, given the byte length |
 //! | [`impl_clenclone!`](crate::impl_clenclone) | [`CLenClone`](crate::CLenClone) | a buffer memdup |
 //! | [`impl_cdispose!`](crate::impl_cdispose) | [`CDispose<T>`](crate::CDispose) | a `*_uninit` / `*_clear` |
-//! | [`impl_cguarded!`](crate::impl_cguarded) | [`CGuarded`](crate::CGuarded), on the layout type | the object's lock / unlock |
+//! | [`impl_cguarded!`](crate::impl_cguarded) | [`CGuarded`](crate::CGuarded) (and the `FooLocked` handle), on the layout type | the C lock / unlock |
 
 /// Define a wrapped `*-sys` type: the layout newtype plus its two borrowed
 /// handles, and the [`CCell`](crate::CCell) impl linking them.
@@ -587,31 +587,63 @@ macro_rules! __ffibox_check_ret {
     };
 }
 
+/// The shared handle of the object at `p`, for the `Locked` handles
+/// [`impl_cguarded!`](crate::impl_cguarded) generates in another crate.
+///
+/// # Safety
+///
+/// As a `Ref` handle: `p` is live for `'a` and its reads do not race.
+#[doc(hidden)]
+#[inline(always)]
+pub unsafe fn __handle_ref<'a, T: crate::CCell + 'a>(p: ::core::ptr::NonNull<T>) -> T::Ref<'a> {
+    // SAFETY: the caller upholds `handle_ref`'s contract.
+    unsafe { crate::refs::handle_ref(p) }
+}
+
 /// Implement [`CGuarded`](crate::CGuarded) on a layout type, binding the C
-/// object's lock routines, each called with a `*mut <T as CCell>::C`. The
-/// read pair is optional and defaults to the exclusive one.
+/// lock routines, each called with a `*mut <T as CCell>::C`.
+///
+/// The common form names the [`Locked`](crate::CGuarded::Locked) handle to
+/// generate, `FooLocked<'a>`: the handle a held [`CGuard`](crate::CGuard)
+/// grants, where the getters and setters for the lock-protected state go.
 ///
 /// ```ignore
-/// impl_cguarded!(Store, lock = ffi::store_write_lock, unlock = ffi::store_unlock);
+/// define_ctype!(Odb, OdbRef, OdbMut, ffi::odb_st);
+/// impl_cguarded!(Odb, OdbLocked, lock = ffi::odb_lock, unlock = ffi::odb_unlock);
+///
+/// impl OdbRef<'_> { /* fixed state; routines that lock internally */ }
+/// impl OdbLocked<'_> { /* the state `odb_lock` protects */ }
 ///
 /// // Lock routines that report failure: `ok` maps a lock's return to success.
 /// impl_cguarded!(
 ///     Store,
-///     lock = ffi::CRYPTO_THREAD_write_lock,
-///     unlock = ffi::CRYPTO_THREAD_unlock,
-///     read_lock = ffi::CRYPTO_THREAD_read_lock,
-///     read_unlock = ffi::CRYPTO_THREAD_unlock,
+///     StoreLocked,
+///     lock = ffi::X509_STORE_lock,
+///     unlock = ffi::X509_STORE_unlock,
 ///     ok = |r| r == 1,
 /// );
 /// ```
 ///
-/// Without `ok`, `lock` and `read_lock` must return `()`. A status the macro
-/// discarded would be a failed lock reported as held — and a lock backed by
-/// `pthread_rwlock_*` *does* fail where it matters, with `EDEADLK` when the
+/// `FooLocked` is move-only and reaches the getters with `as_ref()`;
+/// `as_locked()` reborrows it, and a crate-private `as_mut_ptr()` gives the
+/// pointer for C calls that require the lock held.
+///
+/// With `all` in place of the handle name, the lock covers the whole object:
+/// the macro also implements [`CGuardedAll`](crate::CGuardedAll), and the
+/// locked handle is the `Mut` handle. Such an object is reached through a
+/// [`CGuardedRef`](crate::CGuardedRef).
+///
+/// ```ignore
+/// impl_cguarded!(Registry, all, lock = registry_lock, unlock = registry_unlock, ok = |r| r == 0);
+/// ```
+///
+/// Without `ok`, `lock` must return `()`. A status the macro discarded would
+/// be a failed lock reported as held — and a lock backed by
+/// `pthread_mutex_*` *does* fail where it matters, with `EDEADLK` when the
 /// thread already holds it, so a discarded status would hand out a second
-/// exclusive handle instead of deadlocking. With `ok`, a rejected return makes
-/// [`read`](crate::CGuardedArc::read) / [`write`](crate::CGuardedArc::write)
-/// panic. The unlock routines' return values, if any, are discarded: a failed
+/// locked handle instead of deadlocking. With `ok`, a rejected return makes
+/// [`CArc::lock`](crate::CArc::lock) / [`CGuardedRef::lock`](crate::CGuardedRef::lock)
+/// panic. The unlock routine's return value, if any, is discarded: a failed
 /// unlock leaves the object locked, which can deadlock but never aliases.
 ///
 /// ```compile_fail,E0277
@@ -619,32 +651,84 @@ macro_rules! __ffibox_check_ret {
 /// # unsafe fn obj_lock(_: *mut obj_st) -> i32 { 0 }
 /// # unsafe fn obj_unlock(_: *mut obj_st) -> i32 { 0 }
 /// ffibox::define_ctype!(Obj, ObjRef, ObjMut, obj_st);
-/// ffibox::impl_cguarded!(Obj, lock = obj_lock, unlock = obj_unlock); // needs `ok = …`
+/// ffibox::impl_cguarded!(Obj, ObjLocked, lock = obj_lock, unlock = obj_unlock); // needs `ok = …`
 /// ```
 ///
 /// # Safety
 ///
 /// The macro is safe to invoke but emits an `unsafe impl`. You assert
 /// [`CGuarded`](crate::CGuarded)'s contract: every C routine touching the
-/// object's mutable state takes this lock, and a lock call that passes the
-/// return check (or returns `()`) holds the lock — so a same-thread relock of
-/// the exclusive side must block or be rejected, never succeed.
+/// protected state takes this lock or requires it held, and a lock call that
+/// passes the return check (or returns `()`) holds the lock — so a
+/// same-thread relock must block or be rejected, never succeed. With `all`,
+/// you also assert [`CGuardedAll`](crate::CGuardedAll)'s: nothing reaches the
+/// object's state without the lock.
 #[macro_export]
 macro_rules! impl_cguarded {
     (
-        $t:ty, lock = $lock:path, unlock = $unlock:path
-        $(, read_lock = $rlock:path, read_unlock = $runlock:path)?
+        $t:ty, all, lock = $lock:path, unlock = $unlock:path
         $(, ok = $ok:expr)? $(,)?
     ) => {
         $crate::impl_cguarded!(
-            @impl $t, $lock, $unlock, [$($rlock, $runlock)?], [$($ok)?]
+            @impl $t, [<$t as $crate::CCell>::Mut<'a>], LockWhole, $lock, $unlock, [$($ok)?]
         );
+        // SAFETY: the invoker asserts `CGuardedAll`'s contract; `Locked` is
+        // `Mut` and `Scope` is `LockWhole` above.
+        unsafe impl $crate::CGuardedAll for $t {}
     };
-    // `$check` is one bracketed token tree, so it can be used inside the
-    // read pair's repetition, which a separately repeating `$ok` could not.
-    (@impl $t:ty, $lock:path, $unlock:path, [$($rlock:path, $runlock:path)?], $check:tt) => {
-        // SAFETY: the invoker asserts `CGuarded`'s contract for these routines.
+    (
+        $t:ty, $lk:ident, lock = $lock:path, unlock = $unlock:path
+        $(, ok = $ok:expr)? $(,)?
+    ) => {
+        #[doc = concat!("Exclusive borrow of a [`", stringify!($t), "`] under its lock, from a held [`CGuard`](", stringify!($crate), "::CGuard). The state the lock protects is reached here.")]
+        #[repr(transparent)]
+        pub struct $lk<'a>(
+            $crate::CBorrowedPtr<'a, $t>,
+            // Invariant in the pointee, as `&'a mut` is; see `CGuarded`'s contract.
+            ::core::marker::PhantomData<&'a mut $t>,
+        );
+
+        impl<'a> $lk<'a> {
+            /// Writable pointer to the C object, for FFI calls that require
+            /// the lock held and for field access through `addr_of_mut!`.
+            #[inline]
+            #[must_use]
+            #[allow(dead_code)]
+            pub(crate) fn as_mut_ptr(&mut self) -> *mut <$t as $crate::CCell>::C {
+                self.0.as_non_null().as_ptr().cast()
+            }
+
+            /// Reborrow shared, for the getters that need no lock.
+            #[inline]
+            #[must_use]
+            pub fn as_ref(&self) -> <$t as $crate::CCell>::Ref<'_> {
+                // SAFETY: the handle keeps the object live for the borrow,
+                // and the held lock keeps writers out while it reads.
+                unsafe { $crate::macros::__handle_ref(self.0.as_non_null()) }
+            }
+
+            /// Reborrow exclusively, for passing to a function that takes the
+            /// handle by value while keeping this one. This handle is frozen
+            /// while the result lives.
+            #[inline]
+            #[must_use]
+            pub fn as_locked(&mut self) -> $lk<'_> {
+                $lk(self.0, ::core::marker::PhantomData)
+            }
+        }
+
+        $crate::impl_cguarded!(@impl $t, [$lk<'a>], LockFields, $lock, $unlock, [$($ok)?]);
+    };
+    // `$check` is one bracketed token tree, matched by the helper whatever
+    // `ok` was given or omitted.
+    (@impl $t:ty, [$($locked:tt)*], $scope:ident, $lock:path, $unlock:path, $check:tt) => {
+        // SAFETY: the invoker asserts `CGuarded`'s contract for these
+        // routines; the `Locked` handle is transparent over `CBorrowedPtr`
+        // and invariant, as generated above or as the `Mut` handle is.
         unsafe impl $crate::CGuarded for $t {
+            type Locked<'a> = $($locked)* where Self: 'a;
+            type Scope = $crate::$scope;
+
             #[inline]
             #[allow(unused_unsafe)]
             unsafe fn c_lock(ptr: ::core::ptr::NonNull<Self>) -> bool {
@@ -660,23 +744,6 @@ macro_rules! impl_cguarded {
                 // SAFETY: the caller holds the lock.
                 let _ = unsafe { $unlock(raw) };
             }
-            $(
-                #[inline]
-                #[allow(unused_unsafe)]
-                unsafe fn c_read_lock(ptr: ::core::ptr::NonNull<Self>) -> bool {
-                    let raw: *mut <$t as $crate::CCell>::C = ptr.as_ptr().cast();
-                    // SAFETY: the caller upholds `c_read_lock`'s contract.
-                    let ret = unsafe { $rlock(raw) };
-                    $crate::__ffibox_check_ret!(ret $check)
-                }
-                #[inline]
-                #[allow(unused_unsafe)]
-                unsafe fn c_read_unlock(ptr: ::core::ptr::NonNull<Self>) {
-                    let raw: *mut <$t as $crate::CCell>::C = ptr.as_ptr().cast();
-                    // SAFETY: the caller holds a read lock.
-                    let _ = unsafe { $runlock(raw) };
-                }
-            )?
         }
     };
 }
