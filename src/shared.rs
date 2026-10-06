@@ -96,6 +96,21 @@ use crate::traits::{CCell, CDrop, CDupClone, CGuarded, CGuardedAll, CRefClone, L
 /// counted reference C handed over, with no up_ref to call) is a `CArc`
 /// without `Clone`, never a [`CBox`].
 ///
+/// `T` is a [`CCell`] layout type, as for [`CBox`]: every method requires it,
+/// so no erased `CArc<c_void, _>` can be formed. An erased payload with a
+/// Rust-chosen type wants its own typed owner over the C refcount instead.
+///
+/// ```compile_fail,E0599
+/// struct VoidUnref;
+/// // SAFETY: never called; the arc below must not type-check.
+/// unsafe impl ffibox::CDrop<core::ffi::c_void> for VoidUnref {
+///     unsafe fn c_drop(&self, _: core::ptr::NonNull<core::ffi::c_void>) {}
+/// }
+/// let _ = unsafe {
+///     ffibox::CArc::<core::ffi::c_void, VoidUnref>::from_raw_with(core::ptr::null_mut(), VoidUnref)
+/// };
+/// ```
+///
 /// `Send` / `Sync` on `Arc`'s terms: `T: Send + Sync`, plus the policy's.
 #[repr(C)]
 #[must_use = "dropping a CArc releases its reference"]
@@ -104,7 +119,7 @@ pub struct CArc<T, D: CDrop<T>> {
     policy: D,
 }
 
-impl<T, D: CDrop<T>> CArc<T, D> {
+impl<T: CCell, D: CDrop<T>> CArc<T, D> {
     /// Adopt one counted reference under `D::default()`; `None` if null.
     ///
     /// # Safety
@@ -161,7 +176,7 @@ impl<T, D: CDrop<T>> CArc<T, D> {
     }
 }
 
-impl<T, D: CDrop<T>> CArc<T, D> {
+impl<T: CCell, D: CDrop<T>> CArc<T, D> {
     /// Whether two arcs reference the same object, like
     /// [`Arc::ptr_eq`](https://doc.rust-lang.org/std/sync/struct.Arc.html#method.ptr_eq).
     #[inline]
@@ -306,7 +321,7 @@ impl<T: CGuarded<Scope = LockFields>, D: CDrop<T>> CArc<T, D> {
     }
 }
 
-impl<T, D: CRefClone<T>> CArc<T, D> {
+impl<T: CCell, D: CRefClone<T>> CArc<T, D> {
     /// Another reference through [`CRefClone::c_up_ref`]; `None` if it failed.
     #[inline]
     pub fn try_clone(&self) -> Option<Self>
@@ -339,7 +354,7 @@ impl<T: CCell, D: CRefClone<T>> CArc<T, D> {
     }
 }
 
-impl<T, D: CRefClone<T> + Clone> Clone for CArc<T, D> {
+impl<T: CCell, D: CRefClone<T> + Clone> Clone for CArc<T, D> {
     #[inline]
     fn clone(&self) -> Self {
         // Abort on a failed up_ref (an overflowing count), as `Arc` does.

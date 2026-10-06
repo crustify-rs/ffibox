@@ -16,14 +16,13 @@
 //!   the null niche, a stateful policy makes it fat, etc.)
 
 use core::cell::Cell;
-use core::ffi::c_void;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use ffibox::{
-    impl_cdrop, impl_cdrop_void, impl_cdupclone, impl_clendrop, impl_crefclone, CArc, CBorrowedPtr,
-    CBox, CCell, CDrop, CRefClone, CSlice, CSliceMut, CVec,
+    impl_cdrop, impl_cdupclone, impl_clendrop, impl_crefclone, CBorrowedPtr, CBox, CCell, CDrop,
+    CRefClone, CSlice, CSliceMut, CVec,
 };
 
 // ---------------------------------------------------------------------------
@@ -43,7 +42,6 @@ static REFCOUNTED_LOCK: Mutex<()> = Mutex::new(());
 static BOXED_LOCK: Mutex<()> = Mutex::new(());
 static DUPABLE_LOCK: Mutex<()> = Mutex::new(());
 static CVEC_LOCK: Mutex<()> = Mutex::new(());
-static CVOIDBOX_LOCK: Mutex<()> = Mutex::new(());
 static SHARED_LOCK: Mutex<()> = Mutex::new(());
 static BUILT_LOCK: Mutex<()> = Mutex::new(());
 
@@ -887,134 +885,6 @@ fn cvec_is_ptr_plus_usize() {
         core::mem::size_of::<CVec<u8, RecordingFree>>(),
         core::mem::size_of::<*mut u8>() + core::mem::size_of::<usize>(),
     );
-}
-
-// ---------------------------------------------------------------------------
-// `void *` payloads — `CArc<c_void>`
-// ---------------------------------------------------------------------------
-//
-// Unlike a typed owner, a `CArc<c_void>` keeps the pointee erased
-// throughout: only the policy is known. The bytes behind the `void *` are
-// never read as a Rust type — they are merely owned and freed. These tests use
-// a Rust-allocated blob standing in for a C allocation, freed through a
-// C-style free function bound by `impl_cdrop_void!`.
-
-static COWN_FREE_CALLS: AtomicUsize = AtomicUsize::new(0);
-static COWN_FREED_PTR: core::sync::atomic::AtomicPtr<c_void> =
-    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
-
-// The opaque allocation hiding behind the `void *`. The owned type never names
-// it; only the test's free routine does, to reclaim and drop it.
-#[repr(C)]
-struct ErasedBlob {
-    #[allow(dead_code)]
-    payload: u32,
-}
-
-/// A C-style destructor (`unsafe extern "C" fn(*mut c_void)`), mirroring a
-/// real free routine such as libgit2's `git__free`.
-///
-/// # Safety
-///
-/// `ptr` must be an `ErasedBlob` from `Box::into_raw`, owned by the caller.
-unsafe extern "C" fn test_blob_free(ptr: *mut c_void) {
-    COWN_FREE_CALLS.fetch_add(1, Ordering::SeqCst);
-    COWN_FREED_PTR.store(ptr, Ordering::SeqCst);
-    // SAFETY: caller upholds the contract; reclaim the Rust-allocated blob
-    // standing in for the C allocation.
-    drop(unsafe { Box::from_raw(ptr.cast::<ErasedBlob>()) });
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct TestBlobFree;
-impl_cdrop_void!(TestBlobFree, test_blob_free);
-/// An erased blob freed by `test_blob_free` (cf. a `git__free`d buffer).
-type OwnedBlob = CArc<c_void, TestBlobFree>;
-
-// Leak an `ErasedBlob` and hand its address out as an opaque `void *`.
-fn make_owned_blob(payload: u32) -> (OwnedBlob, *mut c_void) {
-    let raw = Box::into_raw(Box::new(ErasedBlob { payload })).cast::<c_void>();
-    // SAFETY: `raw` is a fresh, uniquely-owned allocation; `test_blob_free` is
-    // its correct destructor.
-    (unsafe { OwnedBlob::from_raw(raw) }.unwrap(), raw)
-}
-
-#[test]
-fn cown_drop_frees_once_via_policy() {
-    let _guard = lock(&CVOIDBOX_LOCK);
-    COWN_FREE_CALLS.store(0, Ordering::SeqCst);
-    COWN_FREED_PTR.store(core::ptr::null_mut(), Ordering::SeqCst);
-
-    let (own, raw) = make_owned_blob(0xABCD);
-    assert_eq!(COWN_FREE_CALLS.load(Ordering::SeqCst), 0);
-
-    drop(own);
-
-    assert_eq!(
-        COWN_FREE_CALLS.load(Ordering::SeqCst),
-        1,
-        "Drop must invoke the policy exactly once"
-    );
-    assert_eq!(
-        COWN_FREED_PTR.load(Ordering::SeqCst),
-        raw,
-        "the destructor must receive the original erased address (no header, no cast drift)"
-    );
-}
-
-#[test]
-fn cown_from_null_is_none() {
-    // SAFETY: null is the documented `None` case.
-    assert!(unsafe { OwnedBlob::from_raw(core::ptr::null_mut()) }.is_none());
-}
-
-#[test]
-fn cown_into_raw_then_from_raw_round_trips_without_freeing() {
-    let _guard = lock(&CVOIDBOX_LOCK);
-    COWN_FREE_CALLS.store(0, Ordering::SeqCst);
-
-    let (own, raw) = make_owned_blob(7);
-
-    // Surrender to a C `void *` slot — must NOT free.
-    let foreign = own.into_raw();
-    assert_eq!(foreign, raw, "into_raw yields the same erased address");
-    assert_eq!(
-        COWN_FREE_CALLS.load(Ordering::SeqCst),
-        0,
-        "into_raw must not run the destructor"
-    );
-
-    // Reclaim from the slot — the policy rides along in the type, so no extra
-    // data is threaded through C.
-    // SAFETY: `foreign` came from `into_raw` on an `OwnedBlob` and has not
-    // been consumed since.
-    let own = unsafe { OwnedBlob::from_raw(foreign) }.unwrap();
-    assert_eq!(COWN_FREE_CALLS.load(Ordering::SeqCst), 0);
-
-    drop(own);
-    assert_eq!(
-        COWN_FREE_CALLS.load(Ordering::SeqCst),
-        1,
-        "exactly one free after the full round-trip"
-    );
-}
-
-#[test]
-fn cown_is_pointer_sized_voidptr() {
-    // Frees a blob, which the counting tests above observe.
-    let _guard = lock(&CVOIDBOX_LOCK);
-    use core::mem::{align_of, size_of};
-
-    // A ZST policy keeps the layout of a raw `void *`, and `Option<OwnedBlob>`
-    // is the null-niche `void *`.
-    assert_eq!(size_of::<OwnedBlob>(), size_of::<*mut c_void>());
-    assert_eq!(align_of::<OwnedBlob>(), align_of::<*mut c_void>());
-    assert_eq!(size_of::<Option<OwnedBlob>>(), size_of::<*mut c_void>());
-
-    // as_ptr / into_raw alias the original allocation exactly.
-    let (own, raw) = make_owned_blob(1);
-    assert_eq!(own.as_ptr(), raw);
-    drop(own);
 }
 
 // The mocks play both wrapper and C type: each is its own `C`. The handles are the generic

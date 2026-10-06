@@ -11,7 +11,6 @@
 //! | [`impl_cdupclone!`](crate::impl_cdupclone) | [`CDupClone<T>`](crate::CDupClone) | a `*_dup` |
 //! | [`impl_crefclone!`](crate::impl_crefclone) | [`CRefClone<T>`](crate::CRefClone) | an `*_up_ref`, optionally a sole-owner check |
 //! | [`impl_cdrop_str!`](crate::impl_cdrop_str) / [`impl_cdupclone_str!`](crate::impl_cdupclone_str) | the same, for `c_char` | a string free / `strdup` |
-//! | [`impl_cdrop_void!`](crate::impl_cdrop_void) | `CDrop<c_void>` | an opaque payload's free |
 //! | [`impl_clendrop!`](crate::impl_clendrop) | [`CLenDrop`](crate::CLenDrop) | a buffer free, given the byte length |
 //! | [`impl_clenclone!`](crate::impl_clenclone) | [`CLenClone`](crate::CLenClone) | a buffer memdup |
 //! | [`impl_cdispose!`](crate::impl_cdispose) | [`CDispose<T>`](crate::CDispose) | a `*_uninit` / `*_clear` |
@@ -343,9 +342,8 @@ macro_rules! define_ctype {
 /// ffibox::impl_cdrop!(FooFree, Foo, bar_free); // expects *mut foo_st
 /// ```
 ///
-/// For `c_char` and `c_void` pointees, which
-/// are their own C type, use [`impl_cdrop_str!`](crate::impl_cdrop_str) and
-/// [`impl_cdrop_void!`](crate::impl_cdrop_void).
+/// For a `c_char` string, which is its own C type, use
+/// [`impl_cdrop_str!`](crate::impl_cdrop_str).
 ///
 /// A destructor of another shape is adapted by an `unsafe fn` passed by path:
 ///
@@ -406,25 +404,6 @@ macro_rules! impl_cdrop {
 macro_rules! impl_cdrop_str {
     ($policy:ty, $f:path) => {
         $crate::impl_cdrop!(@impl $policy, ::core::ffi::c_char, ::core::ffi::c_char, $f);
-    };
-}
-
-/// [`impl_cdrop!`](crate::impl_cdrop) for an opaque payload: implements
-/// [`CDrop<c_void>`](crate::CDrop), calling the routine with a `*mut c_void`.
-/// The policy for an erased shared owner, `CArc<c_void, _>`; a [`CBox`](crate::CBox)
-/// owns only [`CCell`](crate::CCell) types.
-///
-/// ```ignore
-/// impl_cdrop_void!(ArenaFree, ffi::arena_free);
-/// ```
-///
-/// # Safety
-///
-/// As [`impl_cdrop!`](crate::impl_cdrop).
-#[macro_export]
-macro_rules! impl_cdrop_void {
-    ($policy:ty, $f:path) => {
-        $crate::impl_cdrop!(@impl $policy, ::core::ffi::c_void, ::core::ffi::c_void, $f);
     };
 }
 

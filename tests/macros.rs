@@ -1,7 +1,7 @@
 //! Tests that exercise `define_ctype!` and the policy macros (`impl_cdrop!`,
 //! `impl_cdupclone!`, `impl_crefclone!`, `impl_clendrop!`, `impl_clenclone!`,
-//! `impl_cdispose!`, `impl_cdrop_void!`, and the `_str` variants), wiring them to mock
-//! C-like state and driving them through the owners: `CBox`, `CVoidBox`,
+//! `impl_cdispose!`, and the `_str` variants), wiring them to mock
+//! C-like state and driving them through the owners: `CBox`,
 //! `CStrBox`, `CVec`, `CVal` and the run views.
 //!
 //! `FooOwned` is a refcounted object's sole reference (`FOO_free` is a
@@ -21,14 +21,14 @@
 use core::cell::Cell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use core::ffi::{c_char, c_void, CStr};
+use core::ffi::{c_char, CStr};
 use core::ptr::NonNull;
 use std::ffi::CString;
 
 use ffibox::{
-    define_ctype, impl_cdispose, impl_cdrop, impl_cdrop_str, impl_cdrop_void, impl_cdupclone,
-    impl_cdupclone_str, impl_clenclone, impl_clendrop, impl_crefclone, CArc, CBox, CDrop,
-    CDupClone, CLenDrop, CRefClone, CSlice, CSliceMut, CStrBox, CVal, CVec,
+    define_ctype, impl_cdispose, impl_cdrop, impl_cdrop_str, impl_cdupclone, impl_cdupclone_str,
+    impl_clenclone, impl_clendrop, impl_crefclone, CBox, CDrop, CDupClone, CLenDrop, CRefClone,
+    CSlice, CSliceMut, CStrBox, CVal, CVec,
 };
 
 // ---------------------------------------------------------------------------
@@ -533,49 +533,6 @@ fn slot_pointer_destructor_form() {
     assert_eq!(BAR_SLOT_FREES.load(Ordering::SeqCst), 1);
 }
 
-// ---------------------------------------------------------------------------
-// CArc<c_void> — opaque shared `void *`, impl_cdrop_void!
-// ---------------------------------------------------------------------------
-
-static PAYLOAD_FREES: AtomicUsize = AtomicUsize::new(0);
-
-/// # Safety
-///
-/// `p` must be a live payload from `payload_new`.
-unsafe fn payload_free(p: *mut c_void) {
-    PAYLOAD_FREES.fetch_add(1, Ordering::SeqCst);
-    // SAFETY: caller guarantees `p` came from `payload_new`.
-    drop(unsafe { Box::from_raw(p.cast::<u32>()) });
-}
-
-fn payload_new(v: u32) -> *mut c_void {
-    Box::into_raw(Box::new(v)).cast()
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PayloadFree;
-impl_cdrop_void!(PayloadFree, payload_free);
-/// A type-erased payload under an erased shared owner.
-pub type Payload = CArc<c_void, PayloadFree>;
-
-#[test]
-fn void_payload_lifecycle() {
-    // SAFETY: a fresh, uniquely-owned payload.
-    let a = unsafe { Payload::from_raw(payload_new(11)) }.unwrap();
-    // SAFETY: a live `u32` payload; the wrapper may look, ffibox never does.
-    assert_eq!(unsafe { *a.as_ptr().cast::<u32>() }, 11);
-    // Nothing duplicates an opaque payload.
-    <Payload as AmbiguousIfClone<_>>::check();
-
-    assert_eq!(
-        core::mem::size_of::<Option<Payload>>(),
-        core::mem::size_of::<*mut c_void>()
-    );
-
-    drop(a);
-    assert_eq!(PAYLOAD_FREES.load(Ordering::SeqCst), 1);
-}
-
 /// Compiles only when `T` is NOT `Clone` (both impls would apply to a `Clone`
 /// type, making `_` ambiguous).
 trait AmbiguousIfClone<A> {
@@ -605,7 +562,6 @@ fn a_policy_without_cdupclone_yields_a_non_clone_owner() {
 static TAGGED_FREES: AtomicUsize = AtomicUsize::new(0);
 static TAGGED_DUP_FREES: AtomicUsize = AtomicUsize::new(0);
 static TAGGED_DUPS: AtomicUsize = AtomicUsize::new(0);
-static HAND_PAYLOAD_FREES: AtomicUsize = AtomicUsize::new(0);
 
 /// A stateful policy: carries the tag it stamps on teardown. Deliberately not
 /// `Default` (nor `Clone`), so its box is built with `from_c_with` /
@@ -647,20 +603,6 @@ unsafe impl CDupClone<Bar> for TaggedDup {
 pub type BarTagged = CBox<Bar, Tagged>;
 pub type BarTaggedDup = CBox<Bar, TaggedDup>;
 
-/// A hand-written `void` policy.
-pub struct PayloadByHand;
-
-// SAFETY: frees a payload from `payload_new` exactly once.
-unsafe impl CDrop<c_void> for PayloadByHand {
-    unsafe fn c_drop(&self, ptr: NonNull<c_void>) {
-        HAND_PAYLOAD_FREES.fetch_add(1, Ordering::SeqCst);
-        // SAFETY: caller upholds the trait contract.
-        drop(unsafe { Box::from_raw(ptr.as_ptr().cast::<u32>()) });
-    }
-}
-
-pub type PayloadHand = CArc<c_void, PayloadByHand>;
-
 #[test]
 fn stateful_non_default_policy_works_through_from_raw_with() {
     let raw = Box::into_raw(Box::new(bar_st { payload: 1 }));
@@ -699,14 +641,6 @@ fn hand_written_policy_with_clone() {
         3,
         "the policy was cloned too"
     );
-}
-
-#[test]
-fn hand_written_void_policy() {
-    // SAFETY: a fresh, uniquely-owned payload.
-    let p = unsafe { PayloadHand::from_raw_with(payload_new(1), PayloadByHand) }.unwrap();
-    drop(p);
-    assert_eq!(HAND_PAYLOAD_FREES.load(Ordering::SeqCst), 1);
 }
 
 // ---------------------------------------------------------------------------
