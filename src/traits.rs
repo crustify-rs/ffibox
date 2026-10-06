@@ -436,19 +436,33 @@ pub unsafe trait CLenDrop {
 /// cloning only when `T: Copy`; a buffer of owning elements needs a
 /// per-element clone contract, which this trait does not provide.
 ///
+/// It also copies *into* the policy's allocator from memory it does not own —
+/// a Rust slice ([`CVec::from_slice`]) or a run inside a C object
+/// ([`CSlice::to_cvec`](crate::CSlice::to_cvec)) — so the source need not come
+/// from this allocator, and is only read.
+///
 /// # Safety
 ///
-/// `c_clone_len` must return a fresh, uniquely-owned allocation of `byte_len`
-/// bytes byte-copied from `ptr` and releasable by this policy's [`CLenDrop`]
-/// impl — or `None` on allocation failure. It must not invalidate `ptr`.
+/// - `c_clone_len` must return a fresh, uniquely-owned allocation of
+///   `byte_len` bytes byte-copied from `ptr` and releasable by this policy's
+///   [`CLenDrop`] impl — or `None` on allocation failure.
+/// - It must only read `ptr`, whatever allocator (if any) it came from.
+/// - Every allocation it returns must be aligned to at least
+///   [`ALIGN`](Self::ALIGN).
 pub unsafe trait CLenClone: CLenDrop {
-    /// Byte-copy the `byte_len`-byte buffer at `ptr` into a fresh allocation,
-    /// or `None` on failure.
+    /// Alignment every allocation [`c_clone_len`](Self::c_clone_len) returns
+    /// is guaranteed to have; the copying constructors reject an element type
+    /// aligned beyond it at compile time. `1` (any byte) unless the policy
+    /// vouches for more, as `malloc`-family allocators do.
+    const ALIGN: usize = 1;
+
+    /// Byte-copy the `byte_len` bytes at `ptr` into a fresh allocation, or
+    /// `None` on failure.
     ///
     /// # Safety
     ///
-    /// `ptr` must point to a live allocation of at least `byte_len` bytes
-    /// compatible with this policy's allocator.
+    /// `ptr` must be valid for reads of `byte_len` bytes for the call, from any
+    /// allocator; the routine does not write through it.
     unsafe fn c_clone_len(&self, ptr: *mut u8, byte_len: usize) -> Option<NonNull<u8>>;
 }
 

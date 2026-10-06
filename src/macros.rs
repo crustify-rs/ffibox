@@ -772,17 +772,33 @@ macro_rules! impl_clendrop {
 /// impl_clenclone!(AvVecFree, av_vec_memdup);
 /// ```
 ///
+/// An allocator aligning beyond a byte says so, which lets the copying
+/// constructors take wider element types:
+///
+/// ```ignore
+/// impl_clenclone!(AvVecFree, av_vec_memdup, align = 16);
+/// ```
+///
 /// # Safety
 ///
 /// The macro is safe to invoke but emits an `unsafe impl`. You assert that the
-/// routine returns a fresh `byte_len`-byte copy, or NULL, that the policy's
-/// `c_drop_len` releases.
+/// routine only reads its source, returns a fresh `byte_len`-byte copy, or
+/// NULL, that the policy's `c_drop_len` releases, aligned to `align` (1 when
+/// omitted).
 #[macro_export]
 macro_rules! impl_clenclone {
+    ($policy:ty, $f:path, align = $align:expr) => {
+        $crate::impl_clenclone!(@impl $policy, $f, $align);
+    };
     ($policy:ty, $f:path) => {
+        $crate::impl_clenclone!(@impl $policy, $f, 1);
+    };
+    (@impl $policy:ty, $f:path, $align:expr) => {
         // SAFETY: the invoker asserts `$f` returns a fresh `byte_len`-byte
         // copy, or NULL, that the policy releases.
         unsafe impl $crate::CLenClone for $policy {
+            const ALIGN: usize = $align;
+
             #[inline]
             #[allow(unused_unsafe)]
             unsafe fn c_clone_len(

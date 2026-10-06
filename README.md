@@ -345,7 +345,7 @@ rather than repeating it.
 | owners | `CBox<Foo, P>` | ffibox | the sole owner of an object behind a pointer, released by `P` on drop; `Clone` when `P` deep-copies |
 | | `CVal<Foo, P>` | ffibox | an owned value held inline, its resources disposed by `P` on drop |
 | | `CStrBox<P>` | ffibox | an owned NUL-terminated `char *`; read-only `CStr` / `str` / byte views |
-| | `CVec<T, P>` | ffibox | an owned `(ptr, len)` array, NULL when empty; `&[T]` for plain elements, `CSlice` for wrapped C objects |
+| | `CVec<T, P>` | ffibox | an owned `(ptr, len)` array, NULL when empty; `&[T]` for plain elements, `CSlice` for wrapped C objects; `from_slice` copies a Rust slice into `P`'s allocator |
 | per C lock | `FooLocked<'a>` | `impl_cguarded!` | exclusive borrow under the C lock, move-only; getters and setters for the state the lock protects, the unlocked getters through `as_ref()` |
 | shared owner | `CArc<Foo, P>` | ffibox | one counted reference to a refcounted object; `Clone` through the up_ref; the shared handle always, `get_mut` / `make_mut` when the count proves it sole or after a copy, and `lock()` → `CGuard` when `Foo` is `CGuarded` |
 | lock | `CGuard<'a, Foo>` | ffibox | a held C lock, unlocking on drop — `MutexGuard`; `as_locked()` → `FooLocked<'_>`, `as_ref()` → `FooRef<'_>` |
@@ -417,7 +417,7 @@ carries `PhantomData<*const ()>` instead (see the conventions in
 | `CDupClone<T>: CDrop<T>` | `c_dup` — a deep copy (a NEW pointer, NULL on failure) | `impl_cdupclone!(P, Foo, f)`; `_str` for `strdup` | `Clone` / `try_clone` |
 | `CRefClone<T>: CDrop<T>` | `c_up_ref` — a refcount increment on the SAME pointer; `c_is_sole_owner` (default `false`) | `impl_crefclone!(P, Foo, f)`; `…, ok = |r| r == 1`, `…, sole = g` | `CArc`'s `Clone`, `get_mut`, `make_mut` |
 | `CLenDrop` | `c_drop_len` — a buffer free, given the byte length | `impl_clendrop!(P, f)` | `CVec` |
-| `CLenClone: CLenDrop` | `c_clone_len` — a buffer memdup (`T: Copy` only) | `impl_clenclone!(P, f)` | `CVec`'s `Clone` |
+| `CLenClone: CLenDrop` | `c_clone_len` — a buffer memdup (`T: Copy` only) from any readable source; `ALIGN` (default 1) bounds the element types it can copy | `impl_clenclone!(P, f)`, `impl_clenclone!(P, f, align = 16)` | `CVec`'s `Clone`, `CVec::from_slice`, `CSlice::to_cvec` |
 | `CDispose<T>` | `c_dispose` — `*_uninit` / `*_clear` on a value | `impl_cdispose!(P, Foo, f)` | `CVal` |
 | `CGuarded`, on `Foo` | `c_lock` / `c_unlock`; the `Locked` handle; the `Scope` it covers | `impl_cguarded!(Foo, FooLocked, lock = f, unlock = g)`; `…, ok = |r| r == 1`; `impl_cguarded!(Foo, all, …)` for `CGuardedAll` | `CArc::lock`, `CGuardedRef::lock` |
 
