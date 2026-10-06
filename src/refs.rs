@@ -930,6 +930,90 @@ impl<T: Copy, S: CLenClone + Clone> CVec<T, S> {
     }
 }
 
+impl<T: Copy, S: CLenClone> CVec<T, S> {
+    /// Copy `src` into a fresh allocation of the policy's allocator under
+    /// `S::default()`; `None` if the copy failed. An empty `src` gives an
+    /// empty buffer, without calling C.
+    ///
+    /// The way Rust hands C a buffer it will free: `CVec::<u8, AvFree>::from_slice(b)`
+    /// is `av_memdup(b, len)`. Element types aligned beyond
+    /// [`S::ALIGN`](CLenClone::ALIGN), and zero-sized ones, are rejected at
+    /// compile time.
+    ///
+    /// ```compile_fail,E0080
+    /// # use core::ptr::NonNull;
+    /// # struct Bytes;
+    /// # unsafe impl ffibox::CLenDrop for Bytes { unsafe fn c_drop_len(&self, _: *mut u8, _: usize) {} }
+    /// # unsafe impl ffibox::CLenClone for Bytes {
+    /// #     unsafe fn c_clone_len(&self, _: *mut u8, _: usize) -> Option<NonNull<u8>> { None }
+    /// # }
+    /// // `Bytes` vouches for byte alignment only, so a `u32` buffer is refused.
+    /// let _ = ffibox::CVec::<u32, Bytes>::from_slice_with(&[1, 2], Bytes);
+    /// ```
+    ///
+    /// ```compile_fail,E0080
+    /// # use core::ptr::NonNull;
+    /// # struct Bytes;
+    /// # unsafe impl ffibox::CLenDrop for Bytes { unsafe fn c_drop_len(&self, _: *mut u8, _: usize) {} }
+    /// # unsafe impl ffibox::CLenClone for Bytes {
+    /// #     unsafe fn c_clone_len(&self, _: *mut u8, _: usize) -> Option<NonNull<u8>> { None }
+    /// # }
+    /// // Zero-sized elements have no bytes to copy.
+    /// let _ = ffibox::CVec::<(), Bytes>::from_slice_with(&[(), ()], Bytes);
+    /// ```
+    #[inline]
+    pub fn from_slice(src: &[T]) -> Option<Self>
+    where
+        S: Default,
+    {
+        Self::from_slice_with(src, S::default())
+    }
+
+    /// As [`from_slice`](Self::from_slice), under `policy`.
+    #[inline]
+    pub fn from_slice_with(src: &[T], policy: S) -> Option<Self> {
+        // SAFETY: `src` is `src.len()` initialised, readable `T` for the call.
+        unsafe { copy_run(src.as_ptr(), src.len(), policy) }
+    }
+}
+
+/// Byte-copy `len` elements at `src` into a fresh `CVec` through `policy`.
+///
+/// # Safety
+///
+/// `src` must address `len` initialised `T`, readable for the call.
+#[inline]
+unsafe fn copy_run<T: Copy, S: CLenClone>(
+    src: *const T,
+    len: usize,
+    policy: S,
+) -> Option<CVec<T, S>> {
+    const {
+        assert!(
+            core::mem::size_of::<T>() != 0,
+            "zero-sized elements have no bytes to copy"
+        );
+        assert!(
+            core::mem::align_of::<T>() <= S::ALIGN,
+            "the policy's allocator cannot align T"
+        );
+    }
+    if len == 0 {
+        return Some(CVec::empty_with(policy));
+    }
+    let byte_len = len.checked_mul(core::mem::size_of::<T>())?;
+    // SAFETY: the caller guarantees `byte_len` readable bytes at `src`, which
+    // `c_clone_len` only reads. A `Some` is a fresh allocation of `byte_len`
+    // bytes the policy releases, aligned to `S::ALIGN >= align_of::<T>()`,
+    // holding a byte copy of `len` valid `T: Copy` values.
+    let ptr = unsafe { policy.c_clone_len(src.cast_mut().cast(), byte_len) }?;
+    Some(CVec {
+        ptr: Some(ptr.cast()),
+        len,
+        policy,
+    })
+}
+
 impl<T: Copy, S: CLenClone + Clone> Clone for CVec<T, S> {
     #[inline]
     fn clone(&self) -> Self {
@@ -1253,6 +1337,29 @@ impl<'a, T: CCell> CSlice<'a, T> {
 /// the element type is not what decides between `&[T]` and a `CSlice` — the
 /// owner is.
 impl<'a, T: CPlainElem> CSlice<'a, T> {
+    /// Copy the run into a fresh buffer of `S`'s allocator, under
+    /// `S::default()`; `None` if the copy failed.
+    ///
+    /// The bytes are read straight from the C object, never through a `&[T]`,
+    /// so this is sound while C keeps its pointer to the run.
+    #[inline]
+    pub fn to_cvec<S: CLenClone + Default>(&self) -> Option<CVec<T, S>>
+    where
+        T: Copy,
+    {
+        self.to_cvec_with(S::default())
+    }
+
+    /// As [`to_cvec`](Self::to_cvec), under `policy`.
+    #[inline]
+    pub fn to_cvec_with<S: CLenClone>(&self, policy: S) -> Option<CVec<T, S>>
+    where
+        T: Copy,
+    {
+        // SAFETY: a `CSlice` addresses `len` initialised `T` live for `'a`.
+        unsafe { copy_run(self.ptr.as_ptr(), self.len, policy) }
+    }
+
     /// Copy element `i` out; `None` if out of range.
     #[inline]
     #[must_use]
