@@ -213,16 +213,19 @@ let n = g.as_ref().count();
 g.as_locked().set_count(n + 1);          // registry_unlock when `g` drops
 ```
 
-### An opaque payload — no sole owner
+### An opaque payload — no erased owner
 
-A `void *` crossing FFI is never a [`CBox`]: `CBox` owns only `define_ctype!`
-layout types. What the payload really is decides the owner:
+A `void *` crossing FFI is never a [`CBox`] or [`CArc`]: both own only
+`define_ctype!` layout types. What the payload really is decides the owner:
 
 - **bytes** (an arena block, a codec buffer) → `CVec<u8, P>` (or
   `CVec<MaybeUninit<u8>, P>` before it is filled), released through `CLenDrop`;
-- **a C struct the caller knows** → `CBox<Foo, P>` after `define_ctype!`;
-- **an erased object several holders share** → `CArc<c_void, P>`, its policy
-  bound with `impl_cdrop_void!`.
+- **a C struct the caller knows** → `CBox<Foo, P>`, or `CArc<Foo, P>` when
+  counted, after `define_ctype!`.
+
+Neither `CBox` nor `CArc` owns a `c_void`: an erased payload whose type Rust
+chooses (a refcounted user object, say) gets its own typed owner over the C
+routines.
 
 ```rust,no_run
 use core::mem::MaybeUninit;
@@ -410,7 +413,7 @@ carries `PhantomData<*const ()>` instead (see the conventions in
 
 | Trait | Defines | Macro | Drives |
 |-------|---------|-------|--------|
-| `CDrop<T>` | `c_drop` — a `*_free`, or a refcount down-ref | `impl_cdrop!(P, Foo, f)`; `_str` / `_void` for `c_char` / `c_void` | `CBox`, `CStrBox`, `CArc` |
+| `CDrop<T>` | `c_drop` — a `*_free`, or a refcount down-ref | `impl_cdrop!(P, Foo, f)`; `_str` for `c_char` | `CBox`, `CStrBox`, `CArc` |
 | `CDupClone<T>: CDrop<T>` | `c_dup` — a deep copy (a NEW pointer, NULL on failure) | `impl_cdupclone!(P, Foo, f)`; `_str` for `strdup` | `Clone` / `try_clone` |
 | `CRefClone<T>: CDrop<T>` | `c_up_ref` — a refcount increment on the SAME pointer; `c_is_sole_owner` (default `false`) | `impl_crefclone!(P, Foo, f)`; `…, ok = |r| r == 1`, `…, sole = g` | `CArc`'s `Clone`, `get_mut`, `make_mut` |
 | `CLenDrop` | `c_drop_len` — a buffer free, given the byte length | `impl_clendrop!(P, f)` | `CVec` |
@@ -534,8 +537,8 @@ release it? This is about who *releases* the object, not who allocated it — a
     inline at all: behind a pointer, as below.
 - **One object behind a pointer** → `CBox<Foo, P>` if this is the only
   reference, `CArc<Foo, P>` if it is one of several counted ones. `CBox` owns
-  only `define_ctype!` layout types: a `void *` payload is bytes (`CVec<u8, P>`)
-  or a shared erased object (`CArc<c_void, P>`).
+  only `define_ctype!` layout types, as does `CArc`: a `void *` payload is
+  bytes (`CVec<u8, P>`) or a typed owner of its own.
 
 **Step 3 — Which policy?** (boxes, strings, buffers)
 

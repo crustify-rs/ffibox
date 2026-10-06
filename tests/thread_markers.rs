@@ -1,7 +1,7 @@
 //! The `Send`/`Sync` opt-in: withheld by default, granted per type, and
 //! inherited by the owners and views from their pointee and policy.
 
-use core::ffi::{c_char, c_void};
+use core::ffi::c_char;
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 
@@ -66,10 +66,6 @@ unsafe impl CDrop<c_char> for AnyThreadFree {
     unsafe fn c_drop(&self, _: NonNull<c_char>) {}
 }
 // SAFETY: as above.
-unsafe impl CDrop<c_void> for AnyThreadFree {
-    unsafe fn c_drop(&self, _: NonNull<c_void>) {}
-}
-// SAFETY: as above.
 unsafe impl CLenDrop for AnyThreadFree {
     unsafe fn c_drop_len(&self, _: *mut u8, _: usize) {}
 }
@@ -80,10 +76,6 @@ pub struct ThisThreadFree(PhantomData<*const ()>);
 // SAFETY: as `AnyThreadFree`.
 unsafe impl CDrop<c_char> for ThisThreadFree {
     unsafe fn c_drop(&self, _: NonNull<c_char>) {}
-}
-// SAFETY: as above.
-unsafe impl CDrop<c_void> for ThisThreadFree {
-    unsafe fn c_drop(&self, _: NonNull<c_void>) {}
 }
 
 fn is_send<T: Send>() {}
