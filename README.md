@@ -213,29 +213,43 @@ let n = g.as_ref().count();
 g.as_locked().set_count(n + 1);          // registry_unlock when `g` drops
 ```
 
-### An opaque payload — `CVoidBox`
+### An opaque payload — no sole owner
+
+A `void *` crossing FFI is never a [`CBox`]: `CBox` owns only `define_ctype!`
+layout types. What the payload really is decides the owner:
+
+- **bytes** (an arena block, a codec buffer) → `CVec<u8, P>` (or
+  `CVec<MaybeUninit<u8>, P>` before it is filled), released through `CLenDrop`;
+- **a C struct the caller knows** → `CBox<Foo, P>` after `define_ctype!`;
+- **an erased object several holders share** → `CArc<c_void, P>`, its policy
+  bound with `impl_cdrop_void!`.
 
 ```rust,no_run
-use ffibox::{impl_cdrop_void, CVoidBox};
+use core::mem::MaybeUninit;
+use ffibox::{impl_clendrop, CVec};
 
 mod sys {
     use core::ffi::c_void;
     extern "C" {
         pub fn arena_alloc(n: usize) -> *mut c_void;
-        pub fn arena_fill(p: *mut c_void, n: usize);
         pub fn arena_free(p: *mut c_void);
     }
 }
 
+unsafe fn arena_free_len(ptr: *mut u8, _byte_len: usize) {
+    unsafe { sys::arena_free(ptr.cast()) }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ArenaFree;
-impl_cdrop_void!(ArenaFree, sys::arena_free);
+impl_clendrop!(ArenaFree, arena_free_len);
 
-/// Arena bytes; the type names the destructor, the bytes stay opaque.
-pub type ArenaBuf = CVoidBox<ArenaFree>;
+/// Arena bytes: a buffer, not an opaque object.
+pub type ArenaBuf = CVec<MaybeUninit<u8>, ArenaFree>;
 
-let buf = unsafe { ArenaBuf::from_raw(sys::arena_alloc(64)) }.unwrap();
-unsafe { sys::arena_fill(buf.as_ptr(), 64) };
+let mut buf = unsafe { ArenaBuf::from_raw_parts(sys::arena_alloc(64).cast(), 64) }.unwrap();
+buf.as_mut_slice().fill(MaybeUninit::new(0));
+let buf = unsafe { buf.assume_init() }; // CVec<u8, ArenaFree>
 // `arena_free` runs here.
 ```
 
@@ -329,7 +343,6 @@ rather than repeating it.
 | | `CVal<Foo, P>` | ffibox | an owned value held inline, its resources disposed by `P` on drop |
 | | `CStrBox<P>` | ffibox | an owned NUL-terminated `char *`; read-only `CStr` / `str` / byte views |
 | | `CVec<T, P>` | ffibox | an owned `(ptr, len)` array, NULL when empty; `&[T]` for plain elements, `CSlice` for wrapped C objects |
-| | `CVoidBox<P>` | ffibox | an owned `void *` that is never looked inside (`CBox<c_void, P>`) |
 | per C lock | `FooLocked<'a>` | `impl_cguarded!` | exclusive borrow under the C lock, move-only; getters and setters for the state the lock protects, the unlocked getters through `as_ref()` |
 | shared owner | `CArc<Foo, P>` | ffibox | one counted reference to a refcounted object; `Clone` through the up_ref; the shared handle always, `get_mut` / `make_mut` when the count proves it sole or after a copy, and `lock()` → `CGuard` when `Foo` is `CGuarded` |
 | lock | `CGuard<'a, Foo>` | ffibox | a held C lock, unlocking on drop — `MutexGuard`; `as_locked()` → `FooLocked<'_>`, `as_ref()` → `FooRef<'_>` |
@@ -375,7 +388,7 @@ contract — see [Under the hood](#4-under-the-hood-hand-written-wrappers).
   of their std counterparts — `CBox` like `Box`, `CArc` with
   `Foo: Send + Sync` like `Arc`, and `CGuardedRef` with `Foo: Send` like
   `&Mutex<_>`.
-  Owners that never name a `Foo` — `CStrBox`, `CVoidBox`, and a `CVec` of
+  Owners that never name a `Foo` — `CStrBox` and a `CVec` of
   plain elements (`CVec<u8, _>`) — follow their policy alone, and a unit-struct
   policy is `Send + Sync`, so **they cross threads by default**. That is right
   for an allocator any thread may free into (`free`, `OPENSSL_free`,
@@ -390,7 +403,7 @@ Every owner's destructor is a **policy**: a type you declare, usually a unit
 struct deriving `Clone, Copy, Debug, Default`, implementing the lifecycle
 traits. Bind a C routine to it with the `impl_*!` macros, or implement the
 traits by hand when teardown needs runtime state. A unit struct is
-`Send + Sync`, which makes a `CStrBox`, `CVoidBox` or plain-element `CVec`
+`Send + Sync`, which makes a `CStrBox` or plain-element `CVec`
 under it free on whichever thread drops it; a thread-bound allocator's policy
 carries `PhantomData<*const ()>` instead (see the conventions in
 [section 1](#1-the-types-you-get)).
@@ -520,7 +533,9 @@ release it? This is about who *releases* the object, not who allocated it — a
   - address-sensitive (points into itself, or C recorded its address) → not
     inline at all: behind a pointer, as below.
 - **One object behind a pointer** → `CBox<Foo, P>` if this is the only
-  reference, `CArc<Foo, P>` if it is one of several counted ones; a type-erased `void *` payload → `CVoidBox<P>`.
+  reference, `CArc<Foo, P>` if it is one of several counted ones. `CBox` owns
+  only `define_ctype!` layout types: a `void *` payload is bytes (`CVec<u8, P>`)
+  or a shared erased object (`CArc<c_void, P>`).
 
 **Step 3 — Which policy?** (boxes, strings, buffers)
 

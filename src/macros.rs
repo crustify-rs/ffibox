@@ -49,7 +49,7 @@
 /// `$name` carries a zero-sized `PhantomData<*const ()>`, so it and every
 /// owner and handle over it is `!Send` / `!Sync` — a bindgen opaque type would
 /// otherwise make all of them `Send + Sync`. (Owners that never name a
-/// `$name` — `CStrBox`, `CVoidBox`, a `CVec` of plain elements — follow their
+/// `$name` — `CStrBox`, a `CVec` of plain elements — follow their
 /// policy instead, and cross threads by default.) Earn the traits back with a
 /// safety proof:
 ///
@@ -411,7 +411,8 @@ macro_rules! impl_cdrop_str {
 
 /// [`impl_cdrop!`](crate::impl_cdrop) for an opaque payload: implements
 /// [`CDrop<c_void>`](crate::CDrop), calling the routine with a `*mut c_void`.
-/// The policy for a [`CVoidBox`](crate::CVoidBox).
+/// The policy for an erased shared owner, `CArc<c_void, _>`; a [`CBox`](crate::CBox)
+/// owns only [`CCell`](crate::CCell) types.
 ///
 /// ```ignore
 /// impl_cdrop_void!(ArenaFree, ffi::arena_free);

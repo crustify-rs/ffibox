@@ -1,5 +1,5 @@
 //! The handle and owner types: borrowed handle storage ([`CBorrowedPtr`]),
-//! the sole owners ([`CBox`], [`CVoidBox`], [`CStrBox`], [`CVec`], [`CVal`]),
+//! the sole owners ([`CBox`], [`CStrBox`], [`CVec`], [`CVal`]),
 //! and the run views ([`CSlice`] / [`CSliceMut`]). The shared owners are in
 //! [`shared`](crate::shared). The
 //! [README](https://github.com/crustify-rs/ffibox#1-the-types-you-get) says
@@ -37,7 +37,7 @@
 //! is not ABI-guaranteed. [`CVec`] stores pointer + length, the pointer NULL
 //! when empty, as C's `{ T *ptr; size_t len; }`.
 
-use core::ffi::{c_char, c_void};
+use core::ffi::c_char;
 use core::fmt;
 use core::marker::PhantomData;
 use core::mem::{ManuallyDrop, MaybeUninit};
@@ -199,11 +199,22 @@ pub(crate) unsafe fn disarm<O, R>(owner: O, read: impl FnOnce(&O) -> R) -> R {
 /// The sole owner of a C-allocated `T`, released on drop by the policy `D` —
 /// a `Box` whose destructor is a C routine.
 ///
-/// `T` is a [`define_ctype!`](crate::define_ctype) layout type, which unlocks
-/// the handles ([`as_ref`](Self::as_ref) / [`as_mut`](Self::as_mut)) and the
-/// C-typed seam ([`from_c`](Self::from_c) / [`into_c`](Self::into_c) /
-/// [`as_c_ptr`](Self::as_c_ptr)), or [`c_void`] for an opaque payload (see
-/// [`CVoidBox`]).
+/// `T` is a [`CCell`] layout type from [`define_ctype!`](crate::define_ctype):
+/// every method requires it, so no `CBox` of anything else can be formed. A
+/// single heap object crossing FFI is a C struct; a scalar or a buffer of
+/// them is a [`CVec`], a C string a [`CStrBox`], and a Rust value is a `Box`.
+/// The layout type unlocks the handles ([`as_ref`](Self::as_ref) /
+/// [`as_mut`](Self::as_mut)) and the C-typed seam ([`from_c`](Self::from_c) /
+/// [`into_c`](Self::into_c) / [`as_c_ptr`](Self::as_c_ptr)).
+///
+/// ```compile_fail,E0599
+/// struct U32Free;
+/// // SAFETY: never called; the box below must not type-check.
+/// unsafe impl ffibox::CDrop<u32> for U32Free {
+///     unsafe fn c_drop(&self, _: core::ptr::NonNull<u32>) {}
+/// }
+/// let _ = unsafe { ffibox::CBox::<u32, U32Free>::from_raw_with(core::ptr::null_mut(), U32Free) };
+/// ```
 ///
 /// **Sole** is the contract: `as_mut` hands out the exclusive handle from
 /// `&mut self`, which is sound only if nothing else — another owner, or C —
@@ -222,7 +233,7 @@ pub struct CBox<T, D: CDrop<T>> {
     policy: D,
 }
 
-impl<T, D: CDrop<T>> CBox<T, D> {
+impl<T: CCell, D: CDrop<T>> CBox<T, D> {
     /// Take ownership of a raw pointer under `D::default()`; `None` if null.
     ///
     /// # Safety
@@ -371,7 +382,7 @@ impl<T, D: CDrop<T>> Drop for CBox<T, D> {
     }
 }
 
-impl<T, D: CDupClone<T> + Clone> CBox<T, D> {
+impl<T: CCell, D: CDupClone<T> + Clone> CBox<T, D> {
     /// Deep copy through [`CDupClone::c_dup`]; `None` if the C routine failed.
     ///
     /// [`Clone::clone`] aborts on that failure instead, because `Clone` is
@@ -392,7 +403,7 @@ impl<T, D: CDupClone<T> + Clone> CBox<T, D> {
     }
 }
 
-impl<T, D: CDupClone<T> + Clone> Clone for CBox<T, D> {
+impl<T: CCell, D: CDupClone<T> + Clone> Clone for CBox<T, D> {
     #[inline]
     fn clone(&self) -> Self {
         // Abort rather than fabricate a handle, as `Box` does on OOM; use
@@ -423,15 +434,6 @@ impl<T, D: CDrop<T>> fmt::Pointer for CBox<T, D> {
 unsafe impl<T: Send, D: CDrop<T> + Send> Send for CBox<T, D> {}
 // SAFETY: as above; `&CBox<T, D>` hands out `T::Ref<'_>` and `&D`.
 unsafe impl<T: Sync, D: CDrop<T> + Sync> Sync for CBox<T, D> {}
-
-/// The sole owner of an opaque `void *` payload, released by `D`. Nothing
-/// looks inside it; the wrapper passes [`as_ptr`](CBox::as_ptr) to C.
-///
-/// [`c_void`] is `Send + Sync`, so a payload's thread-safety is its policy's
-/// alone — and a unit-struct policy is `Send + Sync`, so by default the box
-/// crosses threads and its free runs wherever it drops. A payload that must
-/// stay on one thread opts out with a policy carrying `PhantomData<*const ()>`.
-pub type CVoidBox<D> = CBox<c_void, D>;
 
 // ---------------------------------------------------------------------------
 // CStrBox<D> — owned NUL-terminated C string

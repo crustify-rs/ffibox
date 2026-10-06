@@ -22,8 +22,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use ffibox::{
-    impl_cdrop, impl_cdrop_void, impl_cdupclone, impl_clendrop, impl_crefclone, CBorrowedPtr, CBox,
-    CCell, CDrop, CRefClone, CSlice, CSliceMut, CVec, CVoidBox,
+    impl_cdrop, impl_cdrop_void, impl_cdupclone, impl_clendrop, impl_crefclone, CArc, CBorrowedPtr,
+    CBox, CCell, CDrop, CRefClone, CSlice, CSliceMut, CVec,
 };
 
 // ---------------------------------------------------------------------------
@@ -890,10 +890,10 @@ fn cvec_is_ptr_plus_usize() {
 }
 
 // ---------------------------------------------------------------------------
-// `void *` payloads — `CVoidBox`
+// `void *` payloads — `CArc<c_void>`
 // ---------------------------------------------------------------------------
 //
-// Unlike a typed box, a `CVoidBox` keeps the pointee erased
+// Unlike a typed owner, a `CArc<c_void>` keeps the pointee erased
 // throughout: only the policy is known. The bytes behind the `void *` are
 // never read as a Rust type — they are merely owned and freed. These tests use
 // a Rust-allocated blob standing in for a C allocation, freed through a
@@ -929,7 +929,7 @@ unsafe extern "C" fn test_blob_free(ptr: *mut c_void) {
 struct TestBlobFree;
 impl_cdrop_void!(TestBlobFree, test_blob_free);
 /// An erased blob freed by `test_blob_free` (cf. a `git__free`d buffer).
-type OwnedBlob = CVoidBox<TestBlobFree>;
+type OwnedBlob = CArc<c_void, TestBlobFree>;
 
 // Leak an `ErasedBlob` and hand its address out as an opaque `void *`.
 fn make_owned_blob(payload: u32) -> (OwnedBlob, *mut c_void) {

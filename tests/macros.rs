@@ -27,8 +27,8 @@ use std::ffi::CString;
 
 use ffibox::{
     define_ctype, impl_cdispose, impl_cdrop, impl_cdrop_str, impl_cdrop_void, impl_cdupclone,
-    impl_cdupclone_str, impl_clenclone, impl_clendrop, impl_crefclone, CBox, CDrop, CDupClone,
-    CLenDrop, CRefClone, CSlice, CSliceMut, CStrBox, CVal, CVec, CVoidBox,
+    impl_cdupclone_str, impl_clenclone, impl_clendrop, impl_crefclone, CArc, CBox, CDrop,
+    CDupClone, CLenDrop, CRefClone, CSlice, CSliceMut, CStrBox, CVal, CVec,
 };
 
 // ---------------------------------------------------------------------------
@@ -534,7 +534,7 @@ fn slot_pointer_destructor_form() {
 }
 
 // ---------------------------------------------------------------------------
-// CVoidBox — opaque `void *`, impl_cdrop_void!
+// CArc<c_void> — opaque shared `void *`, impl_cdrop_void!
 // ---------------------------------------------------------------------------
 
 static PAYLOAD_FREES: AtomicUsize = AtomicUsize::new(0);
@@ -555,8 +555,8 @@ fn payload_new(v: u32) -> *mut c_void {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PayloadFree;
 impl_cdrop_void!(PayloadFree, payload_free);
-/// A type-erased payload.
-pub type Payload = CVoidBox<PayloadFree>;
+/// A type-erased payload under an erased shared owner.
+pub type Payload = CArc<c_void, PayloadFree>;
 
 #[test]
 fn void_payload_lifecycle() {
@@ -659,7 +659,7 @@ unsafe impl CDrop<c_void> for PayloadByHand {
     }
 }
 
-pub type PayloadHand = CVoidBox<PayloadByHand>;
+pub type PayloadHand = CArc<c_void, PayloadByHand>;
 
 #[test]
 fn stateful_non_default_policy_works_through_from_raw_with() {
