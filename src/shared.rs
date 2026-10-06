@@ -320,9 +320,11 @@ impl<T, D: CRefClone<T>> CArc<T, D> {
             policy: self.policy.clone(),
         })
     }
+}
 
+impl<T: CCell, D: CRefClone<T>> CArc<T, D> {
     /// The sole owner, if this is provably the only reference; `self` back
-    /// otherwise.
+    /// otherwise. Only a [`CCell`] object has a [`CBox`].
     #[inline]
     pub fn try_into_box(self) -> Result<CBox<T, D>, Self> {
         // SAFETY: our reference keeps the object live.
@@ -348,7 +350,7 @@ impl<T, D: CRefClone<T> + Clone> Clone for CArc<T, D> {
     }
 }
 
-impl<T, D: CDrop<T>> From<CBox<T, D>> for CArc<T, D> {
+impl<T: CCell, D: CDrop<T>> From<CBox<T, D>> for CArc<T, D> {
     /// Share a sole owner: its one reference becomes the first `CArc`.
     #[inline]
     fn from(b: CBox<T, D>) -> Self {
@@ -360,7 +362,7 @@ impl<T, D: CDrop<T>> From<CBox<T, D>> for CArc<T, D> {
     }
 }
 
-impl<T, D: CRefClone<T>> TryFrom<CArc<T, D>> for CBox<T, D> {
+impl<T: CCell, D: CRefClone<T>> TryFrom<CArc<T, D>> for CBox<T, D> {
     type Error = CArc<T, D>;
 
     /// [`CArc::try_into_box`]: the sole owner, or the arc back if it is not

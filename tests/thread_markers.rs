@@ -7,7 +7,7 @@ use core::ptr::NonNull;
 
 use ffibox::{
     define_ctype, impl_cdispose, impl_cdrop, CBox, CDrop, CLenDrop, CSlice, CSliceMut, CStrBox,
-    CVal, CVec, CVoidBox,
+    CVal, CVec,
 };
 
 /// Stand-in for a bindgen opaque type that never opts in.
@@ -137,13 +137,10 @@ fn owners_and_views_withhold_markers_with_their_pointee() {
 }
 
 #[test]
-fn strings_and_payloads_follow_their_policy() {
+fn strings_follow_their_policy() {
     is_send::<CStrBox<AnyThreadFree>>();
     is_sync::<CStrBox<AnyThreadFree>>();
-    is_send::<CVoidBox<AnyThreadFree>>();
-    is_sync::<CVoidBox<AnyThreadFree>>();
     <CStrBox<ThisThreadFree> as AmbiguousIfSend<_>>::check();
-    <CVoidBox<ThisThreadFree> as AmbiguousIfSend<_>>::check();
 }
 
 #[test]
