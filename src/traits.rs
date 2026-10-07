@@ -15,14 +15,22 @@
 //! | [`CLenDrop`] | `c_drop_len(ptr, byte_len)` | [`CVec`] |
 //! | [`CLenClone`] | `c_clone_len` — a buffer memdup | its `Clone` |
 //! | [`CDispose<T>`] | `c_dispose` — `*_uninit` / `*_clear` on a value | [`CVal`] |
+//! | [`CNew<T>`] | `c_new` — a zero-argument `*_alloc` / `*_new` | `CBox::new`, `CArc::new` |
+//! | [`CAlloc<T>`] | `c_alloc` — untyped storage (`malloc`) | `CBox::new_uninit` |
+//! | [`CAllocZeroed<T>`] | `c_alloc_zeroed` — zeroed storage (`calloc`) | `CBox::new_zeroed`, `CArc::new_zeroed` |
 //!
 //! Every method takes `&self`, so a policy may carry runtime state (the
-//! element-free function of `OPENSSL_sk_pop_free`). A ZST policy costs nothing.
+//! element-free function of a `list_pop_free(list, elem_free)`). A ZST policy costs nothing.
 //!
-//! [`CGuarded`] is the exception: the C lock protecting the object,
-//! implemented on the layout type, which [`CArc::lock`] and
-//! [`CGuardedRef::lock`] take to hand out a [`CGuard`].
+//! The construction traits are sub-traits of [`CDrop`] on the same policy, so
+//! every safe path into an owner goes through the policy that will free it.
+//!
+//! [`CGuarded`] and [`CZeroable`] are the exceptions, implemented on the layout
+//! type: the C lock protecting the object, which [`CArc::lock`] and
+//! [`CGuardedRef::lock`] take to hand out a [`CGuard`]; and the object's
+//! all-zero validity, which zeroing allocators rely on.
 
+use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 
 // Imported so the trait docs' intra-doc links resolve; none of them is named in
@@ -40,7 +48,7 @@ use crate::shared::{CArc, CGuard, CGuardedRef};
 /// [`CStrBox<D>`] drop on.
 ///
 /// `c_drop` releases the owner's claim on the object: a plain `*_free`
-/// (`EVP_MD_CTX_free`), a generic allocator free (`OPENSSL_free`), or the
+/// (`ctx_free`), a generic allocator free (`free`, a library's `lib_free`), or the
 /// refcount **down-ref** of one counted reference ([`CArc`], or a [`CBox`]
 /// holding the only one).
 ///
@@ -58,11 +66,11 @@ use crate::shared::{CArc, CGuard, CGuardedRef};
 /// # Example
 ///
 /// ```ignore
-/// pub struct StackPopFree(unsafe extern "C" fn(*mut c_void));
-/// unsafe impl CDrop<Stack> for StackPopFree {
-///     unsafe fn c_drop(&self, ptr: NonNull<Stack>) {
+/// pub struct ListPopFree(unsafe extern "C" fn(*mut c_void));
+/// unsafe impl CDrop<List> for ListPopFree {
+///     unsafe fn c_drop(&self, ptr: NonNull<List>) {
 ///         // SAFETY: caller upholds the trait contract.
-///         unsafe { OPENSSL_sk_pop_free(ptr.as_ptr().cast(), Some(self.0)) }
+///         unsafe { list_pop_free(ptr.as_ptr().cast(), Some(self.0)) }
 ///     }
 /// }
 /// ```
@@ -95,10 +103,10 @@ pub unsafe trait CDrop<T> {
 /// # Example
 ///
 /// ```ignore
-/// unsafe impl CDupClone<EvpPkey> for EvpPkeyFree {
-///     unsafe fn c_dup(&self, ptr: NonNull<EvpPkey>) -> Option<NonNull<EvpPkey>> {
+/// unsafe impl CDupClone<Key> for KeyFree {
+///     unsafe fn c_dup(&self, ptr: NonNull<Key>) -> Option<NonNull<Key>> {
 ///         // SAFETY: caller upholds the trait contract.
-///         NonNull::new(unsafe { EVP_PKEY_dup(ptr.as_ptr().cast()) }.cast())
+///         NonNull::new(unsafe { key_dup(ptr.as_ptr().cast()) }.cast())
 ///     }
 /// }
 /// ```
@@ -293,6 +301,149 @@ pub unsafe trait CDispose<T> {
 }
 
 // ===========================================================================
+// Construction policies — the safe paths into an owner
+// ===========================================================================
+
+/// All-zero bytes are a valid `Self` for **every safe operation** that can
+/// reach one — the bound a zeroing allocator needs to hand out a `T` rather
+/// than a [`MaybeUninit<T>`](core::mem::MaybeUninit).
+///
+/// Rust-level validity is the easy half: a bindgen struct has no niches.
+/// The half this trait exists for is C's. A type whose C constructor sets
+/// non-zero defaults (a `frame_alloc` that sets `format = -1` and `pts` to
+/// a sentinel) must not implement it, even though zero bytes are a
+/// well-formed Rust value: a safe wrapper forwarding a zeroed one to C would
+/// hand C a state its constructor never produces.
+///
+/// Implemented on the layout type, unlike the policies, because zero-validity
+/// is a property of `T` whatever allocates it. The provided
+/// [`zeroed`](Self::zeroed) builds a value by hand, so no macro is needed.
+///
+/// Without it, a zeroing allocator does not type-check:
+///
+/// ```compile_fail,E0277
+/// # use core::ptr::NonNull;
+/// # use ffibox::{define_ctype, CBox, CDrop};
+/// # mod ffi { #[repr(C)] pub struct frame_st { pub format: i32 } }
+/// define_ctype!(Frame, FrameRef, FrameMut, ffi::frame_st); // no `CZeroable`
+/// # #[derive(Default)]
+/// # struct Heap;
+/// # unsafe impl CDrop<Frame> for Heap { unsafe fn c_drop(&self, _: NonNull<Frame>) {} }
+/// let _ = CBox::<Frame, Heap>::new_zeroed();
+/// ```
+///
+/// # Safety
+///
+/// An all-zero `Self` must be accepted by:
+///
+/// - the getters and setters of [`Ref`](CCell::Ref) / [`Mut`](CCell::Mut) —
+///   a null pointer field surfaces as `None` or is checked before use;
+/// - every safe wrapper that takes a `Self`, and the C routines it forwards
+///   to;
+/// - every teardown policy paired with it — a [`CDrop`], [`CDispose`] or C
+///   `free` callback — because a zeroed object dropped untouched still runs
+///   its teardown.
+pub unsafe trait CZeroable: CCell {
+    /// An all-zero value.
+    #[inline]
+    #[must_use]
+    fn zeroed() -> Self {
+        // SAFETY: `Self` is layout-compatible with its C type per `CCell`,
+        // and all-zero is valid for it per this trait's contract.
+        unsafe { core::mem::MaybeUninit::<Self>::zeroed().assume_init() }
+    }
+}
+
+/// Untyped storage for a `T`: the policy's half of
+/// [`CBox::new_uninit`], like an
+/// [`Allocator`](https://doc.rust-lang.org/std/alloc/trait.Allocator.html)
+/// paired with its free — `malloc` with `free`.
+///
+/// The policy frees the storage both before and after it holds a `T`, so it
+/// is a [`CDrop`] of both: `CDrop<MaybeUninit<T>>` for a box dropped unfilled,
+/// `CDrop<T>` once [`assume_init`](CBox::assume_init) has promoted it. A storage-only policy
+/// writes one generic impl that covers both:
+///
+/// ```ignore
+/// unsafe impl<T> CDrop<T> for LibFree { /* lib_free */ }
+/// unsafe impl<T: CCell> CAlloc<T> for LibFree { /* lib_malloc(size_of::<T>()) */ }
+/// ```
+///
+/// A policy whose free reads the object (a `frame_free`, or a refcount whose
+/// release callback disposes fields) has no sound `CDrop<MaybeUninit<T>>`, so
+/// it cannot implement this; zeroed storage, which it can, is
+/// [`CAllocZeroed`].
+///
+/// # Safety
+///
+/// - A `Some` from [`c_alloc`](Self::c_alloc) must be a fresh, uniquely-owned
+///   allocation of at least `size_of::<T>()` bytes, aligned to
+///   `align_of::<T>()`. A generic impl over an allocator with a fixed
+///   alignment rejects over-aligned `T` with
+///   `const { assert!(align_of::<T>() <= ALIGN) }` in `c_alloc`.
+/// - `CDrop<MaybeUninit<T>>::c_drop` must release such storage exactly once
+///   without reading it.
+/// - `CDrop<T>::c_drop` must release it once it holds a `T`. Which `T`s it
+///   accepts is the policy's to document: the only path from storage to a
+///   `T` is the `unsafe` [`CBox::assume_init`], whose caller vouches for the
+///   object it promotes.
+pub unsafe trait CAlloc<T: CCell>: CDrop<T> + CDrop<MaybeUninit<T>> {
+    /// Allocate uninitialised storage for one `T`; `None` on failure.
+    fn c_alloc(&self) -> Option<NonNull<MaybeUninit<T>>>;
+}
+
+/// Zero-filled storage for a [`CZeroable`] `T`: the policy's half of
+/// [`CBox::new_zeroed`] and [`CArc::new_zeroed`] — `calloc`, a zeroing
+/// `lib_mallocz`, a refcounted allocator's zeroed variant.
+///
+/// Separate from [`CAlloc`] because it asks less of the policy: the object is
+/// valid from the start, so [`CDrop::c_drop`] may read it. A refcount whose
+/// release callback disposes fields can implement this and not `CAlloc`.
+///
+/// # Safety
+///
+/// - A `Some` must be a fresh, uniquely-owned, all-zero `T`, aligned and sized
+///   as [`CAlloc`] requires, holding one claim this policy's `c_drop` releases.
+/// - `c_drop` must accept every `T` safe code can bring it to — the zeroed
+///   state [`CZeroable`] vouches for, and what safe setters write.
+pub unsafe trait CAllocZeroed<T: CZeroable>: CDrop<T> {
+    /// Allocate one all-zero `T`; `None` on failure.
+    fn c_alloc_zeroed(&self) -> Option<NonNull<T>>;
+}
+
+/// A type's zero-argument C constructor, paired with the destructor that
+/// settles it — `frame_alloc` with `frame_free`. The policy's half of
+/// [`CBox::new`] and [`CArc::new`], the analogue of [`Default`].
+///
+/// Constructors that take arguments stay inherent functions on the layout
+/// type returning a `CBox<T, D>` (`Parent::new_child(&self, flags)`): a trait
+/// signature cannot carry their parameters, names or error types. The owner
+/// type still names the policy, so construction and teardown stay paired.
+///
+/// A policy that is only a destructor gives no constructor:
+///
+/// ```compile_fail,E0277
+/// # use core::ptr::NonNull;
+/// # use ffibox::{define_ctype, CBox, CDrop};
+/// # mod ffi { #[repr(C)] pub struct frame_st { pub format: i32 } }
+/// # define_ctype!(Frame, FrameRef, FrameMut, ffi::frame_st);
+/// #[derive(Default)]
+/// struct FrameFree; // `CDrop` only
+/// # unsafe impl CDrop<Frame> for FrameFree { unsafe fn c_drop(&self, _: NonNull<Frame>) {} }
+/// let _ = CBox::<Frame, FrameFree>::new();
+/// ```
+///
+/// # Safety
+///
+/// A `Some` must be a fresh, uniquely-owned, fully-initialised `T` holding one
+/// claim this policy's [`CDrop::c_drop`] releases. `None` must mean the C
+/// routine failed.
+pub unsafe trait CNew<T: CCell>: CDrop<T> {
+    /// Construct one `T`; `None` on failure.
+    fn c_new(&self) -> Option<NonNull<T>>;
+}
+
+// ===========================================================================
 // Buffer elements
 // ===========================================================================
 
@@ -421,8 +572,8 @@ pub unsafe trait CLenDrop {
     /// - `ptr` must be a live allocation the caller owns, from the allocator
     ///   this policy targets.
     /// - `byte_len` must not exceed the allocation's size, and must equal it
-    ///   exactly when the policy's free takes a size (`OPENSSL_clear_free`, a
-    ///   sized deallocator) — passing less there frees the wrong amount, or
+    ///   exactly when the policy's free takes a size (a clearing free
+    ///   taking the length, a sized deallocator) — passing less there frees the wrong amount, or
     ///   leaves the tail uncleared.
     unsafe fn c_drop_len(&self, ptr: *mut u8, byte_len: usize);
 }
@@ -558,7 +709,7 @@ pub unsafe trait CLenClone: CLenDrop {
 /// let _ = run.get(0); // instantiates the handle conversion for `Foo`
 /// ```
 pub unsafe trait CCell: Sized {
-    /// The wrapped C FFI type (e.g. `ffi::stack_st`).
+    /// The wrapped C FFI type (e.g. `ffi::foo_st`).
     type C;
 
     /// The shared borrowed handle — `Copy`, getters only.

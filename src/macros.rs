@@ -20,7 +20,7 @@
 /// handles, and the [`CCell`](crate::CCell) impl linking them.
 ///
 /// ```ignore
-/// define_ctype!(SslSession, SslSessionRef, SslSessionMut, ffi::ssl_session_st);
+/// define_ctype!(Widget, WidgetRef, WidgetMut, ffi::widget_st);
 /// ```
 ///
 /// The names are spelled out because `macro_rules!` cannot concatenate
@@ -34,8 +34,9 @@
 ///
 /// # Values Rust owns
 ///
-/// A `$name` value — from `zeroed()`, or a wrapper constructor around a C
-/// function filling a local — is Rust-owned storage, so `$name::as_ref` /
+/// A `$name` value — from [`CZeroable::zeroed`](crate::CZeroable::zeroed)
+/// for a type that implements it, or a wrapper constructor around a C function
+/// filling a local — is Rust-owned storage, so `$name::as_ref` /
 /// `as_mut` reach its handles directly. That is the one place a reference
 /// covers a C struct's bytes, sound because nothing else yields a `&$name`.
 /// Do not give C a pointer to such a value that outlives the call; a struct C
@@ -104,8 +105,10 @@
 ///     }
 /// }
 /// fn reset(mut m: PtMut<'_>) { m.set_x(0); }
+/// // SAFETY: any `x` is valid, zero included.
+/// unsafe impl ffibox::CZeroable for Pt {}
 ///
-/// let mut p = Pt::zeroed();
+/// let mut p = <Pt as ffibox::CZeroable>::zeroed();
 /// let mut m = p.as_mut();
 /// reset(m.as_mut());  // a reborrow ...
 /// m.set_x(1);         // ... so `m` is still usable
@@ -159,22 +162,6 @@ macro_rules! define_ctype {
         }
 
         impl $name {
-            /// Zero-initialise a value for inline storage or a stack slot.
-            ///
-            /// Valid because `$c_type` is a bindgen `#[repr(C)]` struct over a
-            /// C header, which has no niche types — asserted by invoking
-            /// [`define_ctype!`](crate::define_ctype) on it.
-            #[inline]
-            #[must_use]
-            pub fn zeroed() -> Self {
-                // SAFETY: all-zero is a valid bit pattern for a bindgen C
-                // struct; see `define_ctype!`.
-                Self(
-                    unsafe { ::core::mem::MaybeUninit::<$c_type>::zeroed().assume_init() },
-                    ::core::marker::PhantomData,
-                )
-            }
-
             /// Shared handle to this value — the getters.
             ///
             /// Takes `&self`, a reference covering the C struct's bytes, which
@@ -239,7 +226,7 @@ macro_rules! define_ctype {
 
             /// Borrow a type-erased `void *` back; `None` if null. The inbound
             /// dual of [`as_void_ptr`](Self::as_void_ptr), for C slots that
-            /// hand an opaque pointer back (`SSL_get_ex_data`, `BIO_get_data`,
+            /// hand an opaque pointer back (a `get_user_data` getter,
             /// a callback's `void *arg`). Ownership is not transferred.
             ///
             /// # Safety
@@ -349,10 +336,10 @@ macro_rules! define_ctype {
 ///
 /// ```ignore
 /// /// # Safety
-/// /// `p` must be an owned `AVDictionary`.
-/// unsafe fn dict_free(mut p: *mut ffi::AVDictionary) {
+/// /// `p` must be an owned `dict_st`.
+/// unsafe fn dict_free(mut p: *mut ffi::dict_st) {
 ///     // SAFETY: the caller transfers the dictionary; the local slot is writable.
-///     unsafe { ffi::av_dict_free(&mut p) }
+///     unsafe { ffi::dict_free_slot(&mut p) } // takes `dict_st **` and nulls it
 /// }
 /// impl_cdrop!(DictFree, Dict, dict_free);
 /// ```
@@ -394,7 +381,7 @@ macro_rules! impl_cdrop {
 /// impl_cdrop_str!(LibStrFree, ffi::lib_str_free);
 /// ```
 ///
-/// A generic `void *` free (`av_free`, `free`) goes behind an `unsafe fn`
+/// A generic `void *` free (`free`, a library's `lib_free`) goes behind an `unsafe fn`
 /// adapter taking `*mut c_char`.
 ///
 /// # Safety
@@ -412,8 +399,8 @@ macro_rules! impl_cdrop_str {
 /// returns a NEW pointer, or NULL on failure, that the same policy frees.
 ///
 /// ```ignore
-/// impl_cdrop!(PkeyFree, Pkey, ffi::EVP_PKEY_free);
-/// impl_cdupclone!(PkeyFree, Pkey, ffi::EVP_PKEY_dup);
+/// impl_cdrop!(KeyFree, Key, ffi::key_free);
+/// impl_cdupclone!(KeyFree, Key, ffi::key_dup);
 /// ```
 ///
 /// As in [`impl_cdrop!`](crate::impl_cdrop), the routine is called with a
@@ -471,8 +458,8 @@ macro_rules! impl_cdupclone_str {
 /// impl_crefclone!(FooUnref, Foo, ffi::foo_up_ref); // returns `()`
 ///
 /// // An up_ref that reports failure: `ok` maps its return to success.
-/// impl_cdrop!(SessionUnref, Session, ffi::SSL_SESSION_free);
-/// impl_crefclone!(SessionUnref, Session, ffi::SSL_SESSION_up_ref, ok = |r| r == 1);
+/// impl_cdrop!(SessionUnref, Session, ffi::session_free);
+/// impl_crefclone!(SessionUnref, Session, ffi::session_up_ref, ok = |r| r == 1);
 ///
 /// // With a count the library lets you read: an `unsafe fn(*mut C) -> bool`.
 /// impl_crefclone!(FooUnref, Foo, ffi::foo_up_ref, sole = foo_refcount_is_one);
@@ -588,18 +575,18 @@ pub unsafe fn __handle_ref<'a, T: crate::CCell + 'a>(p: ::core::ptr::NonNull<T>)
 /// grants, where the getters and setters for the lock-protected state go.
 ///
 /// ```ignore
-/// define_ctype!(Odb, OdbRef, OdbMut, ffi::odb_st);
-/// impl_cguarded!(Odb, OdbLocked, lock = ffi::odb_lock, unlock = ffi::odb_unlock);
+/// define_ctype!(Cache, CacheRef, CacheMut, ffi::cache_st);
+/// impl_cguarded!(Cache, CacheLocked, lock = ffi::cache_lock, unlock = ffi::cache_unlock);
 ///
-/// impl OdbRef<'_> { /* fixed state; routines that lock internally */ }
-/// impl OdbLocked<'_> { /* the state `odb_lock` protects */ }
+/// impl CacheRef<'_> { /* fixed state; routines that lock internally */ }
+/// impl CacheLocked<'_> { /* the state `cache_lock` protects */ }
 ///
 /// // Lock routines that report failure: `ok` maps a lock's return to success.
 /// impl_cguarded!(
 ///     Store,
 ///     StoreLocked,
-///     lock = ffi::X509_STORE_lock,
-///     unlock = ffi::X509_STORE_unlock,
+///     lock = ffi::store_lock,
+///     unlock = ffi::store_unlock,
 ///     ok = |r| r == 1,
 /// );
 /// ```
@@ -734,14 +721,14 @@ macro_rules! impl_cguarded {
 ///
 /// ```ignore
 /// /// # Safety
-/// /// `ptr` must be an `av_malloc` buffer.
-/// unsafe fn av_vec_free(ptr: *mut u8, _byte_len: usize) {
+/// /// `ptr` must be a `lib_malloc` buffer.
+/// unsafe fn lib_vec_free(ptr: *mut u8, _byte_len: usize) {
 ///     // SAFETY: the caller transfers the buffer.
-///     unsafe { ffi::av_free(ptr.cast()) }
+///     unsafe { ffi::lib_free(ptr.cast()) }
 /// }
 /// #[derive(Clone, Copy, Debug, Default)]
-/// pub struct AvVecFree;
-/// impl_clendrop!(AvVecFree, av_vec_free);
+/// pub struct LibVecFree;
+/// impl_clendrop!(LibVecFree, lib_vec_free);
 /// ```
 ///
 /// # Safety
@@ -769,14 +756,14 @@ macro_rules! impl_clendrop {
 /// `unsafe fn(*mut u8, usize) -> *mut u8`, returning a fresh copy or NULL:
 ///
 /// ```ignore
-/// impl_clenclone!(AvVecFree, av_vec_memdup);
+/// impl_clenclone!(LibVecFree, lib_vec_memdup);
 /// ```
 ///
 /// An allocator aligning beyond a byte says so, which lets the copying
 /// constructors take wider element types:
 ///
 /// ```ignore
-/// impl_clenclone!(AvVecFree, av_vec_memdup, align = 16);
+/// impl_clenclone!(LibVecFree, lib_vec_memdup, align = 16);
 /// ```
 ///
 /// # Safety
@@ -821,8 +808,8 @@ macro_rules! impl_clenclone {
 ///
 /// ```ignore
 /// #[derive(Clone, Copy, Debug, Default)]
-/// pub struct LayoutUninit;
-/// impl_cdispose!(LayoutUninit, ChannelLayout, ffi::av_channel_layout_uninit);
+/// pub struct ParamsUninit;
+/// impl_cdispose!(ParamsUninit, Params, ffi::params_uninit);
 /// ```
 ///
 /// # Safety
@@ -830,7 +817,7 @@ macro_rules! impl_clenclone {
 /// The macro is safe to invoke but emits an `unsafe impl`. You assert that the
 /// routine releases the value's owned resources exactly once, does not free
 /// the value itself, and accepts every value safe code can reach: what a safe
-/// constructor produces (`zeroed()` included), and whatever the wrapper's safe
+/// constructor produces (`CZeroable::zeroed()` included), and whatever the wrapper's safe
 /// setters then write — so a setter that could break the routine must
 /// validate or be `unsafe`.
 #[macro_export]

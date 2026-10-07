@@ -36,6 +36,10 @@
 //!
 //! Like `Box`, the owners adopt a raw pointer with an `unsafe` `from_raw` and
 //! give one out with a safe `into_raw` / `as_ptr`. A type alias names an owner with its policy.
+//! A policy that also constructs gives [`CBox`] and [`CArc`] safe constructors
+//! that allocate through it: `new` ([`CNew`], a C `*_alloc`), `new_zeroed`
+//! ([`CAllocZeroed`], for a [`CZeroable`] type) and `new_uninit` ([`CAlloc`],
+//! filled in place by C and promoted with `assume_init`).
 //!
 //! ## Quick example
 //!
@@ -121,6 +125,6 @@ pub struct ReadmeDoctests;
 pub use crate::refs::{CBorrowedPtr, CBox, CSlice, CSliceMut, CStrBox, CVal, CVec};
 pub use crate::shared::{CArc, CGuard, CGuardedRef};
 pub use crate::traits::{
-    CCell, CDispose, CDrop, CDupClone, CGuarded, CGuardedAll, CLenClone, CLenDrop, CPlainElem,
-    CRefClone, LockFields, LockScope, LockWhole,
+    CAlloc, CAllocZeroed, CCell, CDispose, CDrop, CDupClone, CGuarded, CGuardedAll, CLenClone,
+    CLenDrop, CNew, CPlainElem, CRefClone, CZeroable, LockFields, LockScope, LockWhole,
 };

@@ -28,7 +28,7 @@ use std::ffi::CString;
 use ffibox::{
     define_ctype, impl_cdispose, impl_cdrop, impl_cdrop_str, impl_cdupclone, impl_cdupclone_str,
     impl_clenclone, impl_clendrop, impl_crefclone, CBox, CDrop, CDupClone, CLenDrop, CRefClone,
-    CSlice, CSliceMut, CStrBox, CVal, CVec,
+    CSlice, CSliceMut, CStrBox, CVal, CVec, CZeroable as _,
 };
 
 // ---------------------------------------------------------------------------
@@ -65,7 +65,7 @@ fn foo_bar_lock() -> std::sync::MutexGuard<'static, ()> {
 const DUP_FAILS_SENTINEL: u64 = u64::MAX;
 
 /// Mock `FOO_up_ref(p)` — increments refcount, returns 1 on success
-/// (matches the OpenSSL convention).
+/// (a common C convention).
 ///
 /// # Safety
 ///
@@ -137,6 +137,8 @@ impl_crefclone!(FooUnref, Foo, FOO_up_ref, ok = |r| r == 1);
 pub type FooOwned = CBox<Foo, FooUnref>;
 
 define_ctype!(Bar, BarRef, BarMut, bar_st);
+// SAFETY: any `payload` is valid, zero included.
+unsafe impl ffibox::CZeroable for Bar {}
 // `BAR_free` is the correct destructor for `bar_st`, and `BAR_dup` deep-copies
 // into a fresh allocation releasable by it, NULL on failure.
 #[derive(Clone, Copy, Debug, Default)]
@@ -354,6 +356,9 @@ unsafe fn QUX_dispose(p: *mut qux_st) {
 }
 
 define_ctype!(Qux, QuxRef, QuxMut, qux_st);
+// SAFETY: `owns == 0` is the state `QUX_dispose` skips; every accessor
+// accepts it.
+unsafe impl ffibox::CZeroable for Qux {}
 #[derive(Clone, Copy, Debug, Default)]
 pub struct QuxDispose;
 impl_cdispose!(QuxDispose, Qux, QUX_dispose);
@@ -490,7 +495,7 @@ fn owned_as_mut_writes_through_the_exclusive_handle() {
 
 static BAR_SLOT_FREES: AtomicUsize = AtomicUsize::new(0);
 
-/// Mock `BAR_free_slot(&p)` — the `av_*_free(T **)` shape: frees `*pp` and
+/// Mock `BAR_free_slot(&p)` — the `foo_free(T **)` shape: frees `*pp` and
 /// nulls the slot.
 ///
 /// # Safety

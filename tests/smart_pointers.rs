@@ -22,7 +22,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use ffibox::{
     impl_cdrop, impl_cdupclone, impl_clendrop, impl_crefclone, CBorrowedPtr, CBox, CCell, CDrop,
-    CRefClone, CSlice, CSliceMut, CVec,
+    CRefClone, CSlice, CSliceMut, CVec, CZeroable as _,
 };
 
 // ---------------------------------------------------------------------------
@@ -962,6 +962,8 @@ pub struct elem_st {
     pub tag: u32,
 }
 ffibox::define_ctype!(Elem, ElemRef, ElemMut, elem_st);
+// SAFETY: any `tag` is valid, zero included.
+unsafe impl ffibox::CZeroable for Elem {}
 
 impl ElemRef<'_> {
     fn tag(&self) -> u32 {
