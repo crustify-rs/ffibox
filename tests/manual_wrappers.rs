@@ -50,7 +50,7 @@ pub struct FooFullFree;
 impl_cdrop!(FooFullFree, FooFull, foo_full_free);
 pub type FooFullOwned = CBox<FooFull, FooFullFree>;
 
-// --- Hand-written type-generic wrapper: the STACK_OF shape Stack<T, S> ---
+// --- Hand-written type-generic wrapper: a type-generic container Stack<T, S> ---
 #[repr(C)]
 pub struct stack_st {
     pub num: i32,
@@ -59,8 +59,8 @@ pub struct stack_st {
 // Free strategies (the `owned_elem` axis).
 pub struct Borrowed;
 pub struct Owned<D>(PhantomData<D>);
-pub struct X509;
-pub struct X509Free;
+pub struct Item;
+pub struct ItemFree;
 
 #[repr(transparent)]
 pub struct Stack<T, S>(stack_st, PhantomData<(*const (), T, S)>);
@@ -132,28 +132,28 @@ impl<'a, T, S> StackMut<'a, T, S> {
     }
 }
 
-// Each STACK_OF(T) is a zero-cost alias picking a strategy — not a redefinition.
-pub type StackOfX509Borrowed = Stack<X509, Borrowed>;
-pub type StackOfX509Owned = Stack<X509, Owned<X509Free>>;
+// Each `Stack<T, S>` alias is zero-cost, picking a strategy — not a redefinition.
+pub type StackOfItemBorrowed = Stack<Item, Borrowed>;
+pub type StackOfItemOwned = Stack<Item, Owned<ItemFree>>;
 
 #[test]
 fn layout_and_niche() {
     // The layout newtype keeps the C struct's size, so it embeds by value.
     assert_eq!(size_of::<FooFull>(), size_of::<foo_st>());
-    assert_eq!(size_of::<Stack<X509, Borrowed>>(), size_of::<stack_st>());
-    assert_eq!(size_of::<StackOfX509Owned>(), size_of::<stack_st>());
+    assert_eq!(size_of::<Stack<Item, Borrowed>>(), size_of::<stack_st>());
+    assert_eq!(size_of::<StackOfItemOwned>(), size_of::<stack_st>());
 
     // The handles are one pointer regardless of the generics, with the niche.
     assert_eq!(
-        size_of::<StackRef<'_, X509, Borrowed>>(),
+        size_of::<StackRef<'_, Item, Borrowed>>(),
         size_of::<*const stack_st>()
     );
     assert_eq!(
-        size_of::<StackMut<'_, X509, Borrowed>>(),
+        size_of::<StackMut<'_, Item, Borrowed>>(),
         size_of::<*const stack_st>()
     );
     assert_eq!(
-        size_of::<Option<StackRef<'_, X509, Borrowed>>>(),
+        size_of::<Option<StackRef<'_, Item, Borrowed>>>(),
         size_of::<*const stack_st>()
     );
     assert_eq!(size_of::<Option<FooFullOwned>>(), size_of::<*mut foo_st>());
@@ -161,7 +161,7 @@ fn layout_and_niche() {
 
 // Covariance: a longer borrow is usable where a shorter one is expected, just
 // like `&'a T`.
-fn _covariant<'a>(x: StackRef<'static, X509, Borrowed>) -> StackRef<'a, X509, Borrowed> {
+fn _covariant<'a>(x: StackRef<'static, Item, Borrowed>) -> StackRef<'a, Item, Borrowed> {
     x
 }
 
@@ -172,10 +172,10 @@ fn the_hand_written_seam_reads_and_writes() {
         data: core::ptr::null_mut(),
     }));
 
-    let r: StackRef<'_, X509, Borrowed> = unsafe { StackRef::from_ptr(raw) }.unwrap();
+    let r: StackRef<'_, Item, Borrowed> = unsafe { StackRef::from_ptr(raw) }.unwrap();
     assert_eq!(r.num(), 3);
 
-    let mut m: StackMut<'_, X509, Borrowed> = StackMut(
+    let mut m: StackMut<'_, Item, Borrowed> = StackMut(
         StackRef(unsafe { CBorrowedPtr::new(NonNull::new(raw.cast()).unwrap()) }),
         PhantomData,
     );
@@ -185,7 +185,7 @@ fn the_hand_written_seam_reads_and_writes() {
 
     // `zeroed` builds a value for inline storage; the pointer to it comes from
     // `addr_of_mut!`, never `&mut`.
-    let mut inline: Stack<X509, Borrowed> = Stack::zeroed();
+    let mut inline: Stack<Item, Borrowed> = Stack::zeroed();
     let slot = addr_of_mut!(inline);
     assert_eq!(
         unsafe { addr_of!((*slot.cast::<stack_st>()).num).read() },
@@ -221,7 +221,7 @@ fn owning_handles_hand_out_handles_not_references() {
 static POP_FREE_CALLS: AtomicUsize = AtomicUsize::new(0);
 static ELEM_FREE_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-extern "C" fn x509_free_mock(_p: *mut core::ffi::c_void) {
+extern "C" fn item_free_mock(_p: *mut core::ffi::c_void) {
     ELEM_FREE_CALLS.fetch_add(1, Ordering::SeqCst);
 }
 
@@ -229,11 +229,11 @@ extern "C" fn x509_free_mock(_p: *mut core::ffi::c_void) {
 #[derive(Clone, Copy)]
 pub struct ElemFree(unsafe extern "C" fn(*mut core::ffi::c_void));
 
-// SAFETY: stand-in for `OPENSSL_sk_pop_free(ptr, self.0)` — calls the fn it
+// SAFETY: stand-in for `list_pop_free(ptr, self.0)` — calls the fn it
 // carried once, as for a one-element stack, then reclaims the Box-backed mock
 // allocation exactly once.
-unsafe impl CDrop<Stack<X509, Borrowed>> for ElemFree {
-    unsafe fn c_drop(&self, ptr: NonNull<Stack<X509, Borrowed>>) {
+unsafe impl CDrop<Stack<Item, Borrowed>> for ElemFree {
+    unsafe fn c_drop(&self, ptr: NonNull<Stack<Item, Borrowed>>) {
         POP_FREE_CALLS.fetch_add(1, Ordering::SeqCst);
         // SAFETY: the carried element free accepts any element pointer.
         unsafe { (self.0)(core::ptr::null_mut()) };
@@ -243,7 +243,7 @@ unsafe impl CDrop<Stack<X509, Borrowed>> for ElemFree {
 
 // A hand-written, stateful policy: no `Default`, so the box is built with
 // `from_c_with`, which takes the policy value.
-pub type StackOwned = CBox<Stack<X509, Borrowed>, ElemFree>;
+pub type StackOwned = CBox<Stack<Item, Borrowed>, ElemFree>;
 
 #[test]
 fn stateful_policy_runs_with_runtime_state() {
@@ -255,7 +255,7 @@ fn stateful_policy_runs_with_runtime_state() {
         data: core::ptr::null_mut(),
     }));
     // The free fn is fixed HERE, at the seam — the whole point of the fat owner.
-    let owned = unsafe { StackOwned::from_c_with(raw, ElemFree(x509_free_mock)) }.unwrap();
+    let owned = unsafe { StackOwned::from_c_with(raw, ElemFree(item_free_mock)) }.unwrap();
     assert_eq!(owned.as_ref().num(), 0);
     drop(owned);
 
@@ -351,7 +351,7 @@ fn owned_ptr_layout_thin_vs_fat() {
     );
     // With real state it is genuinely ptr + inline state (here a fn pointer).
     assert_eq!(
-        size_of::<CBox<Stack<X509, Borrowed>, ElemFree>>(),
+        size_of::<CBox<Stack<Item, Borrowed>, ElemFree>>(),
         size_of::<*mut stack_st>() + size_of::<ElemFree>(),
     );
 }

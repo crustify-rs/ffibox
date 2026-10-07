@@ -44,7 +44,10 @@ use core::mem::{ManuallyDrop, MaybeUninit};
 use core::ops::{Bound, RangeBounds};
 use core::ptr::NonNull;
 
-use crate::traits::{CCell, CDispose, CDrop, CDupClone, CLenClone, CLenDrop, CPlainElem};
+use crate::traits::{
+    CAlloc, CAllocZeroed, CCell, CDispose, CDrop, CDupClone, CLenClone, CLenDrop, CNew, CPlainElem,
+    CZeroable,
+};
 
 // ---------------------------------------------------------------------------
 // CBorrowedPtr — the storage behind every generated handle
@@ -374,6 +377,133 @@ impl<T: CCell, D: CDrop<T>> CBox<T, D> {
     }
 }
 
+/// The safe constructors: each goes through the policy that will free the
+/// object, so a box can only be built from its own allocator. They return
+/// `None` when C reports failure, as [`from_raw`](Self::from_raw) does on
+/// null, so translated C maps its `if (!p)` check onto `?`.
+impl<T: CCell, D: CDrop<T>> CBox<T, D> {
+    /// Construct through the policy's zero-argument C constructor
+    /// ([`CNew`]) under `D::default()`; `None` on failure.
+    #[inline]
+    pub fn new() -> Option<Self>
+    where
+        D: CNew<T> + Default,
+    {
+        Self::new_with(D::default())
+    }
+
+    /// As [`new`](Self::new), under `policy`.
+    #[inline]
+    pub fn new_with(policy: D) -> Option<Self>
+    where
+        D: CNew<T>,
+    {
+        let ptr = policy.c_new()?;
+        Some(Self { ptr, policy })
+    }
+
+    /// Allocate an all-zero `T` through the policy's zeroing allocator
+    /// ([`CAllocZeroed`]) under `D::default()`; `None` on failure.
+    #[inline]
+    pub fn new_zeroed() -> Option<Self>
+    where
+        T: CZeroable,
+        D: CAllocZeroed<T> + Default,
+    {
+        Self::new_zeroed_with(D::default())
+    }
+
+    /// As [`new_zeroed`](Self::new_zeroed), under `policy`.
+    #[inline]
+    pub fn new_zeroed_with(policy: D) -> Option<Self>
+    where
+        T: CZeroable,
+        D: CAllocZeroed<T>,
+    {
+        let ptr = policy.c_alloc_zeroed()?;
+        Some(Self { ptr, policy })
+    }
+
+    /// Allocate uninitialised storage through the policy's allocator
+    /// ([`CAlloc`]) under `D::default()`; `None` on failure. C fills it in
+    /// place through that box's `as_c_ptr`, then
+    /// [`assume_init`](CBox::assume_init) promotes it.
+    ///
+    /// There is no safe `write(value)`: a C object is initialised where it
+    /// lives, and a by-value `T` moved in would either be a zeroed one
+    /// ([`new_zeroed`](Self::new_zeroed) builds that in place) or one owning
+    /// resources a storage-only policy would leak.
+    ///
+    /// Dropped before it is filled, the box frees the storage through the
+    /// policy's `CDrop<MaybeUninit<T>>`, which never reads it.
+    #[inline]
+    pub fn new_uninit() -> Option<CBox<MaybeUninit<T>, D>>
+    where
+        D: CAlloc<T> + Default,
+    {
+        Self::new_uninit_with(D::default())
+    }
+
+    /// As [`new_uninit`](Self::new_uninit), under `policy`.
+    #[inline]
+    pub fn new_uninit_with(policy: D) -> Option<CBox<MaybeUninit<T>, D>>
+    where
+        D: CAlloc<T>,
+    {
+        let ptr = policy.c_alloc()?;
+        Some(CBox { ptr, policy })
+    }
+}
+
+/// Storage not yet holding a `T` — a `Box<MaybeUninit<T>, A>`. No handles: the
+/// accessors assume a valid object, so they wait for
+/// [`assume_init`](Self::assume_init).
+///
+/// ```compile_fail,E0599
+/// # use core::{mem::MaybeUninit, ptr::NonNull};
+/// # use ffibox::{define_ctype, CAlloc, CBox, CDrop};
+/// # mod ffi { #[repr(C)] pub struct foo_st { pub x: u32 } }
+/// # define_ctype!(Foo, FooRef, FooMut, ffi::foo_st);
+/// # struct Heap;
+/// # unsafe impl CDrop<Foo> for Heap { unsafe fn c_drop(&self, _: NonNull<Foo>) {} }
+/// # unsafe impl CDrop<MaybeUninit<Foo>> for Heap {
+/// #     unsafe fn c_drop(&self, _: NonNull<MaybeUninit<Foo>>) {}
+/// # }
+/// # unsafe impl CAlloc<Foo> for Heap {
+/// #     fn c_alloc(&self) -> Option<NonNull<MaybeUninit<Foo>>> { None }
+/// # }
+/// let b = CBox::<Foo, Heap>::new_uninit_with(Heap).unwrap();
+/// let _ = b.as_ref(); // no getters on uninitialised storage
+/// ```
+impl<T: CCell, D: CAlloc<T>> CBox<MaybeUninit<T>, D> {
+    /// Treat the storage as holding a `T`, after C filled it through
+    /// [`as_c_ptr`](Self::as_c_ptr).
+    ///
+    /// # Safety
+    ///
+    /// The storage must hold a `T` that every safe operation on it accepts —
+    /// the getters and setters, the safe wrappers taking a `T`, and the
+    /// policy's [`c_drop`](CDrop::c_drop).
+    #[inline]
+    pub unsafe fn assume_init(self) -> CBox<T, D> {
+        // SAFETY: each field is read out exactly once and `self` is not
+        // dropped.
+        let (ptr, policy) = unsafe { disarm(self, |o| (o.ptr, core::ptr::read(&o.policy))) };
+        CBox {
+            ptr: ptr.cast(),
+            policy,
+        }
+    }
+
+    /// The storage as the C type's pointer, for a C routine to fill in place.
+    /// Ownership is retained.
+    #[inline]
+    #[must_use]
+    pub fn as_c_ptr(&mut self) -> *mut T::C {
+        self.ptr.as_ptr().cast()
+    }
+}
+
 impl<T, D: CDrop<T>> Drop for CBox<T, D> {
     #[inline]
     fn drop(&mut self) {
@@ -389,7 +519,7 @@ impl<T: CCell, D: CDupClone<T> + Clone> CBox<T, D> {
     /// infallible. Use this where the C code checked the `*_dup` result:
     ///
     /// ```ignore
-    /// let copy = pkey.try_clone().ok_or(Error::DupFailed)?;
+    /// let copy = key.try_clone().ok_or(Error::DupFailed)?;
     /// ```
     #[inline]
     pub fn try_clone(&self) -> Option<Self> {
@@ -935,8 +1065,8 @@ impl<T: Copy, S: CLenClone> CVec<T, S> {
     /// `S::default()`; `None` if the copy failed. An empty `src` gives an
     /// empty buffer, without calling C.
     ///
-    /// The way Rust hands C a buffer it will free: `CVec::<u8, AvFree>::from_slice(b)`
-    /// is `av_memdup(b, len)`. Element types aligned beyond
+    /// The way Rust hands C a buffer it will free: `CVec::<u8, LibFree>::from_slice(b)`
+    /// is `lib_memdup(b, len)`. Element types aligned beyond
     /// [`S::ALIGN`](CLenClone::ALIGN), and zero-sized ones, are rejected at
     /// compile time.
     ///
@@ -1058,12 +1188,15 @@ unsafe impl<T: Sync, S: CLenDrop + Sync> Sync for CVec<T, S> {}
 /// alone.
 ///
 /// ```ignore
-/// define_ctype!(ChannelLayout, ChannelLayoutRef, ChannelLayoutMut, ffi::AVChannelLayout);
+/// define_ctype!(Params, ParamsRef, ParamsMut, ffi::params_st);
 /// #[derive(Clone, Copy, Debug, Default)]
-/// pub struct LayoutUninit;
-/// impl_cdispose!(LayoutUninit, ChannelLayout, ffi::av_channel_layout_uninit);
+/// pub struct ParamsUninit;
+/// impl_cdispose!(ParamsUninit, Params, ffi::params_uninit);
+/// // SAFETY: zeroed params are the empty set, which every routine and
+/// // `params_uninit` accept.
+/// unsafe impl CZeroable for Params {}
 ///
-/// let mut layout: CVal<ChannelLayout, LayoutUninit> = CVal::new(ChannelLayout::zeroed());
+/// let mut params: CVal<Params, ParamsUninit> = CVal::new(Params::zeroed());
 /// ```
 ///
 /// A resource-free struct needs no `CVal`: hold the layout type itself. A

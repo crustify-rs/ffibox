@@ -11,6 +11,8 @@ Wrapping a C API in Rust means re-homing C's ownership and lifecycle
 conventions into RAII. The recurring shapes:
 
 - A C-allocated object with a destructor (`free`), and maybe a copy (`dup`).
+- A constructor or allocator (`foo_alloc`, `malloc`, `calloc`) whose result
+  must be released by its paired free.
 - A refcounted object shared by several holders (`up_ref` / `unref`), maybe
   with a C lock over the state they mutate.
 - Types with multiple or runtime-conditional destructors.
@@ -34,6 +36,9 @@ several counted references and hands out the shared handle, the exclusive one
 only when the count proves it sole, and — for an object with a C lock — a
 `CGuard` whose `FooLocked<'a>` handle reaches the state that lock protects; and
 `CVal<Foo, P>` holds the object inline and disposes its resources on drop.
+A policy that also constructs gives `CBox` and `CArc` safe constructors that
+allocate through it, so a safely built owner is always freed by the routine
+paired with its allocator.
 Strings, buffers and borrowed runs get their own types. [Section 1](#1-the-types-you-get) lists them all,
 [section 2](#2-policies--what-teardown-means) covers policies, and
 [section 3](#3-decision-procedure) walks from a C declaration to the type it
@@ -95,8 +100,87 @@ let q = p.clone();           // point_dup
 // `point_free` runs twice here.
 ```
 
-`CBox` is a foreign type, so constructors go on the local `Foo` (or in free
-functions) rather than in an `impl CBox<Foo, _>` block.
+`CBox` is a foreign type, so constructors that take arguments go on the local
+`Foo` (or in free functions) rather than in an `impl CBox<Foo, _>` block. A
+zero-argument constructor can instead go on the policy, as the next example
+shows.
+
+### Constructed by its policy — `CNew` / `CAlloc` / `CAllocZeroed`
+
+```rust,no_run
+use core::{mem::MaybeUninit, ptr::NonNull};
+use ffibox::{
+    define_ctype, impl_cdrop, CAlloc, CAllocZeroed, CBox, CCell, CDrop, CNew, CZeroable,
+};
+
+mod sys {
+    use core::ffi::c_void;
+    #[repr(C)] pub struct frame_st { pub format: i32 }
+    #[repr(C)] pub struct rational_st { pub num: i32, pub den: i32 }
+    extern "C" {
+        pub fn frame_alloc() -> *mut frame_st;       // sets `format = -1`
+        pub fn frame_free(f: *mut frame_st);
+        pub fn rational_init(r: *mut rational_st, num: i32, den: i32);
+        pub fn mem_alloc(n: usize) -> *mut c_void;   // 16-byte aligned
+        pub fn mem_allocz(n: usize) -> *mut c_void;  // zero-filled
+        pub fn mem_free(p: *mut c_void);
+    }
+}
+
+// A type's own zero-argument constructor, paired with its free.
+define_ctype!(Frame, FrameRef, FrameMut, sys::frame_st);
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameFree;
+impl_cdrop!(FrameFree, Frame, sys::frame_free);
+// SAFETY: a fresh, initialised frame, which `frame_free` releases.
+unsafe impl CNew<Frame> for FrameFree {
+    fn c_new(&self) -> Option<NonNull<Frame>> {
+        NonNull::new(unsafe { sys::frame_alloc() }.cast())
+    }
+}
+
+let frame = CBox::<Frame, FrameFree>::new().unwrap();   // frame_alloc
+
+// A generic allocator: one hand-written policy for every type. Its free never
+// reads the object, so one `CDrop<T>` impl also covers `MaybeUninit<T>`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MemFree;
+// SAFETY: releases `mem_alloc` / `mem_allocz` storage once, without reading it.
+unsafe impl<T> CDrop<T> for MemFree {
+    unsafe fn c_drop(&self, p: NonNull<T>) {
+        unsafe { sys::mem_free(p.as_ptr().cast()) }
+    }
+}
+// SAFETY: fresh storage of `T`'s size; over-aligned types are rejected.
+unsafe impl<T: CCell> CAlloc<T> for MemFree {
+    fn c_alloc(&self) -> Option<NonNull<MaybeUninit<T>>> {
+        const { assert!(core::mem::align_of::<T>() <= 16) };
+        NonNull::new(unsafe { sys::mem_alloc(core::mem::size_of::<T>()) }.cast())
+    }
+}
+// SAFETY: as above, zero-filled.
+unsafe impl<T: CZeroable> CAllocZeroed<T> for MemFree {
+    fn c_alloc_zeroed(&self) -> Option<NonNull<T>> {
+        const { assert!(core::mem::align_of::<T>() <= 16) };
+        NonNull::new(unsafe { sys::mem_allocz(core::mem::size_of::<T>()) }.cast())
+    }
+}
+
+define_ctype!(Rational, RationalRef, RationalMut, sys::rational_st);
+// SAFETY: 0/0 is a value every accessor accepts; nothing reads it as a divisor.
+unsafe impl CZeroable for Rational {}
+
+let zero = CBox::<Rational, MemFree>::new_zeroed().unwrap();    // mem_allocz
+let mut slot = CBox::<Rational, MemFree>::new_uninit().unwrap(); // mem_alloc
+unsafe { sys::rational_init(slot.as_c_ptr(), 1, 2) };           // C fills in place
+let half = unsafe { slot.assume_init() };   // CBox<Rational, MemFree>
+// `mem_free` runs for both, and `frame_free` for `frame`.
+```
+
+`Frame` is not `CZeroable`, so `CBox::<Frame, MemFree>::new_zeroed()` does not
+compile: its C constructor sets a non-zero default that a zeroed frame would
+lack. Every constructor returns `None` when C reports failure. `CArc` has the
+same `new` / `new_zeroed`, and a filled `CBox` converts with `.into()`.
 
 ### A shared object — `CArc`, and its lock
 
@@ -218,7 +302,7 @@ g.as_locked().set_count(n + 1);          // registry_unlock when `g` drops
 A `void *` crossing FFI is never a [`CBox`] or [`CArc`]: both own only
 `define_ctype!` layout types. What the payload really is decides the owner:
 
-- **bytes** (an arena block, a codec buffer) → `CVec<u8, P>` (or
+- **bytes** (an arena block, an I/O buffer) → `CVec<u8, P>` (or
   `CVec<MaybeUninit<u8>, P>` before it is filled), released through `CLenDrop`;
 - **a C struct the caller knows** → `CBox<Foo, P>`, or `CArc<Foo, P>` when
   counted, after `define_ctype!`.
@@ -259,7 +343,7 @@ let buf = unsafe { buf.assume_init() }; // CVec<u8, ArenaFree>
 ### By value — `CVal`
 
 ```rust,no_run
-use ffibox::{define_ctype, impl_cdispose, CVal};
+use ffibox::{define_ctype, impl_cdispose, CVal, CZeroable};
 
 mod sys {
     #[repr(C)] pub struct buf_st { pub ptr: *mut u8, pub len: usize }
@@ -276,6 +360,8 @@ pub struct BufDispose;
 impl_cdispose!(BufDispose, Buf, sys::buf_dispose);
 // Rust owns the struct BY VALUE; C owns what its fields point at.
 pub type BufVal = CVal<Buf, BufDispose>;
+// SAFETY: a null, empty buffer is valid for every accessor and `buf_dispose`.
+unsafe impl CZeroable for Buf {}
 
 let mut b = BufVal::new(Buf::zeroed());
 let mut handle = b.as_mut();      // BufMut<'_>, as on a CBox
@@ -289,6 +375,8 @@ impl RationalMut<'_> {
         unsafe { core::ptr::addr_of_mut!((*self.as_mut_ptr()).num).write(v) }
     }
 }
+// SAFETY: 0/0 is a value every accessor accepts; nothing reads it as a divisor.
+unsafe impl CZeroable for Rational {}
 let mut q = Rational::zeroed();
 q.as_mut().set_num(1);
 ```
@@ -339,10 +427,10 @@ rather than repeating it.
 
 | Scope | Type | From | Role |
 |-------|------|------|------|
-| per C type | `Foo` | `define_ctype!` | the layout, the C struct's size: `#[repr(transparent)]` over `ffi::foo`, embeds by value in a `#[repr(C)]` mirror, and is what a `CBox` points at. Never referenced over C-owned memory. Also the value itself when it owns no resources (`AVRational`). |
+| per C type | `Foo` | `define_ctype!` | the layout, the C struct's size: `#[repr(transparent)]` over `ffi::foo`, embeds by value in a `#[repr(C)]` mirror, and is what a `CBox` points at. Never referenced over C-owned memory. Also the value itself when it owns no resources (a rational `{ num, den }`). |
 | | `FooRef<'a>` | `define_ctype!` | shared borrow, one pointer wide, `Copy`; the getters |
 | | `FooMut<'a>` | `define_ctype!` | exclusive borrow, move-only; the setters, and the getters through `as_ref()` |
-| owners | `CBox<Foo, P>` | ffibox | the sole owner of an object behind a pointer, released by `P` on drop; `Clone` when `P` deep-copies |
+| owners | `CBox<Foo, P>` | ffibox | the sole owner of an object behind a pointer, released by `P` on drop; `Clone` when `P` deep-copies; built safely by `new` / `new_zeroed` / `new_uninit` when `P` constructs |
 | | `CVal<Foo, P>` | ffibox | an owned value held inline, its resources disposed by `P` on drop |
 | | `CStrBox<P>` | ffibox | an owned NUL-terminated `char *`; read-only `CStr` / `str` / byte views |
 | | `CVec<T, P>` | ffibox | an owned `(ptr, len)` array, NULL when empty; `&[T]` for plain elements, `CSlice` for wrapped C objects; `from_slice` copies a Rust slice into `P`'s allocator |
@@ -382,6 +470,12 @@ contract — see [Under the hood](#4-under-the-hood-hand-written-wrappers).
   `as_c_ptr` speak the C type, so C interop is cast-free. The handles' seams
   (`from_ptr`, `as_ptr`, `as_mut_ptr`, the `void *` pair) are `pub(crate)`
   in the crate that invokes `define_ctype!`.
+- **Constructing through the policy is safe.** `new`, `new_zeroed` and
+  `new_uninit` (each with a `_with(policy)` form) allocate through the routine
+  the owner frees with, and return `None` when C fails, as `from_raw` does on
+  NULL. The one `unsafe` step is `assume_init`, which promotes storage C has
+  filled through `as_c_ptr`. There is no safe `write(value)`: a C object is
+  initialised where it lives.
 - **`from_raw*` adopts ownership; `from_ptr*` borrows.** Pick the verb by what
   you return.
 - **Thread safety is opt-in for wrapped C types, opt-out for raw memory.**
@@ -394,8 +488,8 @@ contract — see [Under the hood](#4-under-the-hood-hand-written-wrappers).
   Owners that never name a `Foo` — `CStrBox` and a `CVec` of
   plain elements (`CVec<u8, _>`) — follow their policy alone, and a unit-struct
   policy is `Send + Sync`, so **they cross threads by default**. That is right
-  for an allocator any thread may free into (`free`, `OPENSSL_free`,
-  `av_free`); for one that must free on the allocating thread, opt out by
+  for an allocator any thread may free into (`free`, a library's
+  `lib_free`); for one that must free on the allocating thread, opt out by
   giving the policy a `PhantomData<*const ()>` field.
 
 ---
@@ -419,6 +513,10 @@ carries `PhantomData<*const ()>` instead (see the conventions in
 | `CLenDrop` | `c_drop_len` — a buffer free, given the byte length | `impl_clendrop!(P, f)` | `CVec` |
 | `CLenClone: CLenDrop` | `c_clone_len` — a buffer memdup (`T: Copy` only) from any readable source; `ALIGN` (default 1) bounds the element types it can copy | `impl_clenclone!(P, f)`, `impl_clenclone!(P, f, align = 16)` | `CVec`'s `Clone`, `CVec::from_slice`, `CSlice::to_cvec` |
 | `CDispose<T>` | `c_dispose` — `*_uninit` / `*_clear` on a value | `impl_cdispose!(P, Foo, f)` | `CVal` |
+| `CNew<T>: CDrop<T>` | `c_new` — a zero-argument `*_alloc` / `*_new` | by hand | `CBox::new`, `CArc::new` |
+| `CAlloc<T>: CDrop<T> + CDrop<MaybeUninit<T>>` | `c_alloc` — uninitialised storage (`malloc`); the free must not read it | by hand | `CBox::new_uninit` |
+| `CAllocZeroed<T>: CDrop<T>` | `c_alloc_zeroed` — zero-filled storage (`calloc`) | by hand | `CBox::new_zeroed`, `CArc::new_zeroed` |
+| `CZeroable`, on `Foo` | all-zero is valid for every accessor, safe wrapper and paired teardown; provides `Foo::zeroed()` | `unsafe impl CZeroable for Foo {}` | `new_zeroed`, `Foo::zeroed()` |
 | `CGuarded`, on `Foo` | `c_lock` / `c_unlock`; the `Locked` handle; the `Scope` it covers | `impl_cguarded!(Foo, FooLocked, lock = f, unlock = g)`; `…, ok = |r| r == 1`; `impl_cguarded!(Foo, all, …)` for `CGuardedAll` | `CArc::lock`, `CGuardedRef::lock` |
 
 **Because the policy is a type parameter, an owner cannot exist without a
@@ -474,16 +572,34 @@ adapter passed by path. Teardown is unconditional: a gate that suppresses it on
 some paths folds into the routine itself.
 
 **Runtime-state policies.** When teardown needs a value chosen at the wrapping
-site (`OPENSSL_sk_pop_free(stack, elem_free_fn)`), write the policy by hand — a
+site (`list_pop_free(list, elem_free_fn)`), write the policy by hand — a
 struct holding the state, implementing `CDrop<T>` (and `CDupClone<T>` + `Clone`
 to clone). Without `Default` there is no `from_raw(ptr)`; adopt with
 `from_raw_with(ptr, ElemFree(f))` and release with `into_raw_with()`. The box
 then carries the state and is no longer pointer-sized.
 
-**The construction phase.** An allocation Rust is still filling in is held as
-`CBox<Foo, StorageFree>` — a hand-written policy that frees the storage and
-touches no field — then promoted with `with_policy(FooFree)`. Bail with `?`
-before promoting and only the storage is freed.
+**Construction goes through the policy too.** Bind a constructor to the policy
+and the owner's type pairs allocation with teardown, just as it pairs `*_dup`
+with `*_free`. A safely built `CBox<Foo, P>` was allocated by `P`, and `from_raw`
+is the only way around that, which is why it is `unsafe`.
+
+- `CNew` is a type's own zero-argument constructor (`frame_alloc`).
+  Constructors that take arguments stay inherent functions on `Foo` returning a
+  `CBox<Foo, P>`, because a trait signature cannot carry their parameters.
+- `CAllocZeroed` asks for zero-filled storage and needs `Foo: CZeroable`. That
+  marker means all-zero is a state every safe accessor, every safe wrapper and
+  the paired teardown accept, not merely a valid Rust value. Leave it off a
+  type whose C constructor sets non-zero defaults.
+- `CAlloc` gives uninitialised storage, which C fills through `as_c_ptr` and
+  the caller promotes with `unsafe assume_init`. Because a box dropped before
+  that point frees through `CDrop<MaybeUninit<Foo>>`, the policy's free must not
+  read the object, so a destructor like `frame_free` cannot implement it.
+
+**The construction phase.** An allocation that is still being filled in is held
+under a storage-only policy, either `new_uninit` or a hand-written
+`CBox<Foo, StorageFree>`, and then promoted with `with_policy(FooFree)` once it
+satisfies the full destructor. Bail with `?` before promoting and only the
+storage is freed.
 
 ---
 
@@ -529,7 +645,8 @@ release it? This is about who *releases* the object, not who allocated it — a
   failure.
 - **One object held inline** — a local, a field, an array element, with no
   pointer of its own:
-  - owns no resources → the `Foo` itself;
+  - owns no resources → the `Foo` itself (`Foo::zeroed()` when it is
+    `CZeroable`, or a wrapper constructor that has C fill a local);
   - owns resources and stands alone → `CVal<Foo, P>`;
   - embedded in a parent C struct → a bare `Foo`, disposed by the parent's
     teardown (a `Drop` on it would dispose twice);
@@ -545,6 +662,8 @@ release it? This is about who *releases* the object, not who allocated it — a
 | C routines | Policy |
 |------------|--------|
 | `foo_free` | `impl_cdrop!` |
+| `foo_alloc()` + `foo_free` | `impl_cdrop!` + a hand-written `CNew` → `CBox::new()` |
+| `malloc` / `calloc` + `free`, for any type | a generic hand-written `CDrop<T>` + `CAlloc<T>` / `CAllocZeroed<T>` |
 | `foo_free` + `foo_dup` | `impl_cdrop!` + `impl_cdupclone!` |
 | `foo_unref`, held as the only reference | `impl_cdrop!` with the down-ref; no `Clone` |
 | `foo_unref` + `foo_up_ref`, shared, read-only | `impl_cdrop!` + `impl_crefclone!` → `CArc` |
@@ -553,7 +672,7 @@ release it? This is about who *releases* the object, not who allocated it — a
 | a global, never freed, under one C lock | no policy: `impl_cguarded!(Foo, all, …)` → `CGuardedRef<'static, Foo>` |
 | a counted reference with no up_ref | `impl_cdrop!` alone → `CArc` without `Clone` |
 | teardown needs runtime state | a hand-written policy; adopt with `from_raw_with` |
-| built in Rust, not by a C constructor | storage-only policy → `with_policy` |
+| built in place, not by a C constructor | `CAlloc` → `new_uninit` → `assume_init`, then `with_policy` if a fuller destructor takes over |
 | destructor of another shape | an `unsafe fn` adapter, passed by path |
 
 An owned pointer crosses the FFI boundary on the owner's raw seam: `into_raw`

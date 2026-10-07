@@ -7,13 +7,15 @@
 
 use core::ptr::{addr_of, addr_of_mut, NonNull};
 
-use ffibox::{define_ctype, CSlice, CSliceMut};
+use ffibox::{define_ctype, CSlice, CSliceMut, CZeroable as _};
 
 #[repr(C)]
 pub struct pt_st {
     x: i32,
 }
 define_ctype!(Pt, PtRef, PtMut, pt_st);
+// SAFETY: any `x` is valid, zero included.
+unsafe impl ffibox::CZeroable for Pt {}
 
 impl PtRef<'_> {
     fn x(&self) -> i32 {

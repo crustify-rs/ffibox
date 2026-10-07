@@ -75,7 +75,10 @@ use core::ptr::NonNull;
 use crate::refs::{abort_process, disarm, handle_mut, handle_ref, CBorrowedPtr, CBox};
 #[allow(unused_imports)] // doc links
 use crate::traits::LockWhole;
-use crate::traits::{CCell, CDrop, CDupClone, CGuarded, CGuardedAll, CRefClone, LockFields};
+use crate::traits::{
+    CAllocZeroed, CCell, CDrop, CDupClone, CGuarded, CGuardedAll, CNew, CRefClone, CZeroable,
+    LockFields,
+};
 
 // ---------------------------------------------------------------------------
 // CArc<T, D> — a shared reference to a refcounted C object
@@ -374,6 +377,49 @@ impl<T: CCell, D: CDrop<T>> From<CBox<T, D>> for CArc<T, D> {
         // owned one reference.
         let ptr = unsafe { NonNull::new_unchecked(ptr) };
         Self { ptr, policy }
+    }
+}
+
+/// The safe constructors, as [`CBox`]'s: the fresh object's one reference
+/// becomes the first `CArc`. Uninitialised storage is built as a
+/// [`CBox::new_uninit`], filled, and converted with `.into()`.
+impl<T: CCell, D: CDrop<T>> CArc<T, D> {
+    /// [`CBox::new`], shared; `None` on failure.
+    #[inline]
+    pub fn new() -> Option<Self>
+    where
+        D: CNew<T> + Default,
+    {
+        CBox::new().map(Self::from)
+    }
+
+    /// [`CBox::new_with`], shared.
+    #[inline]
+    pub fn new_with(policy: D) -> Option<Self>
+    where
+        D: CNew<T>,
+    {
+        CBox::new_with(policy).map(Self::from)
+    }
+
+    /// [`CBox::new_zeroed`], shared.
+    #[inline]
+    pub fn new_zeroed() -> Option<Self>
+    where
+        T: CZeroable,
+        D: CAllocZeroed<T> + Default,
+    {
+        CBox::new_zeroed().map(Self::from)
+    }
+
+    /// [`CBox::new_zeroed_with`], shared.
+    #[inline]
+    pub fn new_zeroed_with(policy: D) -> Option<Self>
+    where
+        T: CZeroable,
+        D: CAllocZeroed<T>,
+    {
+        CBox::new_zeroed_with(policy).map(Self::from)
     }
 }
 
