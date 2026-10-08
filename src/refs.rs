@@ -1041,13 +1041,40 @@ impl<T, S: CLenDrop> Drop for CVec<T, S> {
 impl<T: Copy, S: CLenClone + Clone> CVec<T, S> {
     /// Byte copy into a fresh allocation through the policy; `None` if the C
     /// copy failed. A NULL buffer clones to another, without calling C.
+    ///
+    /// The copy is only as aligned as [`S::ALIGN`](CLenClone::ALIGN) vouches
+    /// for, so element types aligned beyond it are rejected at compile time,
+    /// as by [`from_slice`](Self::from_slice) — even though the source buffer,
+    /// adopted through [`from_raw_parts`](Self::from_raw_parts), was aligned:
+    ///
+    /// ```compile_fail,E0080
+    /// # use core::ptr::NonNull;
+    /// # #[derive(Clone)]
+    /// # struct Bytes;
+    /// # unsafe impl ffibox::CLenDrop for Bytes { unsafe fn c_drop_len(&self, _: *mut u8, _: usize) {} }
+    /// # unsafe impl ffibox::CLenClone for Bytes {
+    /// #     unsafe fn c_clone_len(&self, _: *mut u8, _: usize) -> Option<NonNull<u8>> { None }
+    /// # }
+    /// // `Bytes` vouches for byte alignment only, so a `u32` copy is refused.
+    /// fn copy(v: &ffibox::CVec<u32, Bytes>) -> Option<ffibox::CVec<u32, Bytes>> {
+    ///     v.try_clone()
+    /// }
+    /// # let _ = copy(&ffibox::CVec::empty_with(Bytes));
+    /// ```
     #[inline]
     pub fn try_clone(&self) -> Option<Self> {
+        const {
+            assert!(
+                core::mem::align_of::<T>() <= S::ALIGN,
+                "the policy's allocator cannot align T"
+            );
+        }
         let Some(src) = self.ptr else {
             return Some(Self::empty_with(self.policy.clone()));
         };
         // SAFETY: `byte_len()` live bytes at `src`; per `CLenClone` a `Some`
-        // is a fresh copy the policy releases.
+        // is a fresh copy the policy releases, aligned to
+        // `S::ALIGN >= align_of::<T>()`.
         let ptr = unsafe {
             self.policy
                 .c_clone_len(src.as_ptr().cast(), self.byte_len())
