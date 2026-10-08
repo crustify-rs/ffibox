@@ -1496,30 +1496,33 @@ impl<'a, T: CCell> CSlice<'a, T> {
 /// pointer and may write through it, and no Rust lifetime constrains that. So
 /// the element type is not what decides between `&[T]` and a `CSlice` — the
 /// owner is.
-impl<'a, T: CPlainElem> CSlice<'a, T> {
+/// A run of `Copy` elements — plain values or wrapped C objects whose bytes
+/// own nothing — copies into an owner of its own, as a `CVec` of them clones.
+impl<'a, T: Copy> CSlice<'a, T> {
     /// Copy the run into a fresh buffer of `S`'s allocator, under
     /// `S::default()`; `None` if the copy failed.
     ///
     /// The bytes are read straight from the C object, never through a `&[T]`,
-    /// so this is sound while C keeps its pointer to the run.
+    /// so this is sound while C keeps its pointer to the run. `T: Copy` is
+    /// what makes a byte copy a whole value, as it does for
+    /// [`CVec::clone`](crate::CVec::clone): a wrapped C object that owns
+    /// nothing (a `{ num, den }` pair) qualifies as well as a plain integer.
     #[inline]
-    pub fn to_cvec<S: CLenClone + Default>(&self) -> Option<CVec<T, S>>
-    where
-        T: Copy,
-    {
+    pub fn to_cvec<S: CLenClone + Default>(&self) -> Option<CVec<T, S>> {
         self.to_cvec_with(S::default())
     }
 
     /// As [`to_cvec`](Self::to_cvec), under `policy`.
     #[inline]
-    pub fn to_cvec_with<S: CLenClone>(&self, policy: S) -> Option<CVec<T, S>>
-    where
-        T: Copy,
-    {
-        // SAFETY: a `CSlice` addresses `len` initialised `T` live for `'a`.
+    pub fn to_cvec_with<S: CLenClone>(&self, policy: S) -> Option<CVec<T, S>> {
+        // SAFETY: a `CSlice` addresses `len` initialised `T` live for `'a`,
+        // which `copy_run` only reads; `T: Copy` makes the byte copy `len`
+        // whole values.
         unsafe { copy_run(self.ptr.as_ptr(), self.len, policy) }
     }
+}
 
+impl<'a, T: CPlainElem> CSlice<'a, T> {
     /// Copy element `i` out; `None` if out of range.
     #[inline]
     #[must_use]
