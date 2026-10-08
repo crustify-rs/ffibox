@@ -6,7 +6,7 @@
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use ffibox::{impl_clenclone, impl_clendrop, CLenClone, CLenDrop, CSlice, CVec};
+use ffibox::{define_ctype, impl_clenclone, impl_clendrop, CLenClone, CLenDrop, CSlice, CVec};
 
 const ALIGN: usize = 16;
 
@@ -107,6 +107,67 @@ fn to_cvec_copies_a_borrowed_run_out_of_c_memory() {
         .to_cvec::<Aligned>()
         .unwrap()
         .is_empty());
+}
+
+/// A C struct that owns nothing: a wrapped C object whose bytes are the
+/// whole value, so a run of them copies as a run of integers does.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct rational_st {
+    pub num: i32,
+    pub den: i32,
+}
+
+define_ctype!(
+    #[derive(Clone, Copy)]
+    Rational,
+    RationalRef,
+    RationalMut,
+    rational_st
+);
+
+impl RationalRef<'_> {
+    fn parts(&self) -> (i32, i32) {
+        // SAFETY: a read of the live, initialised `rational_st` the handle
+        // addresses.
+        unsafe { ((*self.as_ptr()).num, (*self.as_ptr()).den) }
+    }
+}
+
+#[test]
+fn to_cvec_copies_a_borrowed_run_of_wrapped_copy_objects() {
+    // A C object's array of structs (a codec's supported frame rates), seen
+    // through per-element handles because `&[Rational]` would cover C memory.
+    let mut table = [
+        rational_st {
+            num: 24000,
+            den: 1001,
+        },
+        rational_st { num: 25, den: 1 },
+        rational_st { num: 0, den: 0 },
+    ];
+    let c_ptr = table.as_mut_ptr();
+    // SAFETY: `table` holds three initialised structs, which `Rational`
+    // mirrors transparently, outliving the view.
+    let run = unsafe { CSlice::from_raw_parts(NonNull::new(c_ptr.cast::<Rational>()).unwrap(), 3) };
+    let v: CVec<Rational, Aligned> = run.to_cvec().unwrap();
+    // C writes through the pointer it kept; the copy is unaffected.
+    // SAFETY: in bounds, and no reference covers `table`.
+    unsafe { (*c_ptr.add(0)).num = 30000 };
+    let parts: Vec<(i32, i32)> = v.as_handles().iter().map(|r| r.parts()).collect();
+    assert_eq!(parts, [(24000, 1001), (25, 1), (0, 0)]);
+    assert_eq!(run.get(0).unwrap().parts(), (30000, 1001));
+
+    let tail: CVec<Rational, Aligned> = run.slice(1..).unwrap().to_cvec_with(Aligned).unwrap();
+    assert_eq!(tail.as_handles().get(0).unwrap().parts(), (25, 1));
+    assert!(run
+        .slice(3..)
+        .unwrap()
+        .to_cvec::<Aligned>()
+        .unwrap()
+        .is_empty());
+    // The copy clones as any `CVec` of `Copy` elements does.
+    assert_eq!(v.clone().len(), 3);
 }
 
 #[test]
