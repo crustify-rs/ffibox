@@ -808,7 +808,7 @@ fn mock_array<T: Copy>(items: &[T]) -> *mut T {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MockVecFree;
 impl_clendrop!(MockVecFree, mock_vec_free);
-impl_clenclone!(MockVecFree, mock_memdup);
+impl_clenclone!(MockVecFree, mock_memdup, align = VEC_ALIGN);
 /// A buffer from the mock allocator.
 pub type MockVec<T> = CVec<T, MockVecFree>;
 

@@ -24,8 +24,11 @@ unsafe impl CLenDrop for Count {
     }
 }
 // SAFETY: never returns; only empty buffers are cloned here, and those must
-// not reach C.
+// not reach C. So it returns no allocation, and every one it returns is
+// aligned for any element type these tests clone.
 unsafe impl CLenClone for Count {
+    const ALIGN: usize = 8;
+
     unsafe fn c_clone_len(&self, _: *mut u8, _: usize) -> Option<NonNull<u8>> {
         unreachable!("an empty buffer clones without calling C")
     }
