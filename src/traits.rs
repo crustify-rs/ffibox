@@ -132,6 +132,14 @@ pub unsafe trait CDupClone<T>: CDrop<T> {
 ///
 /// - A `true` from `c_up_ref` must mean the count was actually incremented,
 ///   so the object owes one more `c_drop` of this policy (or a clone of it).
+/// - The count must never wrap. Safe code can clone an arc and leak the clone
+///   (`mem::forget`) as often as it likes, each leak owing a `c_drop` that
+///   never comes, so `true` must stay truthful after any number of them:
+///   either `c_up_ref` returns `false` before the count would wrap (the C
+///   routine checks), or the count is too wide to wrap within a process's
+///   lifetime (64 bits). An unchecked 32-bit count (`unsigned int`, or
+///   `uintptr_t` on a 32-bit target) wraps after 2^32 leaked clones, within
+///   seconds, and the next down-ref frees an object other references hold.
 /// - A `false` from `c_up_ref` must mean the C routine failed and nothing
 ///   changed.
 /// - Neither method may invalidate `ptr`.
