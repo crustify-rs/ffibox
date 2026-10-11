@@ -483,8 +483,10 @@ macro_rules! impl_cdupclone_str {
 /// # Safety
 ///
 /// The macro is safe to invoke but emits an `unsafe impl`. You assert that the
-/// up_ref increments the reference count of a live object, and — with `ok` —
-/// that it changes nothing when `ok` rejects its return value. A `sole`
+/// up_ref increments the reference count of a live object, that the count
+/// cannot wrap however many clones safe code leaks (it is 64 bits wide, or
+/// the up_ref fails first, under `ok`), and — with `ok` — that it changes
+/// nothing when `ok` rejects its return value. A `sole`
 /// routine must meet `c_is_sole_owner`'s contract: an Acquire read of a count
 /// that covers every reference.
 #[macro_export]
