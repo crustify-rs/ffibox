@@ -1,0 +1,42 @@
+# ffibox's FFI seam: the fns that convert between its safe owners, views and
+# handles and C pointers, and the unsafe lifecycle hooks its traits fix. One
+# exact fn name per line. `crustify scan-unsafe --seams` reads this file.
+as_ptr
+as_mut_ptr
+as_c_ptr
+as_non_null
+as_elem_ptr
+as_mut_elem_ptr
+as_void_ptr
+as_mut_void_ptr
+from_ptr
+from_void_ptr
+ref_from_ptr
+mut_from_ptr
+ref_from_void_ptr
+mut_from_void_ptr
+from_raw
+from_raw_with
+from_raw_parts
+from_raw_parts_with
+from_raw_parts_or_empty
+from_raw_parts_or_empty_with
+from_c
+from_c_with
+into_raw
+into_raw_with
+into_raw_parts
+into_raw_parts_with
+into_c
+c_alloc
+c_alloc_zeroed
+c_new
+c_drop
+c_drop_len
+c_dup
+c_clone_len
+c_up_ref
+c_is_sole_owner
+c_lock
+c_unlock
+c_dispose
