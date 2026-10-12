@@ -469,7 +469,11 @@ contract — see [Under the hood](#4-under-the-hood-hand-written-wrappers).
   owners' `from_raw` / `into_raw` / `as_ptr` speak the Rust-side pointee; `CBox`'s `from_c` / `into_c` /
   `as_c_ptr` speak the C type, so C interop is cast-free. The handles' seams
   (`from_ptr`, `as_ptr`, `as_mut_ptr`, the `void *` pair) are `pub(crate)`
-  in the crate that invokes `define_ctype!`.
+  in the crate that invokes `define_ctype!`. Their inbound half is also on
+  `CCell` (`ref_from_ptr`, `mut_from_ptr` and the `void *` twins), so generic
+  code over `T: CCell` can borrow a pointer C gives it; those are `unsafe` and
+  public wherever the wrapper type is, and the handles' `from_ptr` forward to
+  them.
 - **Constructing through the policy is safe.** `new`, `new_zeroed` and
   `new_uninit` (each with a `_with(policy)` form) allocate through the routine
   the owner frees with, and return `None` when C fails, as `from_raw` does on
@@ -623,8 +627,9 @@ release it? This is about who *releases* the object, not who allocated it — a
   - an out-parameter slot → `&'a mut MaybeUninit<T>` from
     `ptr.cast::<MaybeUninit<T>>().as_mut()`; no ffibox type;
   - a `void *` → if it is really a `ffi::foo`, erase a `FooRef` with
-    `as_void_ptr` and recover it with `from_void_ptr`; if it is a cookie never
-    looked inside, pass the raw `*mut c_void` through unchanged.
+    `as_void_ptr` and recover it with `from_void_ptr` (generically,
+    `T::ref_from_void_ptr` / `T::mut_from_void_ptr` for `T: CCell`); if it is a
+    cookie never looked inside, pass the raw `*mut c_void` through unchanged.
 
   A borrow that must outlive its parent's scope (stored next to the parent,
   sent to a thread) cannot be expressed as a lifetime; copy the child into an

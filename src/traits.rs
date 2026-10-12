@@ -30,6 +30,7 @@
 //! [`CGuardedRef::lock`] take to hand out a [`CGuard`]; and the object's
 //! all-zero validity, which zeroing allocators rely on.
 
+use core::ffi::c_void;
 use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 
@@ -732,4 +733,83 @@ pub unsafe trait CCell: Sized {
     type Mut<'a>
     where
         Self: 'a;
+
+    /// Borrow a raw pointer as the shared handle; `None` if null.
+    ///
+    /// The generic seam: code over `T: CCell` builds a `T::Ref` where it only
+    /// holds a pointer C gave it (a callback argument, a field). The handles
+    /// [`define_ctype!`](crate::define_ctype) generates forward their own
+    /// `from_ptr` here. Provided, from the layout this trait's contract
+    /// already requires; an implementor never needs to override it, and an
+    /// override must keep this contract.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must address a live, initialised `Self::C` (or be null) that
+    /// outlives `'a`, and nothing may write it while the handle lives except
+    /// through a `Mut` derived from the same borrow.
+    #[inline]
+    unsafe fn ref_from_ptr<'a>(ptr: *mut Self::C) -> Option<Self::Ref<'a>>
+    where
+        Self: 'a,
+    {
+        // SAFETY: `Self` is transparent over `Self::C` (this trait's
+        // contract), so the cast keeps the layout; the caller upholds
+        // liveness for `'a`.
+        NonNull::new(ptr.cast::<Self>()).map(|p| unsafe { crate::refs::handle_ref(p) })
+    }
+
+    /// Borrow a raw pointer as the exclusive handle; `None` if null.
+    ///
+    /// As [`ref_from_ptr`](CCell::ref_from_ptr), for the setters.
+    ///
+    /// # Safety
+    ///
+    /// As [`ref_from_ptr`](CCell::ref_from_ptr), plus: `ptr` must carry write
+    /// provenance, and no other handle to the same object may be used while
+    /// the result lives.
+    #[inline]
+    unsafe fn mut_from_ptr<'a>(ptr: *mut Self::C) -> Option<Self::Mut<'a>>
+    where
+        Self: 'a,
+    {
+        // SAFETY: as `ref_from_ptr`; the caller also upholds exclusivity and
+        // write provenance.
+        NonNull::new(ptr.cast::<Self>()).map(|p| unsafe { crate::refs::handle_mut(p) })
+    }
+
+    /// Borrow a type-erased `void *` back as the shared handle; `None` if
+    /// null. For C slots that hand an opaque pointer back (a callback's
+    /// `void *arg`, a `get_user_data` getter). Ownership is not transferred.
+    ///
+    /// # Safety
+    ///
+    /// As [`ref_from_ptr`](CCell::ref_from_ptr), plus: `ptr` must be a pointer
+    /// to a `Self::C`. Nothing in a `void *` records the type, so one erased
+    /// from another type reconstitutes as confusion.
+    #[inline]
+    unsafe fn ref_from_void_ptr<'a>(ptr: *mut c_void) -> Option<Self::Ref<'a>>
+    where
+        Self: 'a,
+    {
+        // SAFETY: the caller asserts `ptr` addresses a live `Self::C`.
+        unsafe { Self::ref_from_ptr(ptr.cast::<Self::C>()) }
+    }
+
+    /// Borrow a type-erased `void *` back as the exclusive handle; `None` if
+    /// null. As [`ref_from_void_ptr`](CCell::ref_from_void_ptr).
+    ///
+    /// # Safety
+    ///
+    /// As [`mut_from_ptr`](CCell::mut_from_ptr), plus: `ptr` must be a pointer
+    /// to a `Self::C`.
+    #[inline]
+    unsafe fn mut_from_void_ptr<'a>(ptr: *mut c_void) -> Option<Self::Mut<'a>>
+    where
+        Self: 'a,
+    {
+        // SAFETY: the caller asserts `ptr` addresses a live `Self::C` it may
+        // borrow exclusively.
+        unsafe { Self::mut_from_ptr(ptr.cast::<Self::C>()) }
+    }
 }
