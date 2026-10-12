@@ -196,6 +196,18 @@ fn the_hand_written_seam_reads_and_writes() {
 }
 
 #[test]
+fn the_trait_constructors_serve_a_hand_written_impl() {
+    // `CCell`'s provided constructors build this impl's own handle types from
+    // the layout its contract requires; the impl wrote no constructor for them.
+    let mut s = Stack::<Item, Borrowed>::zeroed();
+    let p = addr_of_mut!(s.0);
+    let mut m = unsafe { <Stack<Item, Borrowed> as CCell>::mut_from_ptr(p) }.unwrap();
+    m.set_num(11);
+    let r = unsafe { <Stack<Item, Borrowed> as CCell>::ref_from_void_ptr(p.cast()) }.unwrap();
+    assert_eq!(r.num(), 11);
+}
+
+#[test]
 fn owning_handles_hand_out_handles_not_references() {
     let raw = Box::into_raw(Box::new(foo_st {
         a: 1,

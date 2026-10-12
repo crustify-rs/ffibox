@@ -201,10 +201,8 @@ macro_rules! define_ctype {
             #[inline]
             #[allow(dead_code)]
             pub(crate) unsafe fn from_ptr(ptr: *mut $c_type) -> ::core::option::Option<Self> {
-                // SAFETY: layout-preserving cast per `#[repr(transparent)]`;
-                // the caller upholds liveness and the lifetime.
-                ::core::ptr::NonNull::new(ptr.cast::<$name>())
-                    .map(|p| $rf(unsafe { $crate::CBorrowedPtr::new(p) }))
+                // SAFETY: the caller upholds `CCell::ref_from_ptr`'s contract.
+                unsafe { <$name as $crate::CCell>::ref_from_ptr(ptr) }
             }
 
             /// Read-only pointer to the C object, for FFI calls taking
@@ -239,8 +237,8 @@ macro_rules! define_ctype {
             pub(crate) unsafe fn from_void_ptr(
                 ptr: *mut ::core::ffi::c_void,
             ) -> ::core::option::Option<Self> {
-                // SAFETY: the caller asserts `ptr` addresses a live `$c_type`.
-                unsafe { Self::from_ptr(ptr.cast::<$c_type>()) }
+                // SAFETY: the caller upholds `CCell::ref_from_void_ptr`'s contract.
+                unsafe { <$name as $crate::CCell>::ref_from_void_ptr(ptr) }
             }
         }
 
@@ -254,9 +252,8 @@ macro_rules! define_ctype {
             #[inline]
             #[allow(dead_code)]
             pub(crate) unsafe fn from_ptr(ptr: *mut $c_type) -> ::core::option::Option<Self> {
-                // SAFETY: caller upholds liveness, the lifetime and exclusivity.
-                ::core::ptr::NonNull::new(ptr.cast::<$name>())
-                    .map(|p| $mt($rf(unsafe { $crate::CBorrowedPtr::new(p) }), ::core::marker::PhantomData))
+                // SAFETY: the caller upholds `CCell::mut_from_ptr`'s contract.
+                unsafe { <$name as $crate::CCell>::mut_from_ptr(ptr) }
             }
 
             /// Writable pointer to the C object, for FFI calls taking

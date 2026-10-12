@@ -104,8 +104,8 @@ impl<'a, T> CBorrowedPtr<'a, T> {
 ///
 /// The one place a handle is made generically: [`CCell`]'s contract makes
 /// `T::Ref<'a>` `#[repr(transparent)]` over `CBorrowedPtr<'a, T>`, so the
-/// conversion is a layout-preserving copy. Crate-private, so no constructor is
-/// reachable through `CCell` from outside.
+/// conversion is a layout-preserving copy. Reached from outside only through
+/// [`CCell::ref_from_ptr`] and its `void *` twin, both `unsafe`.
 ///
 /// # Safety
 ///
