@@ -291,9 +291,10 @@ mod sealed {
 /// # Safety
 ///
 /// `c_dispose` must release the value's owned resources exactly once, must not
-/// free the value itself, and must accept every value safe code can bring a
-/// `T` to: what a safe constructor produces (all-zero included), and anything
-/// a safe setter on [`T::Mut`](CCell::Mut) then writes into it.
+/// free the value itself, and must accept every value a [`CVal`] can hold: one
+/// whose ownership [`CVal::new`]'s caller vouched for, an all-zero one when
+/// `T` is [`CZeroable`] ([`CVal::zeroed`] is safe), and anything a safe setter
+/// on [`T::Mut`](CCell::Mut) then writes into it.
 ///
 /// That makes the setters part of this contract. A setter that can leave the
 /// value in a state `c_dispose` cannot handle — an arbitrary pointer in a field

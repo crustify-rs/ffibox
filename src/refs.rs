@@ -1223,7 +1223,7 @@ unsafe impl<T: Sync, S: CLenDrop + Sync> Sync for CVec<T, S> {}
 /// // `params_uninit` accept.
 /// unsafe impl CZeroable for Params {}
 ///
-/// let mut params: CVal<Params, ParamsUninit> = CVal::new(Params::zeroed());
+/// let mut params: CVal<Params, ParamsUninit> = CVal::zeroed();
 /// ```
 ///
 /// A resource-free struct needs no `CVal`: hold the layout type itself. A
@@ -1247,18 +1247,68 @@ pub struct CVal<T: CCell, D: CDispose<T>> {
 
 impl<T: CCell, D: CDispose<T>> CVal<T, D> {
     /// Take ownership of a value; dropping the result disposes it.
+    ///
+    /// # Safety
+    ///
+    /// `value` must own exclusively whatever its fields point at, and `D`
+    /// must be the routine that releases exactly that: a value C just
+    /// filled, or one [`into_inner`](Self::into_inner) gave back. A bitwise
+    /// copy of a struct someone else owns (a field read out of a C parent,
+    /// a duplicate of another value) is not one: disposing it frees what
+    /// its owner still uses. A zeroed value owns nothing; build it with the
+    /// safe [`zeroed`](Self::zeroed).
+    ///
+    /// ```compile_fail,E0133
+    /// # use ffibox::{define_ctype, impl_cdispose, CVal, CZeroable};
+    /// # mod ffi { #[repr(C)] pub struct buf_st { pub ptr: *mut u8 } pub unsafe fn buf_dispose(_: *mut buf_st) {} }
+    /// # define_ctype!(Buf, BufRef, BufMut, ffi::buf_st);
+    /// # #[derive(Default)] struct BufDispose;
+    /// # impl_cdispose!(BufDispose, Buf, ffi::buf_dispose);
+    /// # unsafe impl CZeroable for Buf {}
+    /// let _ = CVal::<Buf, BufDispose>::new(Buf::zeroed()); // adopting needs `unsafe`
+    /// ```
     #[inline]
-    pub fn new(value: T) -> Self
+    pub unsafe fn new(value: T) -> Self
     where
         D: Default,
     {
-        Self::new_with(value, D::default())
+        // SAFETY: the caller upholds this function's contract.
+        unsafe { Self::new_with(value, D::default()) }
     }
 
     /// Take ownership of a value under `policy`.
+    ///
+    /// # Safety
+    ///
+    /// As [`new`](Self::new), with `policy` the routine that releases it.
     #[inline]
-    pub fn new_with(value: T, policy: D) -> Self {
+    pub unsafe fn new_with(value: T, policy: D) -> Self {
         Self { value, policy }
+    }
+
+    /// An all-zero value; dropping the result disposes it.
+    ///
+    /// Safe: zero bytes own nothing, and [`CZeroable`] and [`CDispose`]
+    /// each require that the teardown accepts them.
+    #[inline]
+    pub fn zeroed() -> Self
+    where
+        T: CZeroable,
+        D: Default,
+    {
+        Self::zeroed_with(D::default())
+    }
+
+    /// An all-zero value under `policy`.
+    #[inline]
+    pub fn zeroed_with(policy: D) -> Self
+    where
+        T: CZeroable,
+    {
+        // SAFETY: an all-zero `T` holds null pointers and owns nothing, and
+        // every policy paired with a `CZeroable` type accepts it (both
+        // traits' contracts).
+        unsafe { Self::new_with(T::zeroed(), policy) }
     }
 
     /// Shared handle to the value — the getters.
@@ -1288,7 +1338,13 @@ impl<T: CCell, D: CDispose<T>> CVal<T, D> {
 
     /// Give up disposal and return the bare value, e.g. to move it into a
     /// C-owned parent whose teardown disposes it.
+    ///
+    /// Safe: the `CVal` is consumed, so the value is the only owner of its
+    /// resources, and a bare `T` has no `Drop` — dropping it leaks, as
+    /// [`mem::forget`](core::mem::forget) does. Handing it back to an owner
+    /// is [`new`](Self::new)'s caller's to justify.
     #[inline]
+    #[must_use = "the value still owns its resources; dropping it leaks them"]
     pub fn into_inner(self) -> T {
         // SAFETY: each field is read out exactly once and `self` is not
         // dropped; the policy is dropped normally on return.

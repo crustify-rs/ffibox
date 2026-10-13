@@ -363,10 +363,13 @@ pub type BufVal = CVal<Buf, BufDispose>;
 // SAFETY: a null, empty buffer is valid for every accessor and `buf_dispose`.
 unsafe impl CZeroable for Buf {}
 
-let mut b = BufVal::new(Buf::zeroed());
+let mut b = BufVal::zeroed();         // safe: zero bytes own nothing
 let mut handle = b.as_mut();      // BufMut<'_>, as on a CBox
 unsafe { sys::buf_init(handle.as_mut_ptr(), 64) };   // C fills Rust's storage
 // `buf_dispose` runs when `b` drops; the struct itself is Rust's storage.
+// A value C filled elsewhere is adopted with `unsafe { BufVal::new(raw) }`:
+// the caller vouches that it owns what it points at, and that it is not a
+// copy of a struct someone else still owns.
 
 // A resource-free struct needs no wrapper: the `define_ctype!` type is the value.
 define_ctype!(Rational, RationalRef, RationalMut, sys::rational_st);
