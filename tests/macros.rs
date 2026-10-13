@@ -375,7 +375,7 @@ fn cval_disposes_once_on_drop() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     QUX_DISPOSE_CALLS.store(0, Ordering::SeqCst);
 
-    let v = QuxVal::new(Qux::zeroed());
+    let v = QuxVal::zeroed();
     // SAFETY: zeroed `qux_st` is valid; read through the shared handle.
     assert_eq!(unsafe { (*v.as_ref().as_ptr()).payload }, 0);
     drop(v);
@@ -386,7 +386,7 @@ fn cval_disposes_once_on_drop() {
 fn cval_gates_read_against_write_the_ordinary_way() {
     // The value is Rust's inline storage, so `&self` / `&mut self` do the
     // gating and the handles come from them.
-    let mut v = QuxVal::new(Qux::zeroed());
+    let mut v = QuxVal::zeroed();
     // SAFETY: zeroed `qux_st` is valid; write through the exclusive handle.
     unsafe { (*v.as_mut().as_mut_ptr()).payload = 5 };
     // SAFETY: written on the line above.
@@ -400,14 +400,28 @@ fn cval_disposer_gate_folds_internally() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     GATED_DISPOSE_CALLS.store(0, Ordering::SeqCst);
 
-    drop(QuxVal::new(Qux::zeroed())); // owns == 0: the disposer runs, reclaims nothing
+    drop(QuxVal::zeroed()); // owns == 0: the disposer runs, reclaims nothing
     assert_eq!(GATED_DISPOSE_CALLS.load(Ordering::SeqCst), 0);
 
-    let mut v = QuxVal::new(Qux::zeroed());
+    let mut v = QuxVal::zeroed();
     // SAFETY: write through the exclusive handle.
     unsafe { (*v.as_mut().as_mut_ptr()).owns = 1 };
     drop(v);
     assert_eq!(GATED_DISPOSE_CALLS.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn cval_new_adopts_a_value_given_back() {
+    let _serial = QUX_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    QUX_DISPOSE_CALLS.store(0, Ordering::SeqCst);
+
+    let bare = QuxVal::zeroed().into_inner();
+    // SAFETY: `into_inner` gave the value back; it is the sole owner of what
+    // it points at, and `QuxDispose` is the routine that released it before.
+    drop(unsafe { QuxVal::new(bare) });
+    assert_eq!(QUX_DISPOSE_CALLS.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -418,7 +432,7 @@ fn cval_into_inner_gives_up_disposal() {
     QUX_DISPOSE_CALLS.store(0, Ordering::SeqCst);
 
     // A bare `Qux` has no `Drop`: going out of scope disposes nothing.
-    let _bare: Qux = QuxVal::new(Qux::zeroed()).into_inner();
+    let _bare: Qux = QuxVal::zeroed().into_inner();
     assert_eq!(QUX_DISPOSE_CALLS.load(Ordering::SeqCst), 0);
     assert_eq!(
         core::mem::size_of::<QuxVal>(),
