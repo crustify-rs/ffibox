@@ -39,10 +39,13 @@
 /// filling a local — is Rust-owned storage, so `$name::as_ref` /
 /// `as_mut` reach its handles directly. That is the one place a reference
 /// covers a C struct's bytes, sound because nothing else yields a `&$name`.
-/// Do not give C a pointer to such a value that outlives the call; a struct C
-/// registers or self-references belongs behind
-/// [`CBox`](crate::CBox). One that must be disposed on drop is a
-/// [`CVal`](crate::CVal).
+/// Such a value moves — a `memcpy` on every move, into and out of a
+/// [`CVal`](crate::CVal) — which is sound only while nothing holds its
+/// address. So no safe wrapper may let C keep a pointer to it past the call:
+/// a struct C registers or self-references is address-sensitive, and belongs
+/// behind [`CBox`](crate::CBox), never in a value; it implements no
+/// [`CZeroable`](crate::CZeroable) and gets no by-value constructor. One that
+/// must be disposed on drop is a [`CVal`](crate::CVal).
 ///
 /// # Thread safety is opt-in
 ///
