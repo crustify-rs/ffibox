@@ -352,6 +352,13 @@ pub unsafe trait CDispose<T> {
 /// - every teardown policy paired with it — a [`CDrop`], [`CDispose`] or C
 ///   `free` callback — because a zeroed object dropped untouched still runs
 ///   its teardown.
+///
+/// And `Self` must not be address-sensitive: [`zeroed`](Self::zeroed) hands
+/// out a value that moves — on the stack, into a [`CVal`], out of it with
+/// [`into_inner`](CVal::into_inner) — so no C routine may keep a pointer into
+/// it past the call, or make it point into itself. A struct C registers or
+/// self-references does not implement this trait; allocate it zeroed behind a
+/// pointer instead, where a zeroing policy gives [`CBox`] a stable address.
 pub unsafe trait CZeroable: CCell {
     /// An all-zero value.
     #[inline]
