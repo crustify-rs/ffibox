@@ -1,0 +1,9 @@
+[package]
+name = "ffibox-seam-upstream"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Test fixture: a crate that defines a wrapped type, for ffibox's cross-crate seam tests"
+
+[dependencies]
+ffibox = { path = "../.." }

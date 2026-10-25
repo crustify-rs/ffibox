@@ -126,5 +126,6 @@ pub use crate::refs::{CBorrowedPtr, CBox, CSlice, CSliceMut, CStrBox, CVal, CVec
 pub use crate::shared::{CArc, CGuard, CGuardedRef};
 pub use crate::traits::{
     CAlloc, CAllocZeroed, CCell, CDispose, CDrop, CDupClone, CGuarded, CGuardedAll, CLenClone,
-    CLenDrop, CNew, CPlainElem, CRefClone, CZeroable, LockFields, LockScope, LockWhole,
+    CLenDrop, CMutSeam, CNew, CPlainElem, CRefClone, CRefSeam, CZeroable, LockFields, LockScope,
+    LockWhole,
 };

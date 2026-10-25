@@ -28,9 +28,29 @@
 /// is in the [README](https://github.com/crustify-rs/ffibox#1-the-types-you-get).
 ///
 /// Getters go on `$rf<'a>` taking `&self`, setters on `$mt<'a>` taking
-/// `&mut self`, both through the `pub(crate)` raw seam (`from_ptr`, `as_ptr`,
+/// `&mut self`, both through the raw seam (`from_ptr`, `as_ptr`,
 /// `as_mut_ptr`, and the `void *` variants). Never write an accessor on
 /// `$name`: a `&$name` covers the C object's bytes.
+///
+/// # The seam across crates
+///
+/// The handles' inherent seam methods are `pub(crate)` in the invoking crate,
+/// so they stay off its public API. The macro also implements
+/// [`CRefSeam`](crate::CRefSeam) on `$rf` and [`CMutSeam`](crate::CMutSeam)
+/// on `$mt`, which the inherent methods forward to. Another crate reaches the
+/// same seam by importing them, under the same names; the inbound half is
+/// also on `$name` through [`CCell`](crate::CCell):
+///
+/// ```ignore
+/// use ffibox::{CCell, CMutSeam, CRefSeam};
+///
+/// let p = shared.as_ptr();               // CRefSeam, on upstream's `FooRef`
+/// let q = exclusive.as_mut_void_ptr();   // CMutSeam, on upstream's `FooMut`
+/// // SAFETY: <why `p` addresses a live `foo_st` for `'a`>
+/// let r = unsafe { FooRef::from_ptr(p.cast_mut()) };
+/// // SAFETY: as above.
+/// let s = unsafe { Foo::ref_from_ptr(p.cast_mut()) };
+/// ```
 ///
 /// # Values Rust owns
 ///
@@ -164,6 +184,16 @@ macro_rules! define_ctype {
             type Mut<'a> = $mt<'a>;
         }
 
+        // The handles' seams, public to every crate that names the handles;
+        // the inherent `pub(crate)` ones below forward here.
+        impl<'a> $crate::CRefSeam<'a> for $rf<'a> {
+            type Cell = $name;
+        }
+
+        impl<'a> $crate::CMutSeam<'a> for $mt<'a> {
+            type Cell = $name;
+        }
+
         impl $name {
             /// Shared handle to this value — the getters.
             ///
@@ -204,8 +234,8 @@ macro_rules! define_ctype {
             #[inline]
             #[allow(dead_code)]
             pub(crate) unsafe fn from_ptr(ptr: *mut $c_type) -> ::core::option::Option<Self> {
-                // SAFETY: the caller upholds `CCell::ref_from_ptr`'s contract.
-                unsafe { <$name as $crate::CCell>::ref_from_ptr(ptr) }
+                // SAFETY: the caller upholds `CRefSeam::from_ptr`'s contract.
+                unsafe { <Self as $crate::CRefSeam<'a>>::from_ptr(ptr) }
             }
 
             /// Read-only pointer to the C object, for FFI calls taking
@@ -214,7 +244,7 @@ macro_rules! define_ctype {
             #[must_use]
             #[allow(dead_code)]
             pub(crate) fn as_ptr(&self) -> *const $c_type {
-                self.0.as_non_null().as_ptr().cast::<$c_type>()
+                <Self as $crate::CRefSeam<'a>>::as_ptr(self)
             }
 
             /// Type-erased `*const c_void`, for read-only `void *` shims.
@@ -222,7 +252,7 @@ macro_rules! define_ctype {
             #[must_use]
             #[allow(dead_code)]
             pub(crate) fn as_void_ptr(&self) -> *const ::core::ffi::c_void {
-                self.as_ptr().cast()
+                <Self as $crate::CRefSeam<'a>>::as_void_ptr(self)
             }
 
             /// Borrow a type-erased `void *` back; `None` if null. The inbound
@@ -240,8 +270,8 @@ macro_rules! define_ctype {
             pub(crate) unsafe fn from_void_ptr(
                 ptr: *mut ::core::ffi::c_void,
             ) -> ::core::option::Option<Self> {
-                // SAFETY: the caller upholds `CCell::ref_from_void_ptr`'s contract.
-                unsafe { <$name as $crate::CCell>::ref_from_void_ptr(ptr) }
+                // SAFETY: the caller upholds `CRefSeam::from_void_ptr`'s contract.
+                unsafe { <Self as $crate::CRefSeam<'a>>::from_void_ptr(ptr) }
             }
         }
 
@@ -255,8 +285,8 @@ macro_rules! define_ctype {
             #[inline]
             #[allow(dead_code)]
             pub(crate) unsafe fn from_ptr(ptr: *mut $c_type) -> ::core::option::Option<Self> {
-                // SAFETY: the caller upholds `CCell::mut_from_ptr`'s contract.
-                unsafe { <$name as $crate::CCell>::mut_from_ptr(ptr) }
+                // SAFETY: the caller upholds `CMutSeam::from_ptr`'s contract.
+                unsafe { <Self as $crate::CMutSeam<'a>>::from_ptr(ptr) }
             }
 
             /// Writable pointer to the C object, for FFI calls taking
@@ -265,7 +295,7 @@ macro_rules! define_ctype {
             #[must_use]
             #[allow(dead_code)]
             pub(crate) fn as_mut_ptr(&mut self) -> *mut $c_type {
-                self.0 .0.as_non_null().as_ptr().cast::<$c_type>()
+                <Self as $crate::CMutSeam<'a>>::as_mut_ptr(self)
             }
 
             /// Type-erased `*mut c_void`, for writing `void *` shims.
@@ -273,7 +303,7 @@ macro_rules! define_ctype {
             #[must_use]
             #[allow(dead_code)]
             pub(crate) fn as_mut_void_ptr(&mut self) -> *mut ::core::ffi::c_void {
-                self.as_mut_ptr().cast()
+                <Self as $crate::CMutSeam<'a>>::as_mut_void_ptr(self)
             }
 
             /// Reborrow shared, for passing where a getter-only handle is

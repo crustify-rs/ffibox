@@ -821,3 +821,132 @@ pub unsafe trait CCell: Sized {
         unsafe { Self::mut_from_ptr(ptr.cast::<Self::C>()) }
     }
 }
+
+// ===========================================================================
+// The handles' seams, public wherever the handles are
+// ===========================================================================
+
+/// The raw seam of a shared handle, callable from any crate.
+///
+/// [`define_ctype!`](crate::define_ctype) implements it on `FooRef<'a>`, and
+/// `FooRef`'s own `pub(crate)` seam forwards here, so the owning crate keeps
+/// calling `r.as_ptr()` as before. Another crate that holds a `FooRef` and
+/// calls C with it (a wrapper over a library whose API takes the owning
+/// crate's type) imports this trait and calls the same methods: method
+/// resolution skips the inherent methods it cannot see.
+///
+/// ```ignore
+/// use ffibox::CRefSeam;
+/// // SAFETY: `widget_name` reads the widget for the call's duration.
+/// let name = unsafe { ffi::widget_name(widget.as_ptr()) };
+/// ```
+///
+/// Every method is provided, from the layout [`CCell`]'s contract requires
+/// of `CCell::Ref`, and the bound `Cell: CCell<Ref<'a> = Self>` admits only
+/// the type that is some cell's shared handle, so an impl needs no `unsafe`.
+/// A hand-written `CCell` implementor (one `define_ctype!` cannot express)
+/// opts in the same way:
+///
+/// ```ignore
+/// impl<'a> ffibox::CRefSeam<'a> for FooRef<'a> {
+///     type Cell = Foo;
+/// }
+/// ```
+///
+/// As on [`CBox::as_c_ptr`](crate::CBox::as_c_ptr), giving a pointer out is
+/// safe and adopting one is `unsafe`.
+pub trait CRefSeam<'a>: Copy {
+    /// The wrapped type this is the shared handle of.
+    type Cell: CCell<Ref<'a> = Self> + 'a;
+
+    /// Borrow a raw pointer; `None` if null. As
+    /// [`CCell::ref_from_ptr`], called on the handle type.
+    ///
+    /// # Safety
+    ///
+    /// As [`CCell::ref_from_ptr`].
+    #[inline]
+    unsafe fn from_ptr(ptr: *mut <Self::Cell as CCell>::C) -> Option<Self> {
+        // SAFETY: the caller upholds `CCell::ref_from_ptr`'s contract.
+        unsafe { <Self::Cell as CCell>::ref_from_ptr(ptr) }
+    }
+
+    /// Borrow a type-erased `void *` back; `None` if null. As
+    /// [`CCell::ref_from_void_ptr`], called on the handle type.
+    ///
+    /// # Safety
+    ///
+    /// As [`CCell::ref_from_void_ptr`].
+    #[inline]
+    unsafe fn from_void_ptr(ptr: *mut c_void) -> Option<Self> {
+        // SAFETY: the caller upholds `CCell::ref_from_void_ptr`'s contract.
+        unsafe { <Self::Cell as CCell>::ref_from_void_ptr(ptr) }
+    }
+
+    /// Read-only pointer to the C object, for FFI calls taking
+    /// `*const C` and for field reads through `addr_of!`.
+    #[inline]
+    #[must_use]
+    fn as_ptr(&self) -> *const <Self::Cell as CCell>::C {
+        crate::refs::ref_handle_ptr::<Self::Cell>(self)
+            .as_ptr()
+            .cast_const()
+            .cast()
+    }
+
+    /// Type-erased `*const c_void`, for read-only `void *` shims.
+    #[inline]
+    #[must_use]
+    fn as_void_ptr(&self) -> *const c_void {
+        self.as_ptr().cast()
+    }
+}
+
+/// The raw seam of an exclusive handle, callable from any crate. As
+/// [`CRefSeam`], for `FooMut<'a>`; `Cell: CCell<Mut<'a> = Self>`.
+pub trait CMutSeam<'a>: Sized {
+    /// The wrapped type this is the exclusive handle of.
+    type Cell: CCell<Mut<'a> = Self> + 'a;
+
+    /// Borrow a raw pointer exclusively; `None` if null. As
+    /// [`CCell::mut_from_ptr`], called on the handle type.
+    ///
+    /// # Safety
+    ///
+    /// As [`CCell::mut_from_ptr`].
+    #[inline]
+    unsafe fn from_ptr(ptr: *mut <Self::Cell as CCell>::C) -> Option<Self> {
+        // SAFETY: the caller upholds `CCell::mut_from_ptr`'s contract.
+        unsafe { <Self::Cell as CCell>::mut_from_ptr(ptr) }
+    }
+
+    /// Borrow a type-erased `void *` back exclusively; `None` if null. As
+    /// [`CCell::mut_from_void_ptr`], called on the handle type.
+    ///
+    /// # Safety
+    ///
+    /// As [`CCell::mut_from_void_ptr`].
+    #[inline]
+    unsafe fn from_void_ptr(ptr: *mut c_void) -> Option<Self> {
+        // SAFETY: the caller upholds `CCell::mut_from_void_ptr`'s contract.
+        unsafe { <Self::Cell as CCell>::mut_from_void_ptr(ptr) }
+    }
+
+    /// Writable pointer to the C object, for FFI calls taking `*mut C` and
+    /// for field writes through `addr_of_mut!`. Takes `&mut self`, so the
+    /// pointer is derived under the handle's exclusive borrow.
+    #[inline]
+    #[must_use]
+    fn as_mut_ptr(&mut self) -> *mut <Self::Cell as CCell>::C {
+        crate::refs::mut_handle_ptr::<Self::Cell>(self)
+            .as_ptr()
+            .cast()
+    }
+
+    /// Type-erased `*mut c_void`, for writing `void *` shims.
+    #[inline]
+    #[must_use]
+    fn as_mut_void_ptr(&mut self) -> *mut c_void {
+        self.as_mut_ptr().cast()
+    }
+}

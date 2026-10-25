@@ -19,6 +19,10 @@ default = ["std"]
 # that path is a double-panic.
 std = []
 
+[dev-dependencies]
+# Defines a wrapped type in another crate, for `tests/cross_crate_seam.rs`.
+ffibox-seam-upstream = { path = "tests/seam_upstream" }
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

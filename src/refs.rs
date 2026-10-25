@@ -150,6 +150,39 @@ pub(crate) unsafe fn handle_mut<'a, T: CCell + 'a>(p: NonNull<T>) -> T::Mut<'a> 
     unsafe { core::mem::transmute_copy(&raw) }
 }
 
+/// The pointer a shared handle of `T` holds; the inverse of [`handle_ref`].
+#[inline]
+pub(crate) fn ref_handle_ptr<'a, T: CCell + 'a>(h: &T::Ref<'a>) -> NonNull<T> {
+    const {
+        assert!(
+            core::mem::size_of::<T::Ref<'a>>() == core::mem::size_of::<CBorrowedPtr<'a, T>>(),
+            "CCell::Ref must be transparent over CBorrowedPtr",
+        )
+    };
+    // SAFETY: `CCell`'s contract makes `T::Ref<'a>` transparent over
+    // `CBorrowedPtr<'a, T>` with no `Drop`; the sizes are equal (checked
+    // above), so `transmute_copy` reads exactly the one pointer `h` holds.
+    let raw: CBorrowedPtr<'a, T> = unsafe { core::mem::transmute_copy(h) };
+    raw.as_non_null()
+}
+
+/// The pointer an exclusive handle of `T` holds; the inverse of
+/// [`handle_mut`]. Takes `&mut`, so the pointer keeps the handle's write
+/// provenance.
+#[inline]
+pub(crate) fn mut_handle_ptr<'a, T: CCell + 'a>(h: &mut T::Mut<'a>) -> NonNull<T> {
+    const {
+        assert!(
+            core::mem::size_of::<T::Mut<'a>>() == core::mem::size_of::<CBorrowedPtr<'a, T>>(),
+            "CCell::Mut must be transparent over CBorrowedPtr",
+        )
+    };
+    // SAFETY: as `ref_handle_ptr`, for `T::Mut<'a>`, which `CCell`'s contract
+    // also makes transparent over `CBorrowedPtr<'a, T>` with no `Drop`.
+    let raw: CBorrowedPtr<'a, T> = unsafe { core::mem::transmute_copy(&*h) };
+    raw.as_non_null()
+}
+
 // ---------------------------------------------------------------------------
 // Abort helper — portable across std and no_std builds
 // ---------------------------------------------------------------------------
