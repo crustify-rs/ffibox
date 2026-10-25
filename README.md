@@ -471,12 +471,13 @@ contract — see [Under the hood](#4-under-the-hood-hand-written-wrappers).
   since a raw pointer asserts nothing until someone dereferences it. The
   owners' `from_raw` / `into_raw` / `as_ptr` speak the Rust-side pointee; `CBox`'s `from_c` / `into_c` /
   `as_c_ptr` speak the C type, so C interop is cast-free. The handles' seams
-  (`from_ptr`, `as_ptr` / `as_mut_ptr`, the `void *` pairs) are the traits
-  `CRefSeam` on `FooRef`, `CMutSeam` on `FooMut` and `CLockedSeam` on
-  `FooLocked`, which the macros implement: import them wherever the seam is
-  used, in the crate that invokes `define_ctype!` or in any other that holds
-  its handles. They add no method to the wrapper crate's own API, so its
-  public surface carries no raw pointer for them. The inbound half is also on
+  are traits the macros implement: `CRefSeam` on `FooRef` (`from_ptr`,
+  `as_ptr` and the `void *` pair), `CMutSeam` on `FooMut` (`from_ptr`,
+  `as_mut_ptr` and the `void *` pair) and `CLockedSeam` on `FooLocked`
+  (`as_mut_ptr` alone). Import them wherever the seam is used, in the crate
+  that invokes `define_ctype!` or in any other that holds its handles. Their
+  methods are provided once, by ffibox, so the wrapper crate defines no
+  raw-pointer method of its own for them. The inbound half is also on
   `CCell` (`ref_from_ptr`, `mut_from_ptr` and the `void *` twins), so generic
   code over `T: CCell` can borrow a pointer C gives it; those are `unsafe`,
   and the handles' `from_ptr` forward to them.
