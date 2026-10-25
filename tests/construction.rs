@@ -22,7 +22,9 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use std::alloc::{alloc, alloc_zeroed, dealloc, Layout};
 use std::sync::{Mutex, MutexGuard};
 
-use ffibox::{define_ctype, CAlloc, CAllocZeroed, CArc, CBox, CCell, CDrop, CNew, CZeroable};
+use ffibox::{
+    define_ctype, CAlloc, CAllocZeroed, CArc, CBox, CCell, CDrop, CNew, CRefSeam, CZeroable,
+};
 
 // The counters are process-global; tests take this lock so one test's reset
 // cannot clobber another's tally (see `smart_pointers.rs`).

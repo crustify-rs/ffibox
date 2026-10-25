@@ -11,7 +11,7 @@ use core::sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering};
 
 use ffibox::{
     define_ctype, impl_cdrop, impl_cdupclone, impl_cguarded, impl_crefclone, CArc, CBox, CDrop,
-    CGuard, CGuardedRef, CRefClone,
+    CGuard, CGuardedRef, CLockedSeam, CMutSeam, CRefClone, CRefSeam,
 };
 
 // ---------------------------------------------------------------------------

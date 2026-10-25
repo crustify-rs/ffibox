@@ -642,12 +642,14 @@ pub unsafe trait CLenClone: CLenDrop {
 /// the borrowed handles that carry its accessors.
 ///
 /// A **linking** trait, not an access trait: it names the wrapped C type and
-/// the two handle types, and has no methods — nothing on it is callable, so
+/// the two handle types. Its only methods are the provided, `unsafe` inbound
+/// seam (`ref_from_ptr`, `mut_from_ptr` and their `void *` twins), so
 /// implementing it exposes no constructor. ffibox builds the handles from a
-/// pointer itself, relying on the layout the contract below guarantees. The seam (`as_ptr` / `as_mut_ptr` /
-/// `from_ptr`) lives on the handles as inherent methods, because that is where
-/// a `&self` receiver is sound — `&FooRef` covers one pointer of Rust stack
-/// where `&Foo` would cover the C object.
+/// pointer itself, relying on the layout the contract below guarantees. The
+/// outbound seam (`as_ptr` / `as_mut_ptr`) lives on the handles, through
+/// [`CRefSeam`] and [`CMutSeam`], because that is where a `&self` receiver is
+/// sound — `&FooRef` covers one pointer of Rust stack where `&Foo` would
+/// cover the C object.
 ///
 /// Implemented by [`define_ctype!`](crate::define_ctype) for the trivial base
 /// case, or by hand for lifetime- / type-generic newtypes.
@@ -826,14 +828,13 @@ pub unsafe trait CCell: Sized {
 // The handles' seams, public wherever the handles are
 // ===========================================================================
 
-/// The raw seam of a shared handle, callable from any crate.
+/// The raw seam of a shared handle: the one way to reach the pointer a
+/// `FooRef` holds, or to borrow one as a `FooRef`, in any crate.
 ///
-/// [`define_ctype!`](crate::define_ctype) implements it on `FooRef<'a>`, and
-/// `FooRef`'s own `pub(crate)` seam forwards here, so the owning crate keeps
-/// calling `r.as_ptr()` as before. Another crate that holds a `FooRef` and
-/// calls C with it (a wrapper over a library whose API takes the owning
-/// crate's type) imports this trait and calls the same methods: method
-/// resolution skips the inherent methods it cannot see.
+/// [`define_ctype!`](crate::define_ctype) implements it on `FooRef<'a>`. The
+/// owning crate imports it to write its getters, and another crate that holds
+/// a `FooRef` and calls C with it (a wrapper over a library whose API takes
+/// the owning crate's type) imports it the same way.
 ///
 /// ```ignore
 /// use ffibox::CRefSeam;
@@ -948,5 +949,24 @@ pub trait CMutSeam<'a>: Sized {
     #[must_use]
     fn as_mut_void_ptr(&mut self) -> *mut c_void {
         self.as_mut_ptr().cast()
+    }
+}
+
+/// The raw seam of a locked handle (`FooLocked`, from
+/// [`impl_cguarded!`](crate::impl_cguarded) over some fields), callable from
+/// any crate. As [`CMutSeam`], for [`CGuarded::Locked`]; a lock over the whole
+/// object hands out the `Mut` handle, whose seam is `CMutSeam`'s.
+pub trait CLockedSeam<'a>: Sized {
+    /// The guarded type this is the locked handle of.
+    type Cell: CGuarded<Locked<'a> = Self> + 'a;
+
+    /// Writable pointer to the C object, for FFI calls that require the lock
+    /// held and for field access through `addr_of_mut!`.
+    #[inline]
+    #[must_use]
+    fn as_mut_ptr(&mut self) -> *mut <Self::Cell as CCell>::C {
+        crate::refs::locked_handle_ptr::<Self::Cell>(self)
+            .as_ptr()
+            .cast()
     }
 }

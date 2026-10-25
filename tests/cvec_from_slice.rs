@@ -6,7 +6,9 @@
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use ffibox::{define_ctype, impl_clenclone, impl_clendrop, CLenClone, CLenDrop, CSlice, CVec};
+use ffibox::{
+    define_ctype, impl_clenclone, impl_clendrop, CLenClone, CLenDrop, CRefSeam, CSlice, CVec,
+};
 
 const ALIGN: usize = 16;
 

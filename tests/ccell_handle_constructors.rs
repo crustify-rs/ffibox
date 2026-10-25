@@ -6,7 +6,7 @@
 use core::ffi::c_void;
 use core::ptr::{addr_of, addr_of_mut};
 
-use ffibox::{define_ctype, CCell};
+use ffibox::{define_ctype, CCell, CMutSeam, CRefSeam};
 
 #[repr(C)]
 pub struct pt_st {

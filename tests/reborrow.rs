@@ -7,7 +7,7 @@
 
 use core::ptr::{addr_of, addr_of_mut, NonNull};
 
-use ffibox::{define_ctype, CSlice, CSliceMut, CZeroable as _};
+use ffibox::{define_ctype, CMutSeam, CRefSeam, CSlice, CSliceMut, CZeroable as _};
 
 #[repr(C)]
 pub struct pt_st {

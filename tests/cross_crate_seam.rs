@@ -1,7 +1,6 @@
 #![allow(missing_docs)]
-//! The handles' seam from a crate that did not invoke `define_ctype!`: the
-//! inherent `pub(crate)` methods are invisible here, so every call below
-//! resolves to `CRefSeam` / `CMutSeam` / `CCell`, under the same names.
+//! The handles' seam from a crate that did not invoke `define_ctype!`, through
+//! `CRefSeam` / `CMutSeam` / `CCell` as the owning crate uses them.
 
 use ffibox::{CCell, CMutSeam, CRefSeam, CZeroable};
 use ffibox_seam_upstream::{widget_st, Widget, WidgetMut, WidgetRef};

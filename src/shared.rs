@@ -21,7 +21,7 @@
 //!
 //! ```
 //! use core::ptr::addr_of;
-//! use ffibox::{define_ctype, impl_cdrop, impl_crefclone, CArc};
+//! use ffibox::{define_ctype, impl_cdrop, impl_crefclone, CArc, CRefSeam};
 //!
 //! mod ffi {
 //!     use core::sync::atomic::{AtomicUsize, Ordering};

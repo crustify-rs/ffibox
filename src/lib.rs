@@ -44,7 +44,7 @@
 //! ## Quick example
 //!
 //! ```
-//! use ffibox::{define_ctype, impl_cdrop, impl_cdupclone, CBox};
+//! use ffibox::{define_ctype, impl_cdrop, impl_cdupclone, CBox, CMutSeam, CRefSeam};
 //!
 //! mod ffi {
 //!     #[repr(C)]
@@ -126,6 +126,6 @@ pub use crate::refs::{CBorrowedPtr, CBox, CSlice, CSliceMut, CStrBox, CVal, CVec
 pub use crate::shared::{CArc, CGuard, CGuardedRef};
 pub use crate::traits::{
     CAlloc, CAllocZeroed, CCell, CDispose, CDrop, CDupClone, CGuarded, CGuardedAll, CLenClone,
-    CLenDrop, CMutSeam, CNew, CPlainElem, CRefClone, CRefSeam, CZeroable, LockFields, LockScope,
-    LockWhole,
+    CLenDrop, CLockedSeam, CMutSeam, CNew, CPlainElem, CRefClone, CRefSeam, CZeroable, LockFields,
+    LockScope, LockWhole,
 };

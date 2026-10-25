@@ -52,7 +52,7 @@ declare C routines a real `*-sys` crate would provide.
 ### A boxed object — `CBox`
 
 ```rust,no_run
-use ffibox::{define_ctype, impl_cdrop, impl_cdupclone, CBox};
+use ffibox::{define_ctype, impl_cdrop, impl_cdupclone, CBox, CMutSeam, CRefSeam};
 
 mod sys {
     #[repr(C)] pub struct point_st { pub x: i32, pub y: i32 }
@@ -185,7 +185,7 @@ same `new` / `new_zeroed`, and a filled `CBox` converts with `.into()`.
 ### A shared object — `CArc`, and its lock
 
 ```rust,no_run
-use ffibox::{define_ctype, impl_cdrop, impl_cguarded, impl_crefclone, CArc};
+use ffibox::{define_ctype, impl_cdrop, impl_cguarded, impl_crefclone, CArc, CLockedSeam, CRefSeam};
 
 mod sys {
     #[repr(C)] pub struct session_st { _opaque: [u8; 0] }
@@ -255,7 +255,7 @@ let _ = s.as_ref().name();                        // no lock needed
 
 ```rust,no_run
 use core::ptr::{addr_of, addr_of_mut};
-use ffibox::{define_ctype, impl_cguarded, CGuardedRef};
+use ffibox::{define_ctype, impl_cguarded, CGuardedRef, CMutSeam, CRefSeam};
 
 mod sys {
     #[repr(C)] pub struct registry_st { pub count: i32 }
@@ -343,7 +343,7 @@ let buf = unsafe { buf.assume_init() }; // CVec<u8, ArenaFree>
 ### By value — `CVal`
 
 ```rust,no_run
-use ffibox::{define_ctype, impl_cdispose, CVal, CZeroable};
+use ffibox::{define_ctype, impl_cdispose, CMutSeam, CVal, CZeroable};
 
 mod sys {
     #[repr(C)] pub struct buf_st { pub ptr: *mut u8, pub len: usize }
@@ -471,12 +471,15 @@ contract — see [Under the hood](#4-under-the-hood-hand-written-wrappers).
   since a raw pointer asserts nothing until someone dereferences it. The
   owners' `from_raw` / `into_raw` / `as_ptr` speak the Rust-side pointee; `CBox`'s `from_c` / `into_c` /
   `as_c_ptr` speak the C type, so C interop is cast-free. The handles' seams
-  (`from_ptr`, `as_ptr`, `as_mut_ptr`, the `void *` pair) are `pub(crate)`
-  in the crate that invokes `define_ctype!`. Their inbound half is also on
+  (`from_ptr`, `as_ptr` / `as_mut_ptr`, the `void *` pairs) are the traits
+  `CRefSeam` on `FooRef`, `CMutSeam` on `FooMut` and `CLockedSeam` on
+  `FooLocked`, which the macros implement: import them wherever the seam is
+  used, in the crate that invokes `define_ctype!` or in any other that holds
+  its handles. They add no method to the wrapper crate's own API, so its
+  public surface carries no raw pointer for them. The inbound half is also on
   `CCell` (`ref_from_ptr`, `mut_from_ptr` and the `void *` twins), so generic
-  code over `T: CCell` can borrow a pointer C gives it; those are `unsafe` and
-  public wherever the wrapper type is, and the handles' `from_ptr` forward to
-  them.
+  code over `T: CCell` can borrow a pointer C gives it; those are `unsafe`,
+  and the handles' `from_ptr` forward to them.
 - **Constructing through the policy is safe.** `new`, `new_zeroed` and
   `new_uninit` (each with a `_with(policy)` form) allocate through the routine
   the owner frees with, and return `None` when C fails, as `from_raw` does on
@@ -695,7 +698,8 @@ lifetime-carrying layout type — needs this layer.
 
 | Item | Role | Source |
 |------|------|--------|
-| `CCell` | the linking trait: `type C` (the FFI type), `type Ref<'a>`, `type Mut<'a>`. No methods. Its `unsafe impl` promises that `Self` is layout-compatible with `C`, and that `Ref` / `Mut` are `#[repr(transparent)]` over `CBorrowedPtr<'a, Self>` with no `Drop`, and `Mut` invariant in `Self` (a `PhantomData<&'a mut Self>` field) — ffibox builds handles from that layout, and checks their size at compile time. | `src/traits.rs` |
+| `CCell` | the linking trait: `type C` (the FFI type), `type Ref<'a>`, `type Mut<'a>`, and the provided, `unsafe` inbound seam (`ref_from_ptr`, `mut_from_ptr` and their `void *` twins). Its `unsafe impl` promises that `Self` is layout-compatible with `C`, and that `Ref` / `Mut` are `#[repr(transparent)]` over `CBorrowedPtr<'a, Self>` with no `Drop`, and `Mut` invariant in `Self` (a `PhantomData<&'a mut Self>` field) — ffibox builds handles from that layout, and checks their size at compile time. | `src/traits.rs` |
+| `CRefSeam` / `CMutSeam` / `CLockedSeam` | the handles' seams, every method provided from the layout `CCell` (or `CGuarded`) guarantees: implement them on hand-written handles with `type Cell = Foo;`, as the macros do, or the handles have no `as_ptr` / `as_mut_ptr`. | `src/traits.rs` |
 | `CBorrowedPtr<'a, T>` | what every handle wraps: one pointer tagged with the borrow's lifetime, `Copy` and covariant like `&'a T`. | `src/refs.rs` |
 | `CPlainElem` | marker for plain-data elements: every bit pattern is a valid value and there is no C-side identity. It admits `&[T]` from a `CVec` (a wrapped C type implements `CCell` instead, so `&[Foo]` does not typecheck) and makes copies read out of memory C keeps writing sound. Not the same as initialized: an unfilled buffer is `CVec<MaybeUninit<T>, _>` until `assume_init`. | `src/traits.rs` |
 

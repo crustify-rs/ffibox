@@ -20,7 +20,7 @@ use core::ptr::{addr_of, addr_of_mut, NonNull};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use ffibox::{define_ctype, impl_cdrop, CBorrowedPtr, CBox, CCell, CDrop};
+use ffibox::{define_ctype, impl_cdrop, CBorrowedPtr, CBox, CCell, CDrop, CMutSeam, CRefSeam};
 
 #[repr(C)]
 pub struct foo_st {

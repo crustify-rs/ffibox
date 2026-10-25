@@ -183,6 +183,23 @@ pub(crate) fn mut_handle_ptr<'a, T: CCell + 'a>(h: &mut T::Mut<'a>) -> NonNull<T
     raw.as_non_null()
 }
 
+/// The pointer a locked handle of `T` holds. As [`mut_handle_ptr`], for
+/// [`CGuarded::Locked`](crate::CGuarded::Locked).
+#[inline]
+pub(crate) fn locked_handle_ptr<'a, T: crate::CGuarded + 'a>(h: &mut T::Locked<'a>) -> NonNull<T> {
+    const {
+        assert!(
+            core::mem::size_of::<T::Locked<'a>>() == core::mem::size_of::<CBorrowedPtr<'a, T>>(),
+            "CGuarded::Locked must be transparent over CBorrowedPtr",
+        )
+    };
+    // SAFETY: `CGuarded`'s contract makes `T::Locked<'a>` transparent over
+    // `CBorrowedPtr<'a, T>` with no `Drop`; the sizes are equal (checked
+    // above), so `transmute_copy` reads exactly the one pointer `h` holds.
+    let raw: CBorrowedPtr<'a, T> = unsafe { core::mem::transmute_copy(&*h) };
+    raw.as_non_null()
+}
+
 // ---------------------------------------------------------------------------
 // Abort helper — portable across std and no_std builds
 // ---------------------------------------------------------------------------

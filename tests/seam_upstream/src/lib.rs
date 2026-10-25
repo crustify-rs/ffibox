@@ -1,5 +1,7 @@
-//! An upstream wrapper crate: it invokes `define_ctype!`, so the handles'
-//! inherent seam is `pub(crate)` here and invisible to `cross_crate_seam.rs`.
+//! An upstream wrapper crate: it invokes `define_ctype!` and writes its
+//! accessors through the seam traits, which `cross_crate_seam.rs` imports too.
+
+use ffibox::{CMutSeam, CRefSeam};
 
 /// Stand-in for a `-sys` struct.
 #[repr(C)]
@@ -21,7 +23,7 @@ ffibox::define_ctype!(
 unsafe impl ffibox::CZeroable for Widget {}
 
 impl WidgetRef<'_> {
-    /// Reads `size` through the crate-private seam.
+    /// Reads `size` through the seam.
     #[must_use]
     pub fn size(&self) -> u32 {
         // SAFETY: a read through the shared handle's pointer, live for `'_`.
@@ -30,7 +32,7 @@ impl WidgetRef<'_> {
 }
 
 impl WidgetMut<'_> {
-    /// Writes `size` through the crate-private seam.
+    /// Writes `size` through the seam.
     pub fn set_size(&mut self, v: u32) {
         // SAFETY: a write through the exclusive handle's pointer.
         unsafe { core::ptr::addr_of_mut!((*self.as_mut_ptr()).size).write(v) }

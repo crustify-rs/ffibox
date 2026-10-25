@@ -22,7 +22,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use ffibox::{
     impl_cdrop, impl_cdupclone, impl_clendrop, impl_crefclone, CBorrowedPtr, CBox, CCell, CDrop,
-    CRefClone, CSlice, CSliceMut, CVec, CZeroable as _,
+    CMutSeam, CRefClone, CRefSeam, CSlice, CSliceMut, CVec, CZeroable as _,
 };
 
 // ---------------------------------------------------------------------------
