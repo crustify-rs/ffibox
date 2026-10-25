@@ -23,10 +23,18 @@ pub struct opaque_b {
 
 define_ctype!(
     /// Withholds both markers: the default.
-    NoMarkers, NoMarkersRef, NoMarkersMut, opaque_a);
+    NoMarkers,
+    NoMarkersRef,
+    NoMarkersMut,
+    opaque_a
+);
 define_ctype!(
     /// Registers both markers below.
-    Both, BothRef, BothMut, opaque_b);
+    Both,
+    BothRef,
+    BothMut,
+    opaque_b
+);
 // SAFETY: test stand-in; `opaque_b` is a ZST with no thread-affine state.
 unsafe impl Send for Both {}
 // SAFETY: `&mut T: Send` follows from `T: Send`.

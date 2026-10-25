@@ -1,4 +1,8 @@
-#![allow(missing_docs, clippy::undocumented_unsafe_blocks, clippy::missing_safety_doc)]
+#![allow(
+    missing_docs,
+    clippy::undocumented_unsafe_blocks,
+    clippy::missing_safety_doc
+)]
 //! `CCell`'s handle constructors: generic code over `T: CCell` borrows a
 //! pointer C hands it (typed, or erased to `void *`) as `T::Ref` / `T::Mut`,
 //! and the handles `define_ctype!` generates forward their `from_ptr` there.
