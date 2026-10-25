@@ -56,7 +56,7 @@ use ffibox::{define_ctype, impl_cdrop, impl_cdupclone, CBox, CMutSeam, CRefSeam}
 
 mod sys {
     #[repr(C)] pub struct point_st { pub x: i32, pub y: i32 }
-    extern "C" {
+    unsafe extern "C" {
         pub fn point_new(x: i32, y: i32) -> *mut point_st;
         pub fn point_dup(p: *mut point_st) -> *mut point_st;
         pub fn point_free(p: *mut point_st);
@@ -117,7 +117,7 @@ mod sys {
     use core::ffi::c_void;
     #[repr(C)] pub struct frame_st { pub format: i32 }
     #[repr(C)] pub struct rational_st { pub num: i32, pub den: i32 }
-    extern "C" {
+    unsafe extern "C" {
         pub fn frame_alloc() -> *mut frame_st;       // sets `format = -1`
         pub fn frame_free(f: *mut frame_st);
         pub fn rational_init(r: *mut rational_st, num: i32, den: i32);
@@ -190,7 +190,7 @@ use ffibox::{define_ctype, impl_cdrop, impl_cguarded, impl_crefclone, CArc, CLoc
 mod sys {
     #[repr(C)] pub struct session_st { _opaque: [u8; 0] }
     #[repr(C)] pub struct store_st { _opaque: [u8; 0] }
-    extern "C" {
+    unsafe extern "C" {
         pub fn session_new() -> *mut session_st;
         pub fn session_up_ref(s: *mut session_st);         // cannot fail
         pub fn session_free(s: *mut session_st);           // a down-ref
@@ -259,7 +259,7 @@ use ffibox::{define_ctype, impl_cguarded, CGuardedRef, CMutSeam, CRefSeam};
 
 mod sys {
     #[repr(C)] pub struct registry_st { pub count: i32 }
-    extern "C" {
+    unsafe extern "C" {
         pub static mut registry: registry_st;  // a C global
         pub fn registry_lock() -> i32;         // guards `registry`; 0 on success
         pub fn registry_unlock() -> i32;
@@ -317,7 +317,7 @@ use ffibox::{impl_clendrop, CVec};
 
 mod sys {
     use core::ffi::c_void;
-    extern "C" {
+    unsafe extern "C" {
         pub fn arena_alloc(n: usize) -> *mut c_void;
         pub fn arena_free(p: *mut c_void);
     }
@@ -348,7 +348,7 @@ use ffibox::{define_ctype, impl_cdispose, CMutSeam, CVal, CZeroable};
 mod sys {
     #[repr(C)] pub struct buf_st { pub ptr: *mut u8, pub len: usize }
     #[repr(C)] pub struct rational_st { pub num: i32, pub den: i32 }
-    extern "C" {
+    unsafe extern "C" {
         pub fn buf_init(b: *mut buf_st, n: usize) -> i32;
         pub fn buf_dispose(b: *mut buf_st);
     }
@@ -391,7 +391,7 @@ use ffibox::{impl_cdrop_str, impl_cdupclone_str, impl_clendrop, CStrBox, CVec};
 
 mod sys {
     use core::ffi::c_char;
-    extern "C" {
+    unsafe extern "C" {
         pub fn oids_new(n: usize) -> *mut u32;
         pub fn oids_free(p: *mut u32, n: usize);
         pub fn lib_name() -> *mut c_char;
