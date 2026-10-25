@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.85"
 authors = ["Marius Momeu <marius.momeu@berkeley.edu>", "The Crustify Contributors"]
 license = "MIT OR Apache-2.0"
-description = "Generic smart pointers and traits for building safe Rust wrappers over C types"
+description = "Generic smart pointers and lifecycle traits for building safe Rust wrappers over C pointers and types"
 repository = "https://github.com/crustify-rs/ffibox"
 documentation = "https://docs.rs/ffibox"
 homepage = "https://github.com/crustify-rs/ffibox"
@@ -18,10 +18,6 @@ default = ["std"]
 # Selects `std::process::abort` for the unrecoverable-failure path; without it
 # that path is a double-panic.
 std = []
-
-[dev-dependencies]
-# Defines a wrapped type in another crate, for `tests/cross_crate_seam.rs`.
-ffibox-seam-upstream = { path = "tests/seam_upstream" }
 
 [package.metadata.docs.rs]
 all-features = true
