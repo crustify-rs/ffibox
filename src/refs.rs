@@ -160,9 +160,9 @@ pub(crate) fn ref_handle_ptr<'a, T: CCell + 'a>(h: &T::Ref<'a>) -> NonNull<T> {
         )
     };
     // SAFETY: `CCell`'s contract makes `T::Ref<'a>` transparent over
-    // `CBorrowedPtr<'a, T>` with no `Drop`; the sizes are equal (checked
-    // above), so `transmute_copy` reads exactly the one pointer `h` holds.
-    let raw: CBorrowedPtr<'a, T> = unsafe { core::mem::transmute_copy(h) };
+    // `CBorrowedPtr<'a, T>`, so `h` addresses a valid, aligned
+    // `CBorrowedPtr<'a, T>` (sizes checked above), which is `Copy`.
+    let raw = unsafe { *core::ptr::from_ref(h).cast::<CBorrowedPtr<'a, T>>() };
     raw.as_non_null()
 }
 
@@ -178,8 +178,8 @@ pub(crate) fn mut_handle_ptr<'a, T: CCell + 'a>(h: &mut T::Mut<'a>) -> NonNull<T
         )
     };
     // SAFETY: as `ref_handle_ptr`, for `T::Mut<'a>`, which `CCell`'s contract
-    // also makes transparent over `CBorrowedPtr<'a, T>` with no `Drop`.
-    let raw: CBorrowedPtr<'a, T> = unsafe { core::mem::transmute_copy(&*h) };
+    // also makes transparent over `CBorrowedPtr<'a, T>`.
+    let raw = unsafe { *core::ptr::from_mut(h).cast::<CBorrowedPtr<'a, T>>() };
     raw.as_non_null()
 }
 
@@ -194,9 +194,9 @@ pub(crate) fn locked_handle_ptr<'a, T: crate::CGuarded + 'a>(h: &mut T::Locked<'
         )
     };
     // SAFETY: `CGuarded`'s contract makes `T::Locked<'a>` transparent over
-    // `CBorrowedPtr<'a, T>` with no `Drop`; the sizes are equal (checked
-    // above), so `transmute_copy` reads exactly the one pointer `h` holds.
-    let raw: CBorrowedPtr<'a, T> = unsafe { core::mem::transmute_copy(&*h) };
+    // `CBorrowedPtr<'a, T>`, so `h` addresses a valid, aligned
+    // `CBorrowedPtr<'a, T>` (sizes checked above), which is `Copy`.
+    let raw = unsafe { *core::ptr::from_mut(h).cast::<CBorrowedPtr<'a, T>>() };
     raw.as_non_null()
 }
 
