@@ -116,11 +116,14 @@ pub mod shared;
 pub mod traits;
 
 // Re-export the primary items at the crate root for convenience.
-// Compiles the README's examples, so they cannot drift from the API. They are
+// Compiles every Rust block the docs carry, so no example can drift from the
+// API. The examples live in `docs/examples.md`; the README is included too, so
+// a snippet added there is compiled rather than silently untested. They are
 // `no_run`: their `sys` modules declare C routines that are never linked.
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
-pub struct ReadmeDoctests;
+#[doc = include_str!("../docs/examples.md")]
+pub struct DocExamples;
 
 pub use crate::refs::{CBorrowedPtr, CBox, CSlice, CSliceMut, CStrBox, CVal, CVec};
 pub use crate::shared::{CArc, CGuard, CGuardedRef};
