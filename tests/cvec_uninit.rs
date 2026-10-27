@@ -7,7 +7,7 @@
 use core::mem::MaybeUninit;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{Layout, alloc, dealloc};
 
 use ffibox::{CLenDrop, CVec};
 

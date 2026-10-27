@@ -16,11 +16,11 @@
 
 use core::marker::PhantomData;
 use core::mem::size_of;
-use core::ptr::{addr_of, addr_of_mut, NonNull};
+use core::ptr::{NonNull, addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use ffibox::{define_ctype, impl_cdrop, CBorrowedPtr, CBox, CCell, CDrop, CMutSeam, CRefSeam};
+use ffibox::{CBorrowedPtr, CBox, CCell, CDrop, CMutSeam, CRefSeam, define_ctype, impl_cdrop};
 
 #[repr(C)]
 pub struct foo_st {
@@ -124,7 +124,7 @@ impl<'a, T, S> StackMut<'a, T, S> {
         self.0
     }
     fn as_mut_ptr(&mut self) -> *mut stack_st {
-        self.0 .0.as_non_null().as_ptr().cast()
+        self.0.0.as_non_null().as_ptr().cast()
     }
     /// A setter: `&mut self` on the HANDLE — one pointer of Rust stack.
     fn set_num(&mut self, v: i32) {

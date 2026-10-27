@@ -6,12 +6,12 @@
 
 #![allow(non_camel_case_types, missing_docs)]
 
-use core::ptr::{addr_of, addr_of_mut, NonNull};
-use core::sync::atomic::{fence, AtomicBool, AtomicUsize, Ordering};
+use core::ptr::{NonNull, addr_of, addr_of_mut};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
 
 use ffibox::{
-    define_ctype, impl_cdrop, impl_cdupclone, impl_cguarded, impl_crefclone, CArc, CBox, CDrop,
-    CGuard, CGuardedRef, CLockedSeam, CMutSeam, CRefClone, CRefSeam,
+    CArc, CBox, CDrop, CGuard, CGuardedRef, CLockedSeam, CMutSeam, CRefClone, CRefSeam,
+    define_ctype, impl_cdrop, impl_cdupclone, impl_cguarded, impl_crefclone,
 };
 
 // ---------------------------------------------------------------------------

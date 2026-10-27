@@ -17,13 +17,13 @@
 //! - the `_with` constructors keep the policy they were given
 
 use core::mem::MaybeUninit;
-use core::ptr::{addr_of, NonNull};
+use core::ptr::{NonNull, addr_of};
 use core::sync::atomic::{AtomicUsize, Ordering};
-use std::alloc::{alloc, alloc_zeroed, dealloc, Layout};
+use std::alloc::{Layout, alloc, alloc_zeroed, dealloc};
 use std::sync::{Mutex, MutexGuard};
 
 use ffibox::{
-    define_ctype, CAlloc, CAllocZeroed, CArc, CBox, CCell, CDrop, CNew, CRefSeam, CZeroable,
+    CAlloc, CAllocZeroed, CArc, CBox, CCell, CDrop, CNew, CRefSeam, CZeroable, define_ctype,
 };
 
 // The counters are process-global; tests take this lock so one test's reset

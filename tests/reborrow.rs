@@ -5,9 +5,9 @@
 
 #![allow(non_camel_case_types, missing_docs)]
 
-use core::ptr::{addr_of, addr_of_mut, NonNull};
+use core::ptr::{NonNull, addr_of, addr_of_mut};
 
-use ffibox::{define_ctype, CMutSeam, CRefSeam, CSlice, CSliceMut, CZeroable as _};
+use ffibox::{CMutSeam, CRefSeam, CSlice, CSliceMut, CZeroable as _, define_ctype};
 
 #[repr(C)]
 pub struct pt_st {
@@ -91,9 +91,10 @@ fn split_halves_are_disjoint_and_usable_together() {
     a.set_x(100);
     b.set_x(200);
     a.set_x(101); // both exclusive handles live at once
-    assert!(s
-        .split_at_mut(4)
-        .is_some_and(|(l, r)| l.len() == 4 && r.is_empty()));
+    assert!(
+        s.split_at_mut(4)
+            .is_some_and(|(l, r)| l.len() == 4 && r.is_empty())
+    );
     assert!(s.split_at_mut(5).is_none());
     assert_eq!(xs(&pts), [101, 200, 20, 30]);
 }

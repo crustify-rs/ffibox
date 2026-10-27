@@ -6,8 +6,8 @@ use core::marker::PhantomData;
 use core::ptr::NonNull;
 
 use ffibox::{
-    define_ctype, impl_cdispose, impl_cdrop, CBox, CDrop, CLenDrop, CSlice, CSliceMut, CStrBox,
-    CVal, CVec,
+    CBox, CDrop, CLenDrop, CSlice, CSliceMut, CStrBox, CVal, CVec, define_ctype, impl_cdispose,
+    impl_cdrop,
 };
 
 /// Stand-in for a bindgen opaque type that never opts in.

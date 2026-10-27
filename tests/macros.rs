@@ -21,14 +21,14 @@
 use core::cell::Cell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use core::ffi::{c_char, CStr};
+use core::ffi::{CStr, c_char};
 use core::ptr::NonNull;
 use std::ffi::CString;
 
 use ffibox::{
-    define_ctype, impl_cdispose, impl_cdrop, impl_cdrop_str, impl_cdupclone, impl_cdupclone_str,
-    impl_clenclone, impl_clendrop, impl_crefclone, CBox, CDrop, CDupClone, CLenDrop, CMutSeam,
-    CRefClone, CRefSeam, CSlice, CSliceMut, CStrBox, CVal, CVec, CZeroable as _,
+    CBox, CDrop, CDupClone, CLenDrop, CMutSeam, CRefClone, CRefSeam, CSlice, CSliceMut, CStrBox,
+    CVal, CVec, CZeroable as _, define_ctype, impl_cdispose, impl_cdrop, impl_cdrop_str,
+    impl_cdupclone, impl_cdupclone_str, impl_clenclone, impl_clendrop, impl_crefclone,
 };
 
 // ---------------------------------------------------------------------------

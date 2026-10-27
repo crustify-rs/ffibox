@@ -21,8 +21,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use ffibox::{
-    impl_cdrop, impl_cdupclone, impl_clendrop, impl_crefclone, CBorrowedPtr, CBox, CCell, CDrop,
-    CMutSeam, CRefClone, CRefSeam, CSlice, CSliceMut, CVec, CZeroable as _,
+    CBorrowedPtr, CBox, CCell, CDrop, CMutSeam, CRefClone, CRefSeam, CSlice, CSliceMut, CVec,
+    CZeroable as _, impl_cdrop, impl_cdupclone, impl_clendrop, impl_crefclone,
 };
 
 // ---------------------------------------------------------------------------
@@ -912,7 +912,7 @@ pub struct MockMut<'a, T>(MockRef<'a, T>);
 impl<T> MockMut<'_, T> {
     #[allow(dead_code)]
     fn as_mut_ptr(&mut self) -> *mut T {
-        self.0 .0.as_non_null().as_ptr()
+        self.0.0.as_non_null().as_ptr()
     }
 }
 

@@ -7,7 +7,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use ffibox::{
-    define_ctype, impl_clenclone, impl_clendrop, CLenClone, CLenDrop, CRefSeam, CSlice, CVec,
+    CLenClone, CLenDrop, CRefSeam, CSlice, CVec, define_ctype, impl_clenclone, impl_clendrop,
 };
 
 const ALIGN: usize = 16;
@@ -103,12 +103,13 @@ fn to_cvec_copies_a_borrowed_run_out_of_c_memory() {
 
     let tail = run.slice(1..).unwrap();
     assert_eq!(tail.to_cvec_with(Aligned).unwrap().as_slice(), &[0, 9]);
-    assert!(run
-        .slice(3..)
-        .unwrap()
-        .to_cvec::<Aligned>()
-        .unwrap()
-        .is_empty());
+    assert!(
+        run.slice(3..)
+            .unwrap()
+            .to_cvec::<Aligned>()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// A C struct that owns nothing: a wrapped C object whose bytes are the
@@ -162,12 +163,13 @@ fn to_cvec_copies_a_borrowed_run_of_wrapped_copy_objects() {
 
     let tail: CVec<Rational, Aligned> = run.slice(1..).unwrap().to_cvec_with(Aligned).unwrap();
     assert_eq!(tail.as_handles().get(0).unwrap().parts(), (25, 1));
-    assert!(run
-        .slice(3..)
-        .unwrap()
-        .to_cvec::<Aligned>()
-        .unwrap()
-        .is_empty());
+    assert!(
+        run.slice(3..)
+            .unwrap()
+            .to_cvec::<Aligned>()
+            .unwrap()
+            .is_empty()
+    );
     // The copy clones as any `CVec` of `Copy` elements does.
     assert_eq!(v.clone().len(), 3);
 }

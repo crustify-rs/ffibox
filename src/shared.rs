@@ -72,7 +72,7 @@ use core::fmt;
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 
-use crate::refs::{abort_process, disarm, handle_mut, handle_ref, CBorrowedPtr, CBox};
+use crate::refs::{CBorrowedPtr, CBox, abort_process, disarm, handle_mut, handle_ref};
 #[allow(unused_imports)] // doc links
 use crate::traits::LockWhole;
 use crate::traits::{

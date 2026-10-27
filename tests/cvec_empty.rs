@@ -5,10 +5,10 @@
 
 #![allow(missing_docs)]
 
-use core::ptr::{null_mut, NonNull};
+use core::ptr::{NonNull, null_mut};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use ffibox::{define_ctype, CLenClone, CLenDrop, CVec};
+use ffibox::{CLenClone, CLenDrop, CVec, define_ctype};
 
 /// Counts frees into a counter each test owns. Never frees the memory: the one
 /// test with a real buffer reclaims it itself, after checking the count.
