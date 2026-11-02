@@ -132,8 +132,21 @@ define_ctype!(Foo, FooRef, FooMut, foo_st);
 // down-ref registers as the destructor, the up_ref as its `CRefClone`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FooUnref;
-impl_cdrop!(FooUnref, Foo, FOO_free);
-impl_crefclone!(FooUnref, Foo, FOO_up_ref, ok = |r| r == 1);
+impl_cdrop!(
+    /// Wraps fn::FOO_free
+    #[doc(alias = "FOO_free")]
+    FooUnref,
+    Foo,
+    FOO_free
+);
+impl_crefclone!(
+    /// Wraps fn::FOO_up_ref
+    #[doc(alias = "FOO_up_ref")]
+    FooUnref,
+    Foo,
+    FOO_up_ref,
+    ok = |r| r == 1
+);
 pub type FooOwned = CBox<Foo, FooUnref>;
 
 define_ctype!(Bar, BarRef, BarMut, bar_st);
@@ -144,7 +157,13 @@ unsafe impl ffibox::CZeroable for Bar {}
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BarFree;
 impl_cdrop!(BarFree, Bar, BAR_free);
-impl_cdupclone!(BarFree, Bar, BAR_dup);
+impl_cdupclone!(
+    /// Wraps fn::BAR_dup
+    #[doc(alias = "BAR_dup")]
+    BarFree,
+    Bar,
+    BAR_dup
+);
 pub type BarOwned = CBox<Bar, BarFree>;
 
 // ---------------------------------------------------------------------------
@@ -361,7 +380,13 @@ define_ctype!(Qux, QuxRef, QuxMut, qux_st);
 unsafe impl ffibox::CZeroable for Qux {}
 #[derive(Clone, Copy, Debug, Default)]
 pub struct QuxDispose;
-impl_cdispose!(QuxDispose, Qux, QUX_dispose);
+impl_cdispose!(
+    /// Wraps fn::QUX_dispose
+    #[doc(alias = "QUX_dispose")]
+    QuxDispose,
+    Qux,
+    QUX_dispose
+);
 /// A `qux_st` held inline and disposed on drop.
 pub type QuxVal = CVal<Qux, QuxDispose>;
 
@@ -696,8 +721,18 @@ fn mock_str(s: &str) -> *mut c_char {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MockStrFree;
-impl_cdrop_str!(MockStrFree, mock_str_free);
-impl_cdupclone_str!(MockStrFree, mock_strdup);
+impl_cdrop_str!(
+    /// Wraps fn::mock_str_free
+    #[doc(alias = "mock_str_free")]
+    MockStrFree,
+    mock_str_free
+);
+impl_cdupclone_str!(
+    /// Wraps fn::mock_strdup
+    #[doc(alias = "mock_strdup")]
+    MockStrFree,
+    mock_strdup
+);
 /// A string from the mock allocator.
 pub type MockStr = CStrBox<MockStrFree>;
 
@@ -821,8 +856,19 @@ fn mock_array<T: Copy>(items: &[T]) -> *mut T {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MockVecFree;
-impl_clendrop!(MockVecFree, mock_vec_free);
-impl_clenclone!(MockVecFree, mock_memdup, align = VEC_ALIGN);
+impl_clendrop!(
+    /// Wraps fn::mock_vec_free
+    #[doc(alias = "mock_vec_free")]
+    MockVecFree,
+    mock_vec_free
+);
+impl_clenclone!(
+    /// Wraps fn::mock_memdup
+    #[doc(alias = "mock_memdup")]
+    MockVecFree,
+    mock_memdup,
+    align = VEC_ALIGN
+);
 /// A buffer from the mock allocator.
 pub type MockVec<T> = CVec<T, MockVecFree>;
 

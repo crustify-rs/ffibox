@@ -5,6 +5,21 @@
 //! type does not compile; any other shape goes behind an `unsafe fn` adapter
 //! or into a hand-written policy.
 //!
+//! Each policy macro takes outer attributes ahead of its arguments, a doc
+//! comment and a `#[doc(alias)]` among them, and puts them on the trait method
+//! that calls the routine: [`CRefClone::c_up_ref`](crate::CRefClone::c_up_ref)
+//! for [`impl_crefclone!`](crate::impl_crefclone), and the trait's one method
+//! for the others. That is where a crate records which C routine the method
+//! stands in for:
+//!
+//! ```ignore
+//! impl_cdrop!(
+//!     /// Wraps fn::foo_free
+//!     #[doc(alias = "foo_free")]
+//!     FooFree, Foo, ffi::foo_free
+//! );
+//! ```
+//!
 //! | Macro | Implements | Routine |
 //! |-------|------------|---------|
 //! | [`impl_cdrop!`](crate::impl_cdrop) | [`CDrop<T>`](crate::CDrop) | a `*_free` |
@@ -297,10 +312,11 @@ macro_rules! define_ctype {
 /// the routine releases exactly one unit of ownership of a live object.
 #[macro_export]
 macro_rules! impl_cdrop {
-    (@impl $policy:ty, $t:ty, $c:ty, $f:path) => {
+    (@impl [$(#[$attr:meta])*] $policy:ty, $t:ty, $c:ty, $f:path) => {
         // SAFETY: the invoker asserts `$f` releases one unit of ownership of a
         // live `$c`, which `$t` is layout-compatible with.
         unsafe impl $crate::CDrop<$t> for $policy {
+            $(#[$attr])*
             #[inline]
             #[allow(unused_unsafe)]
             unsafe fn c_drop(&self, ptr: ::core::ptr::NonNull<$t>) {
@@ -310,8 +326,8 @@ macro_rules! impl_cdrop {
             }
         }
     };
-    ($policy:ty, $t:ty, $f:path) => {
-        $crate::impl_cdrop!(@impl $policy, $t, <$t as $crate::CCell>::C, $f);
+    ($(#[$attr:meta])* $policy:ty, $t:ty, $f:path) => {
+        $crate::impl_cdrop!(@impl [$(#[$attr])*] $policy, $t, <$t as $crate::CCell>::C, $f);
     };
 }
 
@@ -331,8 +347,10 @@ macro_rules! impl_cdrop {
 /// As [`impl_cdrop!`](crate::impl_cdrop).
 #[macro_export]
 macro_rules! impl_cdrop_str {
-    ($policy:ty, $f:path) => {
-        $crate::impl_cdrop!(@impl $policy, ::core::ffi::c_char, ::core::ffi::c_char, $f);
+    ($(#[$attr:meta])* $policy:ty, $f:path) => {
+        $crate::impl_cdrop!(
+            @impl [$(#[$attr])*] $policy, ::core::ffi::c_char, ::core::ffi::c_char, $f
+        );
     };
 }
 
@@ -356,10 +374,11 @@ macro_rules! impl_cdrop_str {
 /// NULL on failure.
 #[macro_export]
 macro_rules! impl_cdupclone {
-    (@impl $policy:ty, $t:ty, $c:ty, $f:path) => {
+    (@impl [$(#[$attr:meta])*] $policy:ty, $t:ty, $c:ty, $f:path) => {
         // SAFETY: the invoker asserts `$f` returns a fresh, independent copy
         // of a live `$c`, or NULL, that the policy's `c_drop` releases.
         unsafe impl $crate::CDupClone<$t> for $policy {
+            $(#[$attr])*
             #[inline]
             #[allow(unused_unsafe)]
             unsafe fn c_dup(
@@ -373,8 +392,8 @@ macro_rules! impl_cdupclone {
             }
         }
     };
-    ($policy:ty, $t:ty, $f:path) => {
-        $crate::impl_cdupclone!(@impl $policy, $t, <$t as $crate::CCell>::C, $f);
+    ($(#[$attr:meta])* $policy:ty, $t:ty, $f:path) => {
+        $crate::impl_cdupclone!(@impl [$(#[$attr])*] $policy, $t, <$t as $crate::CCell>::C, $f);
     };
 }
 
@@ -386,8 +405,10 @@ macro_rules! impl_cdupclone {
 /// As [`impl_cdupclone!`](crate::impl_cdupclone).
 #[macro_export]
 macro_rules! impl_cdupclone_str {
-    ($policy:ty, $f:path) => {
-        $crate::impl_cdupclone!(@impl $policy, ::core::ffi::c_char, ::core::ffi::c_char, $f);
+    ($(#[$attr:meta])* $policy:ty, $f:path) => {
+        $crate::impl_cdupclone!(
+            @impl [$(#[$attr])*] $policy, ::core::ffi::c_char, ::core::ffi::c_char, $f
+        );
     };
 }
 
@@ -433,12 +454,13 @@ macro_rules! impl_cdupclone_str {
 /// that covers every reference.
 #[macro_export]
 macro_rules! impl_crefclone {
-    (@impl $policy:ty, $t:ty, $c:ty, $f:path, [$($ok:expr)?], [$($sole:path)?]) => {
+    (@impl [$(#[$attr:meta])*] $policy:ty, $t:ty, $c:ty, $f:path, [$($ok:expr)?], [$($sole:path)?]) => {
         // SAFETY: the invoker asserts `$f` increments the count of a live `$c`
         // whenever the return check passes, so the object owes one more
         // `c_drop`, and that any sole-owner routine meets `c_is_sole_owner`'s
         // contract.
         unsafe impl $crate::CRefClone<$t> for $policy {
+            $(#[$attr])*
             #[inline]
             #[allow(unused_unsafe)]
             unsafe fn c_up_ref(&self, ptr: ::core::ptr::NonNull<$t>) -> bool {
@@ -458,9 +480,9 @@ macro_rules! impl_crefclone {
             )?
         }
     };
-    ($policy:ty, $t:ty, $f:path $(, ok = $ok:expr)? $(, sole = $sole:path)? $(,)?) => {
+    ($(#[$attr:meta])* $policy:ty, $t:ty, $f:path $(, ok = $ok:expr)? $(, sole = $sole:path)? $(,)?) => {
         $crate::impl_crefclone!(
-            @impl $policy, $t, <$t as $crate::CCell>::C, $f, [$($ok)?], [$($sole)?]
+            @impl [$(#[$attr])*] $policy, $t, <$t as $crate::CCell>::C, $f, [$($ok)?], [$($sole)?]
         );
     };
 }
@@ -678,10 +700,11 @@ macro_rules! impl_cguarded {
 /// routine frees a `byte_len`-byte buffer from this allocator family.
 #[macro_export]
 macro_rules! impl_clendrop {
-    ($policy:ty, $f:path) => {
+    ($(#[$attr:meta])* $policy:ty, $f:path) => {
         // SAFETY: the invoker asserts `$f` frees a `byte_len`-byte buffer from
         // this allocator family.
         unsafe impl $crate::CLenDrop for $policy {
+            $(#[$attr])*
             #[inline]
             #[allow(unused_unsafe)]
             unsafe fn c_drop_len(&self, ptr: *mut u8, byte_len: usize) {
@@ -715,18 +738,13 @@ macro_rules! impl_clendrop {
 /// omitted).
 #[macro_export]
 macro_rules! impl_clenclone {
-    ($policy:ty, $f:path, align = $align:expr) => {
-        $crate::impl_clenclone!(@impl $policy, $f, $align);
-    };
-    ($policy:ty, $f:path) => {
-        $crate::impl_clenclone!(@impl $policy, $f, 1);
-    };
-    (@impl $policy:ty, $f:path, $align:expr) => {
+    (@impl [$(#[$attr:meta])*] $policy:ty, $f:path, $align:expr) => {
         // SAFETY: the invoker asserts `$f` returns a fresh `byte_len`-byte
         // copy, or NULL, that the policy releases.
         unsafe impl $crate::CLenClone for $policy {
             const ALIGN: usize = $align;
 
+            $(#[$attr])*
             #[inline]
             #[allow(unused_unsafe)]
             unsafe fn c_clone_len(
@@ -739,6 +757,12 @@ macro_rules! impl_clenclone {
                 ::core::ptr::NonNull::new(copy)
             }
         }
+    };
+    ($(#[$attr:meta])* $policy:ty, $f:path, align = $align:expr) => {
+        $crate::impl_clenclone!(@impl [$(#[$attr])*] $policy, $f, $align);
+    };
+    ($(#[$attr:meta])* $policy:ty, $f:path) => {
+        $crate::impl_clenclone!(@impl [$(#[$attr])*] $policy, $f, 1);
     };
 }
 
@@ -763,10 +787,11 @@ macro_rules! impl_clenclone {
 /// validate or be `unsafe`.
 #[macro_export]
 macro_rules! impl_cdispose {
-    ($policy:ty, $t:ty, $f:path) => {
+    ($(#[$attr:meta])* $policy:ty, $t:ty, $f:path) => {
         // SAFETY: the invoker asserts `$f` disposes a live value's resources
         // once without freeing its storage.
         unsafe impl $crate::CDispose<$t> for $policy {
+            $(#[$attr])*
             #[inline]
             #[allow(unused_unsafe)]
             unsafe fn c_dispose(&self, ptr: ::core::ptr::NonNull<$t>) {
