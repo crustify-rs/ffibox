@@ -73,6 +73,7 @@ allocated it — a `CBox` usually points at memory C allocated.
 
 | doc | what is in it |
 |-----|---------------|
+| [goals.md](docs/goals.md) | what the primitives aim for, in both directions, and how each aim is checked |
 | [examples.md](docs/examples.md) | seven self-contained wrappers, each compiled as a doctest |
 | [ownership.md](docs/ownership.md) | `CBox`, `CVal`, `CStrBox`, `CVec`, `CArc`; the lifecycle policies; picking an owner and a policy |
 | [borrows.md](docs/borrows.md) | `Foo`, `FooRef`, `FooMut`, `FooLocked`, `CGuard`, `CGuardedRef`, `CSlice`; where the accessors live; the seam traits |
