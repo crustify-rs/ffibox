@@ -514,6 +514,25 @@ impl<T> CPayload<T> {
     }
 }
 
+/// Take a box as the payload, without moving the value.
+#[cfg(feature = "alloc")]
+impl<T> From<alloc::boxed::Box<T>> for CPayload<T> {
+    #[inline]
+    fn from(b: alloc::boxed::Box<T>) -> Self {
+        Self(b)
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<T> CPayload<T> {
+    /// The value, back in a box, as before it was handed to C.
+    #[inline]
+    #[must_use]
+    pub fn into_box(self) -> alloc::boxed::Box<T> {
+        self.0
+    }
+}
+
 #[cfg(feature = "alloc")]
 impl<T> core::fmt::Debug for CPayload<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

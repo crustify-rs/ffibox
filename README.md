@@ -92,6 +92,7 @@ When it is Rust's memory that C holds, calls or reads →
 | [ownership.md](docs/ownership.md) | `CBox`, `CVal`, `CStrBox`, `CVec`, `CArc`; the lifecycle policies; picking an owner and a policy |
 | [borrows.md](docs/borrows.md) | `Foo`, `FooRef`, `FooMut`, `FooLocked`, `CGuard`, `CGuardedRef`, `CSlice`; where the accessors live; the seam traits |
 | [outbound.md](docs/outbound.md) | Rust's side: `RustAlloc`, `CClosure`, `CPayload`, out-parameters, the panic barrier, the `export_*!` macros |
+| [patterns.md](docs/patterns.md) | C's iteration, error and callback conventions as Rust's iterators, `Result` and closures |
 | [hand-written.md](docs/hand-written.md) | the wrappers `define_ctype!` cannot express |
 
 ## Maintainers

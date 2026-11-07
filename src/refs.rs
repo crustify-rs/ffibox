@@ -840,6 +840,83 @@ impl<D: CDrop<c_char>> fmt::Debug for CStrBox<D> {
     }
 }
 
+impl<D: CDrop<c_char>> core::ops::Deref for CStrBox<D> {
+    type Target = core::ffi::CStr;
+
+    /// The string, as `CString` derefs to it: [`as_c_str`](Self::as_c_str).
+    #[inline]
+    fn deref(&self) -> &core::ffi::CStr {
+        self.as_c_str()
+    }
+}
+
+impl<D: CDrop<c_char>> AsRef<core::ffi::CStr> for CStrBox<D> {
+    #[inline]
+    fn as_ref(&self) -> &core::ffi::CStr {
+        self.as_c_str()
+    }
+}
+
+impl<D: CDrop<c_char>> core::borrow::Borrow<core::ffi::CStr> for CStrBox<D> {
+    #[inline]
+    fn borrow(&self) -> &core::ffi::CStr {
+        self.as_c_str()
+    }
+}
+
+/// Compared by content, as `CString` is, whatever the policies.
+impl<D: CDrop<c_char>, E: CDrop<c_char>> PartialEq<CStrBox<E>> for CStrBox<D> {
+    #[inline]
+    fn eq(&self, other: &CStrBox<E>) -> bool {
+        self.as_c_str() == other.as_c_str()
+    }
+}
+impl<D: CDrop<c_char>> Eq for CStrBox<D> {}
+
+impl<D: CDrop<c_char>> PartialEq<core::ffi::CStr> for CStrBox<D> {
+    #[inline]
+    fn eq(&self, other: &core::ffi::CStr) -> bool {
+        self.as_c_str() == other
+    }
+}
+
+impl<D: CDrop<c_char>> PartialEq<&core::ffi::CStr> for CStrBox<D> {
+    #[inline]
+    fn eq(&self, other: &&core::ffi::CStr) -> bool {
+        self.as_c_str() == *other
+    }
+}
+
+impl<D: CDrop<c_char>> PartialOrd for CStrBox<D> {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl<D: CDrop<c_char>> Ord for CStrBox<D> {
+    #[inline]
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.as_c_str().cmp(other.as_c_str())
+    }
+}
+
+/// Hashed by content, consistently with `Borrow<CStr>`.
+impl<D: CDrop<c_char>> core::hash::Hash for CStrBox<D> {
+    #[inline]
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.as_c_str().hash(state);
+    }
+}
+
+/// A copy into Rust's allocator, releasing the C string through its policy.
+#[cfg(feature = "alloc")]
+impl<D: CDrop<c_char>> From<CStrBox<D>> for alloc::ffi::CString {
+    #[inline]
+    fn from(s: CStrBox<D>) -> Self {
+        s.as_c_str().into()
+    }
+}
+
 impl<D: CDrop<c_char>> fmt::Pointer for CStrBox<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Pointer::fmt(&self.as_ptr(), f)
@@ -1462,6 +1539,80 @@ impl<T, S: CLenDrop> fmt::Debug for CVec<T, S> {
             .field("ptr", &self.as_ptr())
             .field("len", &self.len)
             .finish()
+    }
+}
+
+/// The elements, as `Vec` derefs to a slice: plain data and owners only.
+impl<T: CSliceElem, S: CLenDrop> core::ops::Deref for CVec<T, S> {
+    type Target = [T];
+
+    #[inline]
+    fn deref(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+
+impl<T: CSliceElem, S: CLenDrop> core::ops::DerefMut for CVec<T, S> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [T] {
+        self.as_mut_slice()
+    }
+}
+
+impl<T: CSliceElem, S: CLenDrop> AsRef<[T]> for CVec<T, S> {
+    #[inline]
+    fn as_ref(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+
+impl<T: CSliceElem, S: CLenDrop> AsMut<[T]> for CVec<T, S> {
+    #[inline]
+    fn as_mut(&mut self) -> &mut [T] {
+        self.as_mut_slice()
+    }
+}
+
+impl<'a, T: CSliceElem, S: CLenDrop> IntoIterator for &'a CVec<T, S> {
+    type Item = &'a T;
+    type IntoIter = core::slice::Iter<'a, T>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+impl<'a, T: CSliceElem, S: CLenDrop> IntoIterator for &'a mut CVec<T, S> {
+    type Item = &'a mut T;
+    type IntoIter = core::slice::IterMut<'a, T>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_mut_slice().iter_mut()
+    }
+}
+
+/// Compared element-wise, as `Vec` is, whatever the policies.
+impl<T: CSliceElem + PartialEq, S: CLenDrop, S2: CLenDrop> PartialEq<CVec<T, S2>> for CVec<T, S> {
+    #[inline]
+    fn eq(&self, other: &CVec<T, S2>) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+impl<T: CSliceElem + Eq, S: CLenDrop> Eq for CVec<T, S> {}
+
+impl<T: CSliceElem + PartialEq, S: CLenDrop> PartialEq<[T]> for CVec<T, S> {
+    #[inline]
+    fn eq(&self, other: &[T]) -> bool {
+        self.as_slice() == other
+    }
+}
+
+impl<T: CSliceElem + core::hash::Hash, S: CLenDrop> core::hash::Hash for CVec<T, S> {
+    #[inline]
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.as_slice().hash(state);
     }
 }
 

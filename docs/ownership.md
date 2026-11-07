@@ -28,6 +28,11 @@ For the borrowed side — handles over objects C or a parent releases — see
   `CBox`'s `from_c` / `into_c` / `as_c_ptr` speak the C type, so C interop is
   cast-free. The handles have seams of their own — see
   [borrows.md](borrows.md#conventions).
+- **The owners behave like their std counterparts where ownership allows.**
+  `CStrBox` derefs to `CStr` and compares and hashes by content, as `CString`
+  does, and converts into one; a `CVec` of plain data or owners derefs to a
+  slice and compares element-wise, as `Vec` does. A `CVec` of C objects does
+  not deref: its elements are reached through handles.
 - **Constructing through the policy is safe.** `new`, `new_zeroed` and
   `new_uninit` (each with a `_with(policy)` form) allocate through the routine
   the owner frees with, and return `None` when C fails, as `from_raw` does on

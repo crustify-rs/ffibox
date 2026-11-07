@@ -120,6 +120,7 @@ pub mod refs;
 #[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
 pub mod rust_alloc;
 pub mod shared;
+pub mod status;
 pub mod traits;
 
 // Re-export the primary items at the crate root for convenience.
