@@ -100,6 +100,9 @@ pub unsafe trait CDrop<T> {
 ///   C type itself treats as immutable), that this policy's `c_drop` releases.
 /// - `None` must mean the C routine failed.
 /// - `c_dup` must not invalidate `ptr`.
+/// - For `T = c_char`, `c_dup` must copy any live NUL-terminated string,
+///   wherever it lives, reading it only, as `strdup` does:
+///   [`CStrBox::from_c_str`] hands it a Rust-side `CStr`.
 ///
 /// # Example
 ///
@@ -552,6 +555,44 @@ unsafe impl<T: CPlainElem, const N: usize> CPlainElem for [T; N] {}
 // SAFETY: a ZST has one bit pattern, the empty one.
 unsafe impl CPlainElem for () {}
 
+/// Elements a [`CVec`] hands out as a real `&[Self]` / `&mut [Self]`: Rust
+/// values rather than C objects, which a reference may cover while the
+/// buffer is owned.
+///
+/// Two kinds qualify:
+///
+/// - **plain data**, every [`CPlainElem`], by a blanket impl;
+/// - **owners**, whose value is a pointer the element owns: `CBox`,
+///   `CStrBox` and `CArc`, bare or in an `Option` for a nullable slot, and
+///   `CVal`. A buffer of them is C's `foo **` (or `foo *` of disposable
+///   values), each slot released by its element type's own policy when the
+///   `CVec` drops — as a `Vec<Box<T>>` drops each box.
+///
+/// A wrapped C object (a [`CCell`] layout type) does not qualify: C may write
+/// it behind a reference, so a buffer of those is reached through
+/// [`CVec::as_handles`] instead.
+///
+/// ```compile_fail,E0599
+/// # use ffibox::{define_ctype, CLenDrop, CVec};
+/// # #[repr(C)] pub struct obj_st { x: u8 }
+/// define_ctype!(Obj, ObjRef, ObjMut, obj_st);
+/// # struct Free;
+/// # unsafe impl CLenDrop for Free { unsafe fn c_drop_len(&self, _: *mut u8, _: usize) {} }
+/// fn view(v: &CVec<Obj, Free>) -> &[Obj] {
+///     v.as_slice() // `Obj` is a C object, not a `CSliceElem`
+/// }
+/// ```
+///
+/// # Safety
+///
+/// `Self` must not be a C object whose bytes C may change behind a
+/// reference: a reference to a `Self` the buffer owns asserts nothing about
+/// memory C writes.
+pub unsafe trait CSliceElem {}
+
+// SAFETY: plain data is a Rust value with no C-side identity.
+unsafe impl<T: CPlainElem> CSliceElem for T {}
+
 // ===========================================================================
 // Length-aware buffer policies — drive CVec's cleanup / clone
 // ===========================================================================
@@ -632,6 +673,36 @@ pub unsafe trait CLenClone: CLenDrop {
     /// `ptr` must be valid for reads of `byte_len` bytes for the call, from any
     /// allocator; the routine does not write through it.
     unsafe fn c_clone_len(&self, ptr: *mut u8, byte_len: usize) -> Option<NonNull<u8>>;
+}
+
+/// Uninitialised buffer storage from the allocator a [`CLenDrop`] policy
+/// frees into — `malloc(n)` paired with `free`, `lib_malloc` with `lib_free`.
+/// The buffer analogue of [`CAlloc`], and what lets Rust build a buffer C
+/// will free: [`CVec::new_uninit`], filled and promoted with
+/// [`assume_init`](CVec::assume_init), and [`CVec::from_fn`], which fills it
+/// element by element.
+///
+/// The elements may own resources of their own (a `char **` of owned
+/// strings), unlike [`CLenClone`]'s byte copies: the constructors write each
+/// element as a value.
+///
+/// # Safety
+///
+/// - A `Some` from [`c_alloc_len`](Self::c_alloc_len) must be a fresh,
+///   uniquely-owned allocation of `byte_len` bytes, aligned to at least
+///   [`ALIGN`](Self::ALIGN), that this policy's
+///   [`c_drop_len`](CLenDrop::c_drop_len) releases given the same `byte_len`,
+///   without reading it.
+/// - `None` must mean the allocation failed.
+pub unsafe trait CLenAlloc: CLenDrop {
+    /// Alignment every allocation [`c_alloc_len`](Self::c_alloc_len) returns
+    /// is guaranteed to have; the constructors reject an element type aligned
+    /// beyond it at compile time. As [`CLenClone::ALIGN`].
+    const ALIGN: usize = 1;
+
+    /// Allocate `byte_len` uninitialised bytes, or `None` on failure. Never
+    /// called with `byte_len == 0`: an empty buffer is NULL.
+    fn c_alloc_len(&self, byte_len: usize) -> Option<NonNull<u8>>;
 }
 
 // ---------------------------------------------------------------------------

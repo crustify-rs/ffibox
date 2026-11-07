@@ -30,6 +30,15 @@
 //! | [`impl_clenclone!`](crate::impl_clenclone) | [`CLenClone`](crate::CLenClone) | a buffer memdup |
 //! | [`impl_cdispose!`](crate::impl_cdispose) | [`CDispose<T>`](crate::CDispose) | a `*_uninit` / `*_clear` |
 //! | [`impl_cguarded!`](crate::impl_cguarded) | [`CGuarded`](crate::CGuarded) (and the `FooLocked` handle), on the layout type | the C lock / unlock |
+//!
+//! The export macros are their counterparts: each offers a policy to C as an
+//! `extern "C"` routine with the C type's signature.
+//!
+//! | Macro | Defines | From |
+//! |-------|---------|------|
+//! | [`export_cdrop!`](crate::export_cdrop) | `void foo_free(foo *)` | [`CDrop<T>`](crate::CDrop) |
+//! | [`export_cdupclone!`](crate::export_cdupclone) | `foo *foo_dup(foo *)` | [`CDupClone<T>`](crate::CDupClone) |
+//! | [`export_cnew!`](crate::export_cnew) | `foo *foo_new(void)` | [`CNew<T>`](crate::CNew) |
 
 /// Define a wrapped `*-sys` type: the layout newtype plus its two borrowed
 /// handles, and the [`CCell`](crate::CCell) impl linking them.
@@ -799,6 +808,94 @@ macro_rules! impl_cdispose {
                 // SAFETY: the caller upholds `c_dispose`'s contract.
                 let _ = unsafe { $f(raw) };
             }
+        }
+    };
+}
+
+// ===========================================================================
+// Exports: offer a policy to C as a routine
+// ===========================================================================
+//
+// The counterparts of the policy macros. Where `impl_cdrop!` binds a C
+// routine to a policy, `export_cdrop!` offers a policy to C as a routine,
+// with the C type's signature: what a ported module's `ffi_export` gateway
+// gives the C that still frees, copies or constructs its objects.
+
+/// Define an `extern "C"` routine that releases one object through a policy:
+/// the counterpart of [`impl_cdrop!`](crate::impl_cdrop), for C that frees an
+/// object Rust allocates.
+///
+/// ```ignore
+/// mod ffi_export {
+///     use super::*;
+///     ffibox::export_cdrop!(#[unsafe(no_mangle)] pub foo_free, Foo, RustAlloc);
+/// }
+/// // extern "C" fn foo_free(ptr: *mut ffi::foo_st), a no-op on NULL.
+/// ```
+///
+/// The policy is built with `Default`. The routine is `unsafe` to call: C
+/// hands over one claim on a live object the policy releases, or NULL.
+/// Outer attributes, `#[unsafe(no_mangle)]` among them, go on the routine.
+#[macro_export]
+macro_rules! export_cdrop {
+    ($(#[$attr:meta])* $vis:vis $name:ident, $t:ty, $policy:ty $(,)?) => {
+        $(#[$attr])*
+        $vis unsafe extern "C" fn $name(ptr: *mut <$t as $crate::CCell>::C) {
+            if let ::core::option::Option::Some(ptr) = ::core::ptr::NonNull::new(ptr) {
+                let policy: $policy = ::core::default::Default::default();
+                // SAFETY: the caller hands over one claim on a live object
+                // this policy releases.
+                unsafe { <$policy as $crate::CDrop<$t>>::c_drop(&policy, ptr.cast::<$t>()) }
+            }
+        }
+    };
+}
+
+/// Define an `extern "C"` routine that deep-copies one object through a
+/// policy: the counterpart of [`impl_cdupclone!`](crate::impl_cdupclone).
+/// Returns NULL for a NULL argument or a failed copy.
+///
+/// ```ignore
+/// ffibox::export_cdupclone!(#[unsafe(no_mangle)] pub foo_dup, Foo, FooPolicy);
+/// // extern "C" fn foo_dup(ptr: *mut ffi::foo_st) -> *mut ffi::foo_st
+/// ```
+///
+/// The routine is `unsafe` to call: C passes a live object, or NULL.
+#[macro_export]
+macro_rules! export_cdupclone {
+    ($(#[$attr:meta])* $vis:vis $name:ident, $t:ty, $policy:ty $(,)?) => {
+        $(#[$attr])*
+        $vis unsafe extern "C" fn $name(
+            ptr: *mut <$t as $crate::CCell>::C,
+        ) -> *mut <$t as $crate::CCell>::C {
+            let ::core::option::Option::Some(ptr) = ::core::ptr::NonNull::new(ptr) else {
+                return ::core::ptr::null_mut();
+            };
+            let policy: $policy = ::core::default::Default::default();
+            // SAFETY: the caller passes a live object.
+            let copy = unsafe { <$policy as $crate::CDupClone<$t>>::c_dup(&policy, ptr.cast::<$t>()) };
+            copy.map_or(::core::ptr::null_mut(), |p| p.as_ptr().cast())
+        }
+    };
+}
+
+/// Define an `extern "C"` routine that constructs one object through a
+/// policy's [`CNew`](crate::CNew): the counterpart of a policy's constructor,
+/// for C that allocates an object Rust frees, or that a Rust allocator now
+/// serves. Returns NULL on failure.
+///
+/// ```ignore
+/// ffibox::export_cnew!(#[unsafe(no_mangle)] pub foo_new, Foo, RustAlloc);
+/// // extern "C" fn foo_new() -> *mut ffi::foo_st
+/// ```
+#[macro_export]
+macro_rules! export_cnew {
+    ($(#[$attr:meta])* $vis:vis $name:ident, $t:ty, $policy:ty $(,)?) => {
+        $(#[$attr])*
+        $vis extern "C" fn $name() -> *mut <$t as $crate::CCell>::C {
+            let policy: $policy = ::core::default::Default::default();
+            <$policy as $crate::CNew<$t>>::c_new(&policy)
+                .map_or(::core::ptr::null_mut(), |p| p.as_ptr().cast())
         }
     };
 }

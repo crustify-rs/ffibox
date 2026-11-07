@@ -45,8 +45,8 @@ use core::ops::{Bound, RangeBounds};
 use core::ptr::NonNull;
 
 use crate::traits::{
-    CAlloc, CAllocZeroed, CCell, CDispose, CDrop, CDupClone, CLenClone, CLenDrop, CNew, CPlainElem,
-    CZeroable,
+    CAlloc, CAllocZeroed, CCell, CDispose, CDrop, CDupClone, CLenAlloc, CLenClone, CLenDrop, CNew,
+    CPlainElem, CSliceElem, CZeroable,
 };
 
 // ---------------------------------------------------------------------------
@@ -391,6 +391,32 @@ impl<T: CCell, D: CDrop<T>> CBox<T, D> {
         unsafe { Self::from_raw_with(ptr.cast(), policy) }
     }
 
+    /// Adopt the object a C routine returns through an out-parameter
+    /// (`int foo_open(foo **out, …)`), with the routine's own return value:
+    /// the slot starts NULL, and is adopted under `D::default()` whatever the
+    /// routine returns, so an object it hands over on failure is still freed.
+    ///
+    /// ```ignore
+    /// // SAFETY: `foo_open` stores an owned `foo` or NULL in its slot.
+    /// let (rc, foo) = unsafe { FooBox::from_c_out(|out| ffi::foo_open(out, path)) };
+    /// if rc < 0 { return Err(Error::from(rc)); }
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// `f` leaves NULL or an object [`from_raw`](Self::from_raw) may adopt in
+    /// the slot.
+    #[inline]
+    pub unsafe fn from_c_out<R>(f: impl FnOnce(*mut *mut T::C) -> R) -> (R, Option<Self>)
+    where
+        D: Default,
+    {
+        let mut slot: *mut T::C = core::ptr::null_mut();
+        let ret = f(&raw mut slot);
+        // SAFETY: the caller vouches for what `f` left in the slot.
+        (ret, unsafe { Self::from_c(slot) })
+    }
+
     /// [`into_raw`](Self::into_raw) as the C type's pointer.
     #[inline]
     #[must_use = "the returned pointer owns the object and must be freed"]
@@ -665,6 +691,25 @@ impl<D: CDrop<c_char>> CStrBox<D> {
         NonNull::new(ptr).map(|ptr| Self { ptr, policy })
     }
 
+    /// Adopt the string a C routine returns through an out-parameter
+    /// (`int get_name(obj *o, char **out)`), with the routine's own return
+    /// value; as [`CBox::from_c_out`].
+    ///
+    /// # Safety
+    ///
+    /// `f` leaves NULL or a string [`from_raw`](Self::from_raw) may adopt in
+    /// the slot.
+    #[inline]
+    pub unsafe fn from_raw_out<R>(f: impl FnOnce(*mut *mut c_char) -> R) -> (R, Option<Self>)
+    where
+        D: Default,
+    {
+        let mut slot: *mut c_char = core::ptr::null_mut();
+        let ret = f(&raw mut slot);
+        // SAFETY: the caller vouches for what `f` left in the slot.
+        (ret, unsafe { Self::from_raw(slot) })
+    }
+
     /// The string for passing to C. Ownership is retained.
     ///
     /// `*const`, like [`CStr::as_ptr`](core::ffi::CStr::as_ptr), because the
@@ -740,6 +785,30 @@ impl<D: CDrop<c_char>> Drop for CStrBox<D> {
     }
 }
 
+impl<D: CDupClone<c_char>> CStrBox<D> {
+    /// Copy a Rust-side string into the policy's allocator (`strdup`) under
+    /// `D::default()`; `None` if the C copy failed. The way Rust hands C a
+    /// string it will free.
+    #[inline]
+    pub fn from_c_str(s: &core::ffi::CStr) -> Option<Self>
+    where
+        D: Default,
+    {
+        Self::from_c_str_with(s, D::default())
+    }
+
+    /// As [`from_c_str`](Self::from_c_str), under `policy`.
+    #[inline]
+    pub fn from_c_str_with(s: &core::ffi::CStr, policy: D) -> Option<Self> {
+        let src = NonNull::from(s).cast::<c_char>();
+        // SAFETY: `src` is a live NUL-terminated string for the call, which
+        // `CDupClone<c_char>` lets `c_dup` copy wherever it lives, reading
+        // it only; a `Some` is a fresh copy the policy releases.
+        let ptr = unsafe { policy.c_dup(src) }?;
+        Some(Self { ptr, policy })
+    }
+}
+
 impl<D: CDupClone<c_char> + Clone> CStrBox<D> {
     /// Deep copy (`strdup`) through the policy; `None` if the C copy failed.
     #[inline]
@@ -791,10 +860,17 @@ unsafe impl<D: CDrop<c_char> + Sync> Sync for CStrBox<D> {}
 /// Owned C-allocated array of `len` elements, released on drop by the policy's
 /// [`c_drop_len`](CLenDrop::c_drop_len) with the total byte length.
 ///
-/// Plain elements ([`CPlainElem`]) read out as a real `&[T]`, which is sound
-/// because the buffer is owned exclusively. Wrapped C objects come out as
-/// handles through [`as_handles`](Self::as_handles), since `&[Foo]` would be a
-/// reference covering them.
+/// Plain elements and owners ([`CSliceElem`]) read out as a real `&[T]`,
+/// which is sound because the buffer is owned exclusively. Wrapped C objects
+/// come out as handles through [`as_handles`](Self::as_handles), since
+/// `&[Foo]` would be a reference covering them.
+///
+/// **Dropping a `CVec` drops its elements**, as dropping a `Vec` does, then
+/// frees the buffer. Which elements own something is their type's to say: a
+/// `CVec<Option<CBox<Foo, FooFree>>, S>` is a `foo **` whose every non-null
+/// slot `foo_free` releases, a `CVec<*mut ffi::foo, S>` one whose slots own
+/// nothing — the shape for an array whose own free routine releases the
+/// elements too, as `foo_array_free(arr, n)` does.
 ///
 /// **NULL with length 0 is a valid, empty `CVec`**, which C commonly returns
 /// for an empty array: adopt it with
@@ -1004,14 +1080,14 @@ impl<T, S: CLenDrop> CVec<T, S> {
     }
 }
 
-impl<T: CPlainElem, S: CLenDrop> CVec<T, S> {
+impl<T: CSliceElem, S: CLenDrop> CVec<T, S> {
     /// The elements as a slice.
     #[inline]
     #[must_use]
     pub fn as_slice(&self) -> &[T] {
         // SAFETY: `len` initialised elements at `data()` per `from_raw_parts`
-        // (none, at an aligned dangling pointer, when NULL), each valid by
-        // `T: CPlainElem`, owned exclusively; bound by `&self`.
+        // (none, at an aligned dangling pointer, when NULL), Rust values by
+        // `T: CSliceElem`, owned exclusively; bound by `&self`.
         unsafe { core::slice::from_raw_parts(self.data().as_ptr(), self.len) }
     }
 
@@ -1081,10 +1157,158 @@ impl<T, S: CLenDrop> Drop for CVec<T, S> {
     #[inline]
     fn drop(&mut self) {
         // A NULL buffer owns no allocation; some frees reject NULL.
-        if let Some(ptr) = self.ptr {
-            // SAFETY: `byte_len` bytes at `ptr` from the policy's allocator.
-            unsafe { self.policy.c_drop_len(ptr.as_ptr().cast(), self.byte_len()) }
+        let Some(ptr) = self.ptr else { return };
+        // Frees the buffer however the element drops end, a panic included.
+        let _free = FreeBuffer {
+            ptr: ptr.as_ptr().cast(),
+            byte_len: self.byte_len(),
+            policy: &self.policy,
+        };
+        if core::mem::needs_drop::<T>() {
+            // SAFETY: `len` initialised elements this buffer owns, dropped
+            // once here; nothing reads them afterwards.
+            unsafe {
+                core::ptr::drop_in_place(core::ptr::slice_from_raw_parts_mut(
+                    ptr.as_ptr(),
+                    self.len,
+                ))
+            }
         }
+    }
+}
+
+/// Frees a buffer through its policy when dropped: the last step of a
+/// [`CVec`]'s drop, and the cleanup of a constructor that fails or panics
+/// part-way.
+struct FreeBuffer<'a, S: CLenDrop> {
+    ptr: *mut u8,
+    byte_len: usize,
+    policy: &'a S,
+}
+
+impl<S: CLenDrop> Drop for FreeBuffer<'_, S> {
+    #[inline]
+    fn drop(&mut self) {
+        // SAFETY: the creator hands over a live `byte_len`-byte allocation of
+        // the policy's allocator, whose elements are dropped or were never
+        // written.
+        unsafe { self.policy.c_drop_len(self.ptr, self.byte_len) }
+    }
+}
+
+impl<T, S: CLenAlloc> CVec<T, S> {
+    /// The byte length of `len` elements, checked: `None` on overflow. Rejects
+    /// zero-sized and over-aligned elements at compile time.
+    #[inline]
+    fn alloc_len(len: usize) -> Option<usize> {
+        const {
+            assert!(
+                core::mem::size_of::<T>() != 0,
+                "zero-sized elements need no buffer"
+            );
+            assert!(
+                core::mem::align_of::<T>() <= <S as CLenAlloc>::ALIGN,
+                "the policy's allocator cannot align T"
+            );
+        }
+        len.checked_mul(core::mem::size_of::<T>())
+    }
+
+    /// A buffer of `len` elements, each `f(i)` in order, from the policy's
+    /// allocator under `S::default()` — the way Rust builds an array C will
+    /// free, as [`core::array::from_fn`] builds one Rust keeps. `None` if the
+    /// allocation failed; a `len` of 0 is the empty, NULL buffer.
+    ///
+    /// The elements may own resources: a `char **` of owned strings is a
+    /// `CVec<Option<CStrBox<LibFree>>, LibFree>`. If `f` panics, the elements
+    /// written so far are dropped and the buffer freed.
+    #[inline]
+    pub fn from_fn(len: usize, f: impl FnMut(usize) -> T) -> Option<Self>
+    where
+        S: Default,
+    {
+        Self::from_fn_with(len, S::default(), f)
+    }
+
+    /// As [`from_fn`](Self::from_fn), under `policy`.
+    pub fn from_fn_with(len: usize, policy: S, mut f: impl FnMut(usize) -> T) -> Option<Self> {
+        let byte_len = Self::alloc_len(len)?;
+        if len == 0 {
+            return Some(Self::empty_with(policy));
+        }
+        let base = policy.c_alloc_len(byte_len)?.cast::<T>();
+
+        /// Drops the elements written so far, then frees the buffer, unless
+        /// disarmed by a complete fill.
+        struct Filling<'a, T, S: CLenDrop> {
+            base: NonNull<T>,
+            written: usize,
+            free: ManuallyDrop<FreeBuffer<'a, S>>,
+        }
+        impl<T, S: CLenDrop> Drop for Filling<'_, T, S> {
+            fn drop(&mut self) {
+                // SAFETY: `written` elements at `base` are initialised and
+                // owned by nothing else; the buffer is freed once, after.
+                unsafe {
+                    core::ptr::drop_in_place(core::ptr::slice_from_raw_parts_mut(
+                        self.base.as_ptr(),
+                        self.written,
+                    ));
+                    ManuallyDrop::drop(&mut self.free);
+                }
+            }
+        }
+
+        let mut fill = Filling {
+            base,
+            written: 0,
+            free: ManuallyDrop::new(FreeBuffer {
+                ptr: base.as_ptr().cast(),
+                byte_len,
+                policy: &policy,
+            }),
+        };
+        while fill.written < len {
+            let value = f(fill.written);
+            // SAFETY: `written < len`, within the `byte_len`-byte allocation,
+            // aligned for `T` by `S::ALIGN >= align_of::<T>()`; the slot is
+            // uninitialised, so nothing is overwritten.
+            unsafe { base.as_ptr().add(fill.written).write(value) };
+            fill.written += 1;
+        }
+        core::mem::forget(fill);
+        Some(Self {
+            ptr: Some(base),
+            len,
+            policy,
+        })
+    }
+
+    /// A buffer of `len` uninitialised elements from the policy's allocator,
+    /// under `S::default()`, for C or Rust to fill before
+    /// [`assume_init`](CVec::assume_init). `None` if the allocation failed; a
+    /// `len` of 0 is the empty, NULL buffer.
+    #[inline]
+    pub fn new_uninit(len: usize) -> Option<CVec<MaybeUninit<T>, S>>
+    where
+        S: Default,
+    {
+        Self::new_uninit_with(len, S::default())
+    }
+
+    /// As [`new_uninit`](Self::new_uninit), under `policy`.
+    #[inline]
+    pub fn new_uninit_with(len: usize, policy: S) -> Option<CVec<MaybeUninit<T>, S>> {
+        let byte_len = Self::alloc_len(len)?;
+        if len == 0 {
+            return Some(CVec::empty_with(policy));
+        }
+        let base = policy.c_alloc_len(byte_len)?.cast::<MaybeUninit<T>>();
+        Some(CVec {
+            ptr: Some(base),
+            len,
+            policy,
+        })
     }
 }
 
@@ -1421,6 +1645,22 @@ impl<T: CCell, D: CDispose<T>> fmt::Debug for CVal<T, D> {
         f.debug_struct("CVal").finish_non_exhaustive()
     }
 }
+
+// The owners are Rust values: a reference to one covers its pointer (or, for
+// a `CVal`, a value Rust holds), never C memory, so a `CVec` of them hands
+// out a real slice.
+// SAFETY: a `CBox` is a pointer and its policy; the object behind it is
+// reached only through handles.
+unsafe impl<T, D: CDrop<T>> CSliceElem for CBox<T, D> {}
+// SAFETY: as above; `None` is a NULL slot.
+unsafe impl<T, D: CDrop<T>> CSliceElem for Option<CBox<T, D>> {}
+// SAFETY: a `CStrBox` is a pointer and its policy; its views are read-only.
+unsafe impl<D: CDrop<c_char>> CSliceElem for CStrBox<D> {}
+// SAFETY: as above.
+unsafe impl<D: CDrop<c_char>> CSliceElem for Option<CStrBox<D>> {}
+// SAFETY: a `CVal` in a buffer the `CVec` owns is Rust-owned storage, as a
+// `CVal` local is; its handles are reached through `as_ref` / `as_mut`.
+unsafe impl<T: CCell, D: CDispose<T>> CSliceElem for CVal<T, D> {}
 
 // ===========================================================================
 // Run views — borrowed runs of contiguous elements, never a `&[T]`

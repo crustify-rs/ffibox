@@ -107,11 +107,18 @@
 #![no_std]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+#[cfg(feature = "alloc")]
+extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+pub mod callback;
+pub mod iter;
 pub mod macros;
 pub mod refs;
+#[cfg(feature = "alloc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+pub mod rust_alloc;
 pub mod shared;
 pub mod traits;
 
@@ -125,10 +132,15 @@ pub mod traits;
 #[doc = include_str!("../docs/examples.md")]
 pub struct DocExamples;
 
+pub use crate::callback::CClosure;
+#[cfg(feature = "alloc")]
+pub use crate::callback::CPayload;
 pub use crate::refs::{CBorrowedPtr, CBox, CSlice, CSliceMut, CStrBox, CVal, CVec};
+#[cfg(feature = "alloc")]
+pub use crate::rust_alloc::RustAlloc;
 pub use crate::shared::{CArc, CGuard, CGuardedRef};
 pub use crate::traits::{
-    CAlloc, CAllocZeroed, CCell, CDispose, CDrop, CDupClone, CGuarded, CGuardedAll, CLenClone,
-    CLenDrop, CLockedSeam, CMutSeam, CNew, CPlainElem, CRefClone, CRefSeam, CZeroable, LockFields,
-    LockScope, LockWhole,
+    CAlloc, CAllocZeroed, CCell, CDispose, CDrop, CDupClone, CGuarded, CGuardedAll, CLenAlloc,
+    CLenClone, CLenDrop, CLockedSeam, CMutSeam, CNew, CPlainElem, CRefClone, CRefSeam, CSliceElem,
+    CZeroable, LockFields, LockScope, LockWhole,
 };

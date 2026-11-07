@@ -16,8 +16,12 @@ categories = ["api-bindings", "rust-patterns", "no-std", "memory-management"]
 [features]
 default = ["std"]
 # Selects `std::process::abort` for the unrecoverable-failure path; without it
-# that path is a double-panic.
-std = []
+# that path is a double-panic. Also enables the panic barrier of the outbound
+# callbacks, which needs `catch_unwind`.
+std = ["alloc"]
+# The policy over Rust's global allocator (`RustAlloc`) and the payloads C
+# holds (`CPayload`), which allocate through it.
+alloc = []
 
 [package.metadata.docs.rs]
 all-features = true

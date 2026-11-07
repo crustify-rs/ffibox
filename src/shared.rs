@@ -461,6 +461,12 @@ unsafe impl<T: Send + Sync, D: CDrop<T> + Send + Sync> Send for CArc<T, D> {}
 // SAFETY: as above.
 unsafe impl<T: Send + Sync, D: CDrop<T> + Send + Sync> Sync for CArc<T, D> {}
 
+// SAFETY: a `CArc` is a pointer and its policy, a Rust value; the object is
+// reached only through handles, so a `CVec` of them hands out a real slice.
+unsafe impl<T, D: CDrop<T>> crate::CSliceElem for CArc<T, D> {}
+// SAFETY: as above; `None` is a NULL slot.
+unsafe impl<T, D: CDrop<T>> crate::CSliceElem for Option<CArc<T, D>> {}
+
 // ---------------------------------------------------------------------------
 // CGuardedRef<'a, T> — a borrow reached only through the object's lock
 // ---------------------------------------------------------------------------
