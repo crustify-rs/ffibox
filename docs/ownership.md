@@ -15,7 +15,7 @@ For the borrowed side — handles over objects C or a parent releases — see
 | owners | `CBox<Foo, P>` | ffibox | the sole owner of an object behind a pointer, released by `P` on drop; `Clone` when `P` deep-copies; built safely by `new` / `new_zeroed` / `new_uninit` when `P` constructs |
 | | `CVal<Foo, P>` | ffibox | an owned value held inline, its resources disposed by `P` on drop |
 | | `CStrBox<P>` | ffibox | an owned NUL-terminated `char *`; read-only `CStr` / `str` / byte views |
-| | `CVec<T, P>` | ffibox | an owned `(ptr, len)` array, NULL when empty; `&[T]` for plain elements, `CSlice` for wrapped C objects; `from_slice` copies a Rust slice into `P`'s allocator |
+| | `CVec<T, P>` | ffibox | an owned `(ptr, len)` array, NULL when empty; drops its elements, then frees the buffer; `&[T]` for plain elements and owners, `CSlice` for wrapped C objects; `from_fn` / `new_uninit` build one in `P`'s allocator, `from_slice` copies a Rust slice into it |
 | shared owner | `CArc<Foo, P>` | ffibox | one counted reference to a refcounted object; `Clone` through the up_ref; the shared handle always, `get_mut` / `make_mut` when the count proves it sole or after a copy, and `lock()` → `CGuard` when `Foo` is `CGuarded` |
 
 ## Conventions
@@ -60,12 +60,23 @@ not, the answer is a borrow instead — see
   `strlen` recovers the length, so one `CDrop<c_char>` policy covers a plain
   free and a clearing free alike. Its views are read-only, like `CStr`.
 - **A counted array** → `CVec<T, P>`, one policy per allocator family. Plain
-  elements (`CPlainElem`: integers, floats, raw pointers, `MaybeUninit`) read out as
-  a real `&[T]` because the buffer is exclusively owned; wrapped C objects come
-  out as handles through `as_handles` → `CSlice`, since `&[Foo]` would cover
-  them. Where C returns NULL with 0 for an empty array, adopt with
-  `from_raw_parts_or_empty`; plain `from_raw_parts` treats every NULL as
-  failure.
+  elements (`CPlainElem`: integers, floats, raw pointers, `MaybeUninit`) and
+  owners (`CSliceElem`) read out as a real `&[T]` because the buffer is
+  exclusively owned; wrapped C objects come out as handles through
+  `as_handles` → `CSlice`, since `&[Foo]` would cover them. Where C returns
+  NULL with 0 for an empty array, adopt with `from_raw_parts_or_empty`; plain
+  `from_raw_parts` treats every NULL as failure.
+
+  Dropping a `CVec` drops its elements, as a `Vec` does, so the element type
+  says what each slot owns:
+
+  | C array | element type |
+  |---------|--------------|
+  | `foo **`, each entry owned, NULL allowed | `Option<CBox<Foo, FooFree>>` |
+  | `char **`, each string owned | `Option<CStrBox<P>>` |
+  | `foo *`, each inline value disposed | `CVal<Foo, FooUninit>` |
+  | freed with its elements by one routine (`foo_array_free(arr, n)`) | the bare pointer or `Foo`, with that routine as the `CLenDrop` |
+  | entries borrowed from elsewhere | the bare pointer |
 - **One object held inline** — a local, a field, an array element, with no
   pointer of its own:
   - owns no resources → the `Foo` itself (`Foo::zeroed()` when it is
@@ -98,6 +109,7 @@ carries `PhantomData<*const ()>` instead (see
 | `CRefClone<T>: CDrop<T>` | `c_up_ref` — a refcount increment on the SAME pointer; `c_is_sole_owner` (default `false`) | `impl_crefclone!(P, Foo, f)`; `…, ok = |r| r == 1`, `…, sole = g` | `CArc`'s `Clone`, `get_mut`, `make_mut` |
 | `CLenDrop` | `c_drop_len` — a buffer free, given the byte length | `impl_clendrop!(P, f)` | `CVec` |
 | `CLenClone: CLenDrop` | `c_clone_len` — a buffer memdup (`T: Copy` only) from any readable source; `ALIGN` (default 1) bounds the element types it can copy | `impl_clenclone!(P, f)`, `impl_clenclone!(P, f, align = 16)` | `CVec`'s `Clone`, `CVec::from_slice`, `CSlice::to_cvec` |
+| `CLenAlloc: CLenDrop` | `c_alloc_len` — uninitialised buffer storage (`malloc(n)`); `ALIGN` as above | by hand | `CVec::from_fn`, `CVec::new_uninit` |
 | `CDispose<T>` | `c_dispose` — `*_uninit` / `*_clear` on a value | `impl_cdispose!(P, Foo, f)` | `CVal` |
 | `CNew<T>: CDrop<T>` | `c_new` — a zero-argument `*_alloc` / `*_new` | by hand | `CBox::new`, `CArc::new` |
 | `CAlloc<T>: CDrop<T> + CDrop<MaybeUninit<T>>` | `c_alloc` — uninitialised storage (`malloc`); the free must not read it | by hand | `CBox::new_uninit` |
@@ -206,6 +218,14 @@ For boxes, strings and buffers.
 | teardown needs runtime state | a hand-written policy; adopt with `from_raw_with` |
 | built in place, not by a C constructor | `CAlloc` → `new_uninit` → `assume_init`, then `with_policy` if a fuller destructor takes over |
 | destructor of another shape | an `unsafe fn` adapter, passed by path |
+| Rust allocates it (`alloc` feature) | `RustAlloc`: objects, buffers and strings from Rust's global allocator |
 
 An owned pointer crosses the FFI boundary on the owner's raw seam: `into_raw`
-surrenders it to C, `from_raw` adopts one C allocated.
+surrenders it to C, `from_raw` adopts one C allocated, and `from_c_out` /
+`from_raw_out` adopt one a C routine returns through an out-parameter.
+
+`RustAlloc` is the policy over Rust's global allocator. An object or buffer
+Rust allocates is held by the same owners and handles as one C allocated, and
+when a type's allocation moves from C to Rust during a port, only its owner's
+alias changes: `CBox<Foo, FooFree>` becomes `CBox<Foo, RustAlloc>`. What it
+allocates only it frees; [outbound.md](outbound.md) covers offering it to C.

@@ -1,9 +1,11 @@
 # ffibox
 
 Generic smart pointers and traits for building safe Rust wrappers over C
-types and pointers. Designed for arbitrary user-space C interop, including the
-case where you need direct field access and a C-ABI-compatible layout (porting
-C internals to Rust in place), not just opaque-handle wrapping.
+types and pointers, in both directions: memory C owns, held from Rust, and
+memory Rust owns that C holds, calls or reads. Designed for arbitrary
+user-space C interop, including the case where you need direct field access
+and a C-ABI-compatible layout (porting C internals to Rust in place), not just
+opaque-handle wrapping.
 
 ## Why
 
@@ -39,7 +41,14 @@ only when the count proves it sole, and — for an object with a C lock — a
 A policy that also constructs gives `CBox` and `CArc` safe constructors that
 allocate through it, so a safely built owner is always freed by the routine
 paired with its allocator.
-Strings, buffers and borrowed runs get their own types.
+Strings, buffers and borrowed runs get their own types; a buffer drops its
+elements, so a `foo **` of owned objects releases each one.
+
+The other direction uses the same terms. `RustAlloc` is the policy over Rust's
+allocator, so an object Rust allocates is held as one C allocated; `CClosure`
+and `CPayload` put a Rust closure behind a C function pointer and its
+context, for one call or until C releases it; the `export_*!` macros offer a
+policy to C as the routine it calls.
 [docs/ownership.md](docs/ownership.md) lists the owners and the policies;
 [docs/borrows.md](docs/borrows.md) lists the handles. Each walks from a C
 declaration to the type it wants.
@@ -53,8 +62,10 @@ ffibox = "0.1"
 
 ffibox is `#![no_std]`. The `std` feature (on by default) selects
 `std::process::abort` for the unrecoverable-failure path (`Clone` or
-`make_mut` when the C copy or up_ref fails); without it that path is a
-double-panic. Nothing
+`make_mut` when the C copy or up_ref fails), where without it that path is a
+double-panic, and lets `CClosure` and `callback::barrier` catch a panic before
+it reaches C. The `alloc` feature, which `std` enables, adds `RustAlloc` and
+`CPayload`, which allocate through Rust's global allocator; nothing else
 allocates.
 
 ```toml
@@ -71,12 +82,16 @@ allocated it — a `CBox` usually points at memory C allocated.
 - **Yes** — it is owned → [docs/ownership.md](docs/ownership.md)
 - **No** — C, or a parent object, releases it → [docs/borrows.md](docs/borrows.md)
 
+When it is Rust's memory that C holds, calls or reads →
+[docs/outbound.md](docs/outbound.md).
+
 | doc | what is in it |
 |-----|---------------|
 | [goals.md](docs/goals.md) | what the primitives aim for, in both directions, and how each aim is checked |
 | [examples.md](docs/examples.md) | seven self-contained wrappers, each compiled as a doctest |
 | [ownership.md](docs/ownership.md) | `CBox`, `CVal`, `CStrBox`, `CVec`, `CArc`; the lifecycle policies; picking an owner and a policy |
 | [borrows.md](docs/borrows.md) | `Foo`, `FooRef`, `FooMut`, `FooLocked`, `CGuard`, `CGuardedRef`, `CSlice`; where the accessors live; the seam traits |
+| [outbound.md](docs/outbound.md) | Rust's side: `RustAlloc`, `CClosure`, `CPayload`, out-parameters, the panic barrier, the `export_*!` macros |
 | [hand-written.md](docs/hand-written.md) | the wrappers `define_ctype!` cannot express |
 
 ## Maintainers

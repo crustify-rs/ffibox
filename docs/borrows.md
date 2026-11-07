@@ -18,6 +18,7 @@ For the owning side — values whose drop releases the object — see
 | lock | `CGuard<'a, Foo>` | ffibox | a held C lock, unlocking on drop — `MutexGuard`; `as_locked()` → `FooLocked<'_>`, `as_ref()` → `FooRef<'_>` |
 | guarded borrow | `CGuardedRef<'a, Foo>` | ffibox | an object under one lock covering all of it (`CGuardedAll`), never released — typically a C global (`'static`); only `lock()`, whose `as_locked()` is `FooMut` — `&Mutex<_>` |
 | views | `CSlice<'a, T>` / `CSliceMut<'a, T>` | ffibox | any borrowed run of elements — a buffer's, a struct field's, a getter's — as handles or copies, never a `&[T]` |
+| | `CNullTerminated<'a, T>` | ffibox | a NULL-terminated array of pointers (`char **`, `foo **`), iterated as `&CStr`s or `FooRef`s |
 
 A wrapper that needs generic parameters (a lifetime-carrying layout type, or
 derived sub-types over a generic field) is written by hand against the same
@@ -64,6 +65,10 @@ does, the answer is an owner — see
   - one object → `FooRef<'a>` / `FooMut<'a>`, its lifetime tied to whatever
     keeps it alive (a parent's handle, the call);
   - a run of elements → `CSlice<'a, T>` / `CSliceMut<'a, T>`;
+  - a NULL-terminated array of pointers → `CNullTerminated<'a, T>`, an
+    `Iterator` of the elements' borrows; a `count` + `get(i)` pair or a
+    `->next` chain is `(0..n).map(get)` or `iter::successors` over the safe
+    getter;
   - an object every access reaches under one lock covering all of it —
     typically a C global and the C lock protecting it → `CGuardedRef<'a, Foo>`,
     `'static` for a global, with `impl_cguarded!(Foo, all, …)`;
