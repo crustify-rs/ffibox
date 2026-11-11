@@ -34,6 +34,11 @@
 //! | [`CVal<T, D>`] | a C struct held by value, disposed on drop |
 //! | [`CSlice<'a, T>`] / [`CSliceMut<'a, T>`] | a borrowed run of elements |
 //! | `impl_*!` | bind a C routine to a policy |
+//! | `export_*!` | offer a policy to C as the routine it calls |
+//! | [`CClosure`] / [`CPayload`] | a Rust closure C calls, for one call or until C releases it |
+//! | [`CFn`] / [`CFnBox`] | a C function and its context that Rust calls, borrowed or owned |
+//! | [`CCallback`] / [`CCallbackBox`] | either: a callback called from Rust and handed to C alike |
+//! | [`RustAlloc`] | the policy over Rust's global allocator, for what Rust allocates and C frees |
 //!
 //! Like `Box`, the owners adopt a raw pointer with an `unsafe` `from_raw` and
 //! give one out with a safe `into_raw` / `as_ptr`. A type alias names an owner with its policy.
@@ -99,14 +104,21 @@
 //!
 //! ## `no_std`
 //!
-//! `#![no_std]`, and nothing allocates. The `std` feature (default) selects
-//! [`std::process::abort`](https://doc.rust-lang.org/std/process/fn.abort.html) for the unrecoverable-failure path; without it that
-//! path is a double-panic.
+//! `#![no_std]`. The `std` feature (default) selects
+//! [`std::process::abort`](https://doc.rust-lang.org/std/process/fn.abort.html) for the unrecoverable-failure path, where
+//! without it that path is a double-panic, and lets [`CClosure`] and
+//! [`callback::barrier`] catch a panic before it reaches C. The `alloc`
+//! feature, which `std` enables, adds [`RustAlloc`], [`CPayload`] and
+//! [`CCallbackBox`], which allocate through Rust's global allocator; nothing
+//! else allocates.
 //!
 //! [README]: https://github.com/crustify-rs/ffibox#readme
 
 #![no_std]
 #![cfg_attr(docsrs, feature(doc_cfg))]
+// The docs link to the items `alloc` and `std` add, which a build without them
+// cannot resolve; docs.rs documents every feature.
+#![cfg_attr(not(feature = "std"), allow(rustdoc::broken_intra_doc_links))]
 
 #[cfg(feature = "alloc")]
 extern crate alloc;

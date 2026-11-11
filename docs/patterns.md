@@ -16,6 +16,8 @@ implement it.
 | an object returned through an out-parameter | a return value | `CBox::from_c_out`, `CStrBox::from_raw_out` |
 | a `foreach(callback, context)` visitor | a closure | `CClosure` |
 | a callback the library keeps | a boxed closure | `CPayload` |
+| a callback the library hands Rust to call | a closure | `CFn`, or `CFnBox` with its context's release |
+| a callback that is a Rust closure or a C function, whichever supplied it | `impl FnMut`, `Box<dyn Fn>` | `CCallback`, `CCallbackBox` |
 
 The `status` functions return the code itself as the error, so `?` converts
 it into the binding's error type through its `From` impl:

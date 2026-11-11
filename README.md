@@ -47,8 +47,10 @@ elements, so a `foo **` of owned objects releases each one.
 The other direction uses the same terms. `RustAlloc` is the policy over Rust's
 allocator, so an object Rust allocates is held as one C allocated; `CClosure`
 and `CPayload` put a Rust closure behind a C function pointer and its
-context, for one call or until C releases it; the `export_*!` macros offer a
-policy to C as the routine it calls.
+context, for one call or until C releases it; `CFn` and `CFnBox` hold a C
+function and its context that Rust calls, and `CCallback` and `CCallbackBox`
+either half; the `export_*!` macros offer a policy to C as the routine it
+calls, with the owner and handle types in its signature.
 [docs/ownership.md](docs/ownership.md) lists the owners and the policies;
 [docs/borrows.md](docs/borrows.md) lists the handles. Each walks from a C
 declaration to the type it wants.
@@ -91,7 +93,7 @@ When it is Rust's memory that C holds, calls or reads →
 | [examples.md](docs/examples.md) | seven self-contained wrappers, each compiled as a doctest |
 | [ownership.md](docs/ownership.md) | `CBox`, `CVal`, `CStrBox`, `CVec`, `CArc`; the lifecycle policies; picking an owner and a policy |
 | [borrows.md](docs/borrows.md) | `Foo`, `FooRef`, `FooMut`, `FooLocked`, `CGuard`, `CGuardedRef`, `CSlice`; where the accessors live; the seam traits |
-| [outbound.md](docs/outbound.md) | Rust's side: `RustAlloc`, `CClosure`, `CPayload`, out-parameters, the panic barrier, the `export_*!` macros |
+| [outbound.md](docs/outbound.md) | Rust's side: `RustAlloc`, the callbacks (`CClosure`, `CPayload`, `CFn`, `CFnBox`, `CCallback`, `CCallbackBox`), out-parameters, the panic barrier, the `export_*!` macros |
 | [patterns.md](docs/patterns.md) | C's iteration, error and callback conventions as Rust's iterators, `Result` and closures |
 | [hand-written.md](docs/hand-written.md) | the wrappers `define_ctype!` cannot express |
 
