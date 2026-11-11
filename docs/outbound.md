@@ -16,8 +16,8 @@ for one call and not kept is plain Rust: `&mut x as *mut _` for C that writes,
 |--------|-----------|------------------|
 | frees an object or buffer Rust allocated | an owner under `RustAlloc`, surrendered with `into_raw` / `into_c` | `Box::into_raw` |
 | frees a string or buffer with its own allocator | `CStrBox::from_c_str`, `CVec::from_slice`, `CVec::from_fn`, `CVec::new_uninit` under that allocator's policy | `CString`, `Vec` |
-| calls a closure during one call | `CClosure`: `ctx()` and `fn_ctx_first()` / `fn_ctx_last()` | `&mut F` |
-| keeps a closure or value, and releases it later | `CPayload`: `into_raw()`, `release_fn()`, `fn_ctx_first()` / `fn_ctx_last()` | `Box<F>` |
+| calls a closure during one call | `CClosure`: `ctx()` and `trampoline()` | `&mut F` |
+| keeps a closure or value, and releases it later | `CPayload`: `into_raw()`, `release_fn()`, `trampoline()` | `Box<F>` |
 | returns an object through an out-parameter | `CBox::from_c_out`, `CStrBox::from_raw_out` | a return value |
 | calls a Rust routine that must not unwind into it | `callback::barrier` | `catch_unwind` |
 | frees, copies or constructs a ported type's objects | `export_cdrop!`, `export_cdupclone!`, `export_cnew!` | the C routines they replace |

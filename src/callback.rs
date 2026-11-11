@@ -2,8 +2,9 @@
 //! context, and the panic barrier between them.
 //!
 //! A C API takes a callback as a function pointer and a context pointer it
-//! passes back on every call, first (`fn(void *ctx, …)`) or last
-//! (`fn(…, void *ctx)`). Two lifetimes cover the APIs that do:
+//! passes back on every call, as one of the callback's arguments: first
+//! (`fn(void *ctx, …)`), last (`fn(…, void *ctx)`), or anywhere between. Two
+//! lifetimes cover the APIs that do:
 //!
 //! | C keeps the callback | Primitive | Rust counterpart |
 //! |----------------------|-----------|------------------|
@@ -13,7 +14,9 @@
 //! Each gives the trampoline, an `unsafe extern "C" fn` with the C type's
 //! signature that recovers the closure from the context and calls it, and the
 //! context itself. The trampoline's type is the one the C declaration names,
-//! so a closure of the wrong arity or argument types does not compile:
+//! and so is where it takes the context: both are inferred from where the
+//! trampoline is passed, and a closure of the wrong arity or argument types
+//! does not compile:
 //!
 //! ```
 //! use core::ffi::{c_int, c_void};
@@ -43,10 +46,16 @@
 //! };
 //! let cb = CClosure::new(&mut add, -1);
 //! // SAFETY: `foreach` calls the callback only during the call, with `ctx`.
-//! let rc = unsafe { foreach(xs.as_ptr(), xs.len(), Some(cb.fn_ctx_last()), cb.ctx()) };
+//! let rc = unsafe { foreach(xs.as_ptr(), xs.len(), Some(cb.trampoline()), cb.ctx()) };
 //! cb.finish();
 //! assert_eq!((rc, sum), (0, 6));
 //! ```
+//!
+//! Only the C API knows which argument is its context, and when its callback
+//! takes more than one `void *`, its signature does not say. The position
+//! then fails to infer, and is named, counting from 0, as in
+//! `cb.trampoline::<_, 2>()` for a `(const void *key, void *value, void *ctx)`
+//! callback ([`CTrampoline`]).
 //!
 //! The closure's arguments are the C types: the binding converts them to
 //! handles and calls its consumer's closure with those, so the consumer's
@@ -93,23 +102,35 @@ pub fn barrier<R>(f: impl FnOnce() -> R, on_panic: impl FnOnce() -> R) -> R {
 }
 
 // ---------------------------------------------------------------------------
-// The trampoline shapes
+// The trampolines
 // ---------------------------------------------------------------------------
 
-/// The C function pointer types a callback holder offers with its context
-/// passed **first**, `unsafe extern "C" fn(*mut c_void, A, B, …) -> R`.
-/// Implemented for every arity up to 6; reached through
-/// [`CClosure::fn_ctx_first`] and [`CPayload::fn_ctx_first`].
-pub trait CtxFirst<P> {
-    /// The trampoline.
-    #[doc(hidden)]
-    fn trampoline() -> P;
-}
-
-/// The C function pointer types a callback holder offers with its context
-/// passed **last**, `unsafe extern "C" fn(A, B, …, *mut c_void) -> R`. As
-/// [`CtxFirst`].
-pub trait CtxLast<P> {
+/// The C function pointer types a callback holder offers: `P`, with the
+/// context at argument `CTX`, counting from 0.
+///
+/// Implemented for every C callback of up to 6 arguments besides the
+/// context, `unsafe extern "C" fn(A, …, *mut c_void, …, G) -> R`, with the
+/// context at each position, on [`CClosure`] and [`CPayload`]. Reached
+/// through their `trampoline` method, where both `P` and `CTX` are inferred
+/// from the C type the trampoline is passed as:
+///
+/// - the position is inferred when one argument alone is a `*mut c_void`, the
+///   context, as in `fn(int x, void *ctx)`;
+/// - it is named when several are, as in
+///   `fn(const void *key, void *value, void *ctx)`, where the compiler cannot
+///   tell the context from the others and the C API's documentation can:
+///   `trampoline::<_, 2>()`.
+///
+/// ```compile_fail,E0284
+/// use core::ffi::c_void;
+/// use ffibox::callback::CClosure;
+///
+/// let mut f = |_: *const c_void, _: *mut c_void| {};
+/// let cb = CClosure::new(&mut f, ());
+/// // Which `void *` is the context? Not inferred: named as `::<_, 2>`.
+/// let _: unsafe extern "C" fn(*const c_void, *mut c_void, *mut c_void) = cb.trampoline();
+/// ```
+pub trait CTrampoline<P, const CTX: usize> {
     /// The trampoline.
     #[doc(hidden)]
     fn trampoline() -> P;
@@ -139,8 +160,8 @@ struct ScopedState<F, R> {
 ///
 /// Built from `&mut F`, so the closure may capture and change local state.
 /// [`ctx`](Self::ctx) is the context to pass, and
-/// [`fn_ctx_first`](Self::fn_ctx_first) / [`fn_ctx_last`](Self::fn_ctx_last)
-/// the trampoline, typed as the C declaration names it. After the call,
+/// [`trampoline`](Self::trampoline) the trampoline, typed as the C
+/// declaration names it. After the call,
 /// [`finish`](Self::finish) (or dropping the `CClosure`) resumes a panic the
 /// closure raised.
 ///
@@ -210,28 +231,16 @@ impl<'a, F, R: Copy> CClosure<'a, F, R> {
         core::ptr::from_ref(&self.state).cast_mut().cast()
     }
 
-    /// The trampoline for a C callback type taking its context first,
-    /// `unsafe extern "C" fn(*mut c_void, A, …) -> R`, inferred from where it
-    /// is passed.
+    /// The trampoline for the C callback type `P`, with the context at
+    /// argument `CTX`; both are inferred from where it is passed, and
+    /// `CTX` is named when the C type cannot tell (see [`CTrampoline`]).
     #[inline]
     #[must_use]
-    pub fn fn_ctx_first<P>(&self) -> P
+    pub fn trampoline<P, const CTX: usize>(&self) -> P
     where
-        Self: CtxFirst<P>,
+        Self: CTrampoline<P, CTX>,
     {
-        <Self as CtxFirst<P>>::trampoline()
-    }
-
-    /// The trampoline for a C callback type taking its context last,
-    /// `unsafe extern "C" fn(A, …, *mut c_void) -> R`, inferred from where it
-    /// is passed.
-    #[inline]
-    #[must_use]
-    pub fn fn_ctx_last<P>(&self) -> P
-    where
-        Self: CtxLast<P>,
-    {
-        <Self as CtxLast<P>>::trampoline()
+        <Self as CTrampoline<P, CTX>>::trampoline()
     }
 
     /// Whether an invocation failed: the closure panicked, or an invocation
@@ -342,8 +351,8 @@ unsafe fn invoke_scoped<F, R: Copy>(ctx: *mut c_void, call: impl FnOnce(&mut F) 
 /// [`into_raw`](Self::into_raw) surrenders it to C as a context pointer;
 /// [`release_fn`](Self::release_fn) is the `void (*)(void *)` C calls once to
 /// drop it; [`borrow`](Self::borrow) recovers a shared reference inside a
-/// callback. For a closure, [`fn_ctx_first`](Self::fn_ctx_first) /
-/// [`fn_ctx_last`](Self::fn_ctx_last) give the trampoline that calls it.
+/// callback. For a closure, [`trampoline`](Self::trampoline) gives the
+/// trampoline that calls it.
 ///
 /// C reaches the value only through its pointer, never its bytes, so the
 /// value is a Rust value throughout: a `&T` to it asserts nothing about
@@ -392,7 +401,7 @@ unsafe fn invoke_scoped<F, R: Copy>(ctx: *mut c_void, call: impl FnOnce(&mut F) 
 ///     seen.fetch_add(v, Ordering::Relaxed);
 /// });
 /// let mut lib = Lib {
-///     cb: Some(payload.fn_ctx_first()),
+///     cb: Some(payload.trampoline()),
 ///     free: Some(CPayload::<_>::release_fn_of(&payload)),
 ///     ctx: payload.into_raw(),
 /// };
@@ -491,26 +500,15 @@ impl<T> CPayload<T> {
         Self::release_fn()
     }
 
-    /// The trampoline calling a registered closure, for a C callback type
-    /// taking its context first; as [`CClosure::fn_ctx_first`].
+    /// The trampoline calling a registered closure, for the C callback type
+    /// `P` with the context at argument `CTX`; as [`CClosure::trampoline`].
     #[inline]
     #[must_use]
-    pub fn fn_ctx_first<P>(&self) -> P
+    pub fn trampoline<P, const CTX: usize>(&self) -> P
     where
-        Self: CtxFirst<P>,
+        Self: CTrampoline<P, CTX>,
     {
-        <Self as CtxFirst<P>>::trampoline()
-    }
-
-    /// The trampoline calling a registered closure, for a C callback type
-    /// taking its context last; as [`CClosure::fn_ctx_last`].
-    #[inline]
-    #[must_use]
-    pub fn fn_ctx_last<P>(&self) -> P
-    where
-        Self: CtxLast<P>,
-    {
-        <Self as CtxLast<P>>::trampoline()
+        <Self as CTrampoline<P, CTX>>::trampoline()
     }
 }
 
@@ -541,87 +539,75 @@ impl<T> core::fmt::Debug for CPayload<T> {
 }
 
 // ---------------------------------------------------------------------------
-// The trampolines, per arity
+// The trampolines, per arity and context position
 // ---------------------------------------------------------------------------
 
-macro_rules! trampolines {
-    ($($a:ident),*) => {
-        impl<'a, F, R: Copy, $($a),*> CtxFirst<unsafe extern "C" fn(*mut c_void $(, $a)*) -> R>
+/// `1` per argument, to count the arguments before the context.
+macro_rules! one {
+    ($x:ident) => {
+        1
+    };
+}
+
+/// The trampolines for one C callback shape: the arguments `$b` before the
+/// context and `$a` after it.
+macro_rules! trampoline_at {
+    ([$($b:ident),*] [$($a:ident),*]) => {
+        impl<'a, F, R: Copy, $($b,)* $($a),*>
+            CTrampoline<unsafe extern "C" fn($($b,)* *mut c_void $(, $a)*) -> R, { 0 $(+ one!($b))* }>
             for CClosure<'a, F, R>
         where
-            F: FnMut($($a),*) -> R,
+            F: FnMut($($b,)* $($a),*) -> R,
         {
             #[inline]
-            fn trampoline() -> unsafe extern "C" fn(*mut c_void $(, $a)*) -> R {
+            fn trampoline() -> unsafe extern "C" fn($($b,)* *mut c_void $(, $a)*) -> R {
                 #[allow(non_snake_case)]
-                unsafe extern "C" fn tramp<F: FnMut($($a),*) -> R, R: Copy, $($a),*>(
-                    ctx: *mut c_void $(, $a: $a)*
+                unsafe extern "C" fn tramp<F: FnMut($($b,)* $($a),*) -> R, R: Copy, $($b,)* $($a),*>(
+                    $($b: $b,)* ctx: *mut c_void $(, $a: $a)*
                 ) -> R {
                     // SAFETY: C passes back the context of the live
                     // `CClosure` this trampoline came with.
-                    unsafe { invoke_scoped::<F, R>(ctx, |f| f($($a),*)) }
+                    unsafe { invoke_scoped::<F, R>(ctx, |f| f($($b,)* $($a),*)) }
                 }
-                tramp::<F, R, $($a),*>
-            }
-        }
-
-        impl<'a, F, R: Copy, $($a),*> CtxLast<unsafe extern "C" fn($($a,)* *mut c_void) -> R>
-            for CClosure<'a, F, R>
-        where
-            F: FnMut($($a),*) -> R,
-        {
-            #[inline]
-            fn trampoline() -> unsafe extern "C" fn($($a,)* *mut c_void) -> R {
-                #[allow(non_snake_case)]
-                unsafe extern "C" fn tramp<F: FnMut($($a),*) -> R, R: Copy, $($a),*>(
-                    $($a: $a,)* ctx: *mut c_void
-                ) -> R {
-                    // SAFETY: as the context-first trampoline.
-                    unsafe { invoke_scoped::<F, R>(ctx, |f| f($($a),*)) }
-                }
-                tramp::<F, R, $($a),*>
+                tramp::<F, R, $($b,)* $($a),*>
             }
         }
 
         #[cfg(feature = "alloc")]
-        impl<F, R, $($a),*> CtxFirst<unsafe extern "C" fn(*mut c_void $(, $a)*) -> R>
+        impl<F, R, $($b,)* $($a),*>
+            CTrampoline<unsafe extern "C" fn($($b,)* *mut c_void $(, $a)*) -> R, { 0 $(+ one!($b))* }>
             for CPayload<F>
         where
-            F: Fn($($a),*) -> R,
+            F: Fn($($b,)* $($a),*) -> R,
         {
             #[inline]
-            fn trampoline() -> unsafe extern "C" fn(*mut c_void $(, $a)*) -> R {
+            fn trampoline() -> unsafe extern "C" fn($($b,)* *mut c_void $(, $a)*) -> R {
                 #[allow(non_snake_case)]
-                unsafe extern "C" fn tramp<F: Fn($($a),*) -> R, R, $($a),*>(
-                    ctx: *mut c_void $(, $a: $a)*
+                unsafe extern "C" fn tramp<F: Fn($($b,)* $($a),*) -> R, R, $($b,)* $($a),*>(
+                    $($b: $b,)* ctx: *mut c_void $(, $a: $a)*
                 ) -> R {
                     // SAFETY: C passes back the payload it holds, unreleased.
                     let f = unsafe { CPayload::<F>::borrow(ctx) };
-                    f($($a),*)
+                    f($($b,)* $($a),*)
                 }
-                tramp::<F, R, $($a),*>
+                tramp::<F, R, $($b,)* $($a),*>
             }
         }
+    };
+}
 
-        #[cfg(feature = "alloc")]
-        impl<F, R, $($a),*> CtxLast<unsafe extern "C" fn($($a,)* *mut c_void) -> R>
-            for CPayload<F>
-        where
-            F: Fn($($a),*) -> R,
-        {
-            #[inline]
-            fn trampoline() -> unsafe extern "C" fn($($a,)* *mut c_void) -> R {
-                #[allow(non_snake_case)]
-                unsafe extern "C" fn tramp<F: Fn($($a),*) -> R, R, $($a),*>(
-                    $($a: $a,)* ctx: *mut c_void
-                ) -> R {
-                    // SAFETY: as the context-first trampoline.
-                    let f = unsafe { CPayload::<F>::borrow(ctx) };
-                    f($($a),*)
-                }
-                tramp::<F, R, $($a),*>
-            }
-        }
+/// The trampolines for a callback of the arguments `$a`, with the context at
+/// each position: before the first, then after each in turn.
+macro_rules! trampolines {
+    ($($a:ident),*) => {
+        trampolines!(@at [] [$($a),*]);
+    };
+    (@at [$($b:ident),*] []) => {
+        trampoline_at!([$($b),*] []);
+    };
+    (@at [$($b:ident),*] [$h:ident $(, $t:ident)*]) => {
+        trampoline_at!([$($b),*] [$h $(, $t)*]);
+        trampolines!(@at [$($b,)* $h] [$($t),*]);
     };
 }
 

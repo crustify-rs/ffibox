@@ -49,7 +49,7 @@ fn a_closure_changes_local_state_through_a_context_last_callback() {
     };
     let cb = CClosure::new(&mut f, -1);
     // SAFETY: `foreach` calls back during the call only.
-    let rc = unsafe { foreach(xs.as_ptr(), xs.len(), Some(cb.fn_ctx_last()), cb.ctx()) };
+    let rc = unsafe { foreach(xs.as_ptr(), xs.len(), Some(cb.trampoline()), cb.ctx()) };
     assert!(!cb.failed());
     cb.finish();
     assert_eq!(rc, 1, "the closure's stop value is C's return");
@@ -61,7 +61,7 @@ fn a_context_first_callback_of_three_arguments() {
     let mut f = |a: c_int, b: c_int, c: c_int| a * 100 + b * 10 + c;
     let cb = CClosure::new(&mut f, -1);
     // SAFETY: `call3` calls back during the call only.
-    assert_eq!(unsafe { call3(cb.fn_ctx_first(), cb.ctx()) }, 123);
+    assert_eq!(unsafe { call3(cb.trampoline(), cb.ctx()) }, 123);
 }
 
 #[test]
@@ -69,7 +69,7 @@ fn a_callback_without_arguments() {
     let mut n = 0;
     let mut f = || n += 1;
     let cb = CClosure::new(&mut f, ());
-    let tramp: unsafe extern "C" fn(*mut c_void) = cb.fn_ctx_first();
+    let tramp: unsafe extern "C" fn(*mut c_void) = cb.trampoline();
     // SAFETY: the context of the live `cb`.
     unsafe {
         tramp(cb.ctx());
@@ -90,7 +90,7 @@ fn a_panic_stops_the_routine_and_resumes_after_it() {
     };
     let cb = CClosure::new_local_for_test(&mut f);
     // SAFETY: `foreach` calls back during the call, on this thread.
-    let rc = unsafe { foreach(xs.as_ptr(), xs.len(), Some(cb.fn_ctx_last()), cb.ctx()) };
+    let rc = unsafe { foreach(xs.as_ptr(), xs.len(), Some(cb.trampoline()), cb.ctx()) };
     assert_eq!(rc, -1, "the failure value stopped the routine");
     assert!(cb.failed());
     let resumed = catch_unwind(AssertUnwindSafe(|| cb.finish()));
@@ -128,7 +128,7 @@ fn a_reentrant_invocation_is_refused_and_reported() {
     };
     let cb = CClosure::new_local_for_test(&mut f);
     ctx.set(cb.ctx());
-    tramp.set(Some(cb.fn_ctx_last()));
+    tramp.set(Some(cb.trampoline()));
     let xs = [1];
     // SAFETY: `foreach` calls back during the call, on this thread.
     let rc = unsafe { foreach(xs.as_ptr(), 1, tramp.get(), ctx.get()) };
@@ -150,7 +150,7 @@ fn a_send_closure_may_be_called_back_on_another_thread() {
         0
     };
     let cb = CClosure::new(&mut f, -1);
-    let tramp: EachLast = cb.fn_ctx_last();
+    let tramp: EachLast = cb.trampoline();
     /// The context, sent to the worker as C would pass it: by pointer.
     struct Ctx(*mut c_void);
     // SAFETY: the closure is `Send`, and one thread uses the context at a time.
@@ -191,7 +191,7 @@ fn a_payload_is_called_back_then_released_once() {
         0
     });
     let mut lib = Lib {
-        cb: Some(payload.fn_ctx_last()),
+        cb: Some(payload.trampoline()),
         free: Some(CPayload::release_fn_of(&payload)),
         ctx: payload.into_raw(),
     };
@@ -223,7 +223,7 @@ fn a_local_payload_may_hold_non_send_state() {
     let hits = std::rc::Rc::new(Cell::new(0));
     let h = hits.clone();
     let payload = CPayload::new(move || h.set(h.get() + 1));
-    let tramp: unsafe extern "C" fn(*mut c_void) = payload.fn_ctx_first();
+    let tramp: unsafe extern "C" fn(*mut c_void) = payload.trampoline();
     let free = CPayload::release_fn_of(&payload);
     // SAFETY: called back and released on this thread.
     let ctx = unsafe { payload.into_raw_local() };
@@ -240,4 +240,64 @@ fn a_local_payload_may_hold_non_send_state() {
 fn the_barrier_maps_a_panic_to_the_error_value() {
     assert_eq!(barrier(|| 3, || -1), 3);
     assert_eq!(barrier(|| -> i32 { panic!("x") }, || -1), -1);
+}
+
+#[test]
+fn a_context_in_the_middle_is_inferred() {
+    /// Stands in for `int visit(cb_t cb, void *ctx)`, calling
+    /// `cb(name, ctx, flags)`.
+    type Mid = unsafe extern "C" fn(*const u8, *mut c_void, c_int) -> c_int;
+    unsafe extern "C" fn visit(cb: Mid, ctx: *mut c_void) -> c_int {
+        // SAFETY: the callback is the caller's.
+        unsafe { cb(c"x".as_ptr().cast(), ctx, 7) }
+    }
+    let mut f = |name: *const u8, flags: c_int| {
+        // SAFETY: `visit` passes a NUL-terminated name.
+        let first = unsafe { *name };
+        c_int::from(first) + flags
+    };
+    let cb = CClosure::new(&mut f, -1);
+    // SAFETY: `visit` calls back during the call only.
+    let rc = unsafe { visit(cb.trampoline(), cb.ctx()) };
+    assert_eq!(rc, i32::from(b'x') + 7);
+}
+
+#[test]
+fn a_context_among_other_void_pointers_is_named() {
+    /// Stands in for a hash-table foreach calling `cb(key, value, ctx)`,
+    /// all three `void *`: the position is the C API's to say.
+    type Each = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> c_int;
+    unsafe extern "C" fn each(cb: Each, ctx: *mut c_void) -> c_int {
+        let (mut k, mut v) = (1u8, 2u8);
+        // SAFETY: the callback is the caller's.
+        unsafe { cb((&raw mut k).cast(), (&raw mut v).cast(), ctx) }
+    }
+    let mut f = |k: *mut c_void, v: *mut c_void| {
+        // SAFETY: `each` passes a live key and value.
+        unsafe { c_int::from(*k.cast::<u8>()) * 10 + c_int::from(*v.cast::<u8>()) }
+    };
+    let cb = CClosure::new(&mut f, -1);
+    // SAFETY: `each` calls back during the call only, with `ctx` third.
+    assert_eq!(unsafe { each(cb.trampoline::<_, 2>(), cb.ctx()) }, 12);
+}
+
+#[test]
+fn every_position_of_the_widest_shape() {
+    type W0 = unsafe extern "C" fn(*mut c_void, u8, u8, u8, u8, u8, u8) -> u32;
+    type W3 = unsafe extern "C" fn(u8, u8, u8, *mut c_void, u8, u8, u8) -> u32;
+    type W6 = unsafe extern "C" fn(u8, u8, u8, u8, u8, u8, *mut c_void) -> u32;
+    let mut f = |a: u8, b: u8, c: u8, d: u8, e: u8, g: u8| {
+        [a, b, c, d, e, g]
+            .iter()
+            .fold(0u32, |n, &x| n * 10 + u32::from(x))
+    };
+    let cb = CClosure::new(&mut f, 0);
+    let (w0, w3, w6): (W0, W3, W6) = (cb.trampoline(), cb.trampoline(), cb.trampoline());
+    let ctx = cb.ctx();
+    // SAFETY: the context of the live `cb`, at the position each type names.
+    unsafe {
+        assert_eq!(w0(ctx, 1, 2, 3, 4, 5, 6), 123_456);
+        assert_eq!(w3(1, 2, 3, ctx, 4, 5, 6), 123_456);
+        assert_eq!(w6(1, 2, 3, 4, 5, 6, ctx), 123_456);
+    }
 }
