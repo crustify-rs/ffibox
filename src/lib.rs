@@ -134,9 +134,9 @@ pub mod traits;
 #[doc = include_str!("../docs/examples.md")]
 pub struct DocExamples;
 
-pub use crate::callback::CClosure;
+pub use crate::callback::{CCallback, CClosure, CFn, CFnBox};
 #[cfg(feature = "alloc")]
-pub use crate::callback::CPayload;
+pub use crate::callback::{CCallbackBox, CPayload};
 pub use crate::refs::{CBorrowedPtr, CBox, CBoxState, CSlice, CSliceMut, CStrBox, CVal, CVec};
 #[cfg(feature = "alloc")]
 pub use crate::rust_alloc::RustAlloc;

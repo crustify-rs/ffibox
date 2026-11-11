@@ -18,6 +18,8 @@ for one call and not kept is plain Rust: `&mut x as *mut _` for C that writes,
 | frees a string or buffer with its own allocator | `CStrBox::from_c_str`, `CVec::from_slice`, `CVec::from_fn`, `CVec::new_uninit` under that allocator's policy | `CString`, `Vec` |
 | calls a closure during one call | `CClosure`: `ctx()` and `trampoline()` | `&mut F` |
 | keeps a closure or value, and releases it later | `CPayload`: `into_raw()`, `release_fn()`, `trampoline()` | `Box<F>` |
+| hands Rust a function and its context to call | `CFn` for the call or borrow it came with, `CFnBox` with the routine that releases the context: `call()`, `parts()` / `into_raw()` | a closure |
+| holds a callback that is either a Rust closure or a C function | `CCallback` (for a call or borrow), `CCallbackBox` (kept until released): `call()` from Rust, `c_form()` / `into_c()` to C | `impl FnMut`, `Box<dyn Fn>` |
 | returns an object through an out-parameter | `CBox::from_c_out`, `CStrBox::from_raw_out` | a return value |
 | calls a Rust routine that must not unwind into it | `callback::barrier` | `catch_unwind` |
 | frees, copies or constructs a ported type's objects | `export_cdrop!`, `export_cdupclone!`, `export_cnew!` | the C routines they replace |
@@ -46,6 +48,19 @@ for one call and not kept is plain Rust: `&mut x as *mut _` for C that writes,
   body goes in `barrier`.
 - **C keeps a value** (a container's payload, user data). `CPayload<T>`, and
   `CPayload::borrow` inside the callbacks that receive it.
+- **C hands Rust a callback** (an options struct's `progress_cb` and
+  `payload`, a ported function's `cb, ctx` arguments through its export).
+  `CFn::new`, `unsafe`, states what the C that supplies the pair guarantees;
+  `call((args…))` takes C's argument types, the context left out, so the
+  binding's safe callable converts its arguments and calls in one justified
+  block. `parts()` hands the pair to another C routine unchanged, with no
+  trampoline between.
+- **A callable is either** (a field a consumer sets with a closure and C
+  sets with a function, a callback ported code calls whoever supplied it).
+  `CCallback` / `CCallbackBox` hold whichever it is: called from Rust, a
+  closure runs through its trampoline, with the same refusal and panic
+  handling as when C calls it, and handed to C, a C function goes as its own
+  pair.
 - **C returns something through an out-parameter.** `from_c_out` /
   `from_raw_out`: the slot starts NULL and is adopted whatever the routine
   returns, so an object handed over on failure is still released.

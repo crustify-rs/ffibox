@@ -1,5 +1,6 @@
-//! Rust code C calls: closures behind a C function pointer and its `void *`
-//! context, and the panic barrier between them.
+//! Callbacks across the boundary: Rust closures C calls, behind a C function
+//! pointer and its `void *` context, C functions with their context that
+//! Rust calls, the types that hold either, and the panic barrier.
 //!
 //! A C API takes a callback as a function pointer and a context pointer it
 //! passes back on every call, as one of the callback's arguments: first
@@ -60,6 +61,19 @@
 //! The closure's arguments are the C types: the binding converts them to
 //! handles and calls its consumer's closure with those, so the consumer's
 //! closure takes safe types only.
+//!
+//! The other way, C hands Rust a function and its context to call: in a
+//! struct field, as an argument, or through an export a ported module offers
+//! the C that still calls it. [`CFn`] holds the pair for the call or borrow it
+//! came with, and [`CFnBox`] holds it with the routine that releases the
+//! context. Where one callable may be either, a consumer's closure or a C
+//! function, [`CCallback`] and [`CCallbackBox`] hold whichever it is, and are
+//! called from Rust and handed to C alike:
+//!
+//! | C keeps the callback | Rust closure | C function | Either |
+//! |----------------------|--------------|------------|--------|
+//! | for one call, or a borrow | [`CClosure`] | [`CFn`] | [`CCallback`] |
+//! | until it releases it | [`CPayload`] | [`CFnBox`] | [`CCallbackBox`] |
 
 use core::ffi::c_void;
 use core::marker::PhantomData;
@@ -523,6 +537,14 @@ impl<T> From<alloc::boxed::Box<T>> for CPayload<T> {
 
 #[cfg(feature = "alloc")]
 impl<T> CPayload<T> {
+    /// The context pointer to the value, without surrendering it: for a C
+    /// call that uses it while `self` is borrowed and keeps nothing.
+    #[inline]
+    #[must_use]
+    pub fn ctx(&self) -> *mut c_void {
+        core::ptr::from_ref::<T>(&self.0).cast_mut().cast()
+    }
+
     /// The value, back in a box, as before it was handed to C.
     #[inline]
     #[must_use]
@@ -535,6 +557,387 @@ impl<T> CPayload<T> {
 impl<T> core::fmt::Debug for CPayload<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("CPayload").finish_non_exhaustive()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CFn — a C function and its context, which Rust calls
+// ---------------------------------------------------------------------------
+
+/// The argument tuples a C function and its context can be called with:
+/// `(A, …)` for `P`, the context left out. Implemented with
+/// [`CTrampoline`]'s shapes, and reached through [`CFn::call`].
+pub trait CFnCall<Args> {
+    /// What the C function returns.
+    type Output;
+
+    /// Call the function with `args`, the context at its position.
+    ///
+    /// # Safety
+    ///
+    /// As [`CFn::call`].
+    #[doc(hidden)]
+    unsafe fn call(&self, args: Args) -> Self::Output;
+}
+
+/// A C function and the context it takes, which Rust calls: the C half of a
+/// callback, as [`CClosure`] is the Rust half. `P` is the C function pointer
+/// type, `unsafe extern "C" fn(…) -> R`, and `CTX` the context's argument,
+/// counting from 0, as [`CTrampoline`] counts it.
+///
+/// A C API hands Rust a callback, in a struct field, as a function's
+/// argument, or through an export a ported module offers to the C that still
+/// calls it, and Rust calls it later. The pair stays valid for `'a`, which
+/// the binding chooses from the C API's contract: the call it came with, or
+/// the borrow of the object holding it.
+///
+/// Built with an `unsafe` [`new`](Self::new), whose contract is what the C
+/// that supplies the pair guarantees, and called with an `unsafe`
+/// [`call`](Self::call), whose arguments are C's types: the binding's safe
+/// callable converts its own arguments to them and calls in one justified
+/// block. [`parts`](Self::parts) hands the pair back to C unchanged, so a
+/// callback C supplied reaches another C API with no trampoline between.
+///
+/// Neither `Send` nor `Sync`: it is called on the thread that holds it.
+// TODO(CFn threads): a C function that the C API lets Rust call from other
+// threads, once a campaign needs it.
+pub struct CFn<'a, P, const CTX: usize> {
+    f: P,
+    ctx: *mut c_void,
+    _valid: PhantomData<&'a ()>,
+}
+
+impl<'a, P: Copy, const CTX: usize> CFn<'a, P, CTX> {
+    /// Take a C function and its context.
+    ///
+    /// # Safety
+    ///
+    /// `f` is a C function of type `P` that may be called with `ctx` as its
+    /// argument `CTX`, any number of times, on the calling thread, until `'a`
+    /// ends.
+    #[inline]
+    pub unsafe fn new(f: P, ctx: *mut c_void) -> Self {
+        Self {
+            f,
+            ctx,
+            _valid: PhantomData,
+        }
+    }
+
+    /// The function and its context, to hand to C.
+    #[inline]
+    #[must_use]
+    pub fn parts(&self) -> (P, *mut c_void) {
+        (self.f, self.ctx)
+    }
+
+    /// Call the function with `args`, the C arguments other than the
+    /// context, in order: `cb.call((item,))` for `fn(item, ctx)`.
+    ///
+    /// # Safety
+    ///
+    /// `args` satisfy what the C callback type requires of its arguments, as
+    /// its C API documents them.
+    #[inline]
+    pub unsafe fn call<Args>(&self, args: Args) -> <Self as CFnCall<Args>>::Output
+    where
+        Self: CFnCall<Args>,
+    {
+        // SAFETY: the caller upholds the arguments' contract; `new`'s
+        // contract makes the function and its context callable now.
+        unsafe { <Self as CFnCall<Args>>::call(self, args) }
+    }
+}
+
+impl<P: Copy, const CTX: usize> Clone for CFn<'_, P, CTX> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+// A copy is the same pair, valid as long; `#[derive]` would bound `P` only.
+impl<P: Copy, const CTX: usize> Copy for CFn<'_, P, CTX> {}
+
+impl<P, const CTX: usize> core::fmt::Debug for CFn<'_, P, CTX> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CFn")
+            .field("ctx", &self.ctx)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A C function and the context it takes, owned: C's counterpart of
+/// [`CPayload`], for a callback C hands over with the routine that releases
+/// its context (`set_cb(cb, ctx, free)`). Dropping it calls the release on
+/// the context; [`into_raw`](Self::into_raw) gives all three back to C.
+///
+/// Neither `Send` nor `Sync`, as [`CFn`].
+#[must_use = "dropping a CFnBox releases its context"]
+pub struct CFnBox<P, const CTX: usize> {
+    f: P,
+    ctx: *mut c_void,
+    release: Option<unsafe extern "C" fn(*mut c_void)>,
+}
+
+impl<P: Copy, const CTX: usize> CFnBox<P, CTX> {
+    /// Take a C function, its context and the routine that releases the
+    /// context.
+    ///
+    /// # Safety
+    ///
+    /// As [`CFn::new`], until the box is dropped or surrendered; and
+    /// `release`, when given, may be called once with `ctx`, after which
+    /// nothing calls `f` with it.
+    #[inline]
+    pub unsafe fn new(
+        f: P,
+        ctx: *mut c_void,
+        release: Option<unsafe extern "C" fn(*mut c_void)>,
+    ) -> Self {
+        Self { f, ctx, release }
+    }
+
+    /// The pair, borrowed: callable, or handed to a C call, while the box
+    /// lives.
+    #[inline]
+    #[must_use]
+    pub fn as_fn(&self) -> CFn<'_, P, CTX> {
+        // SAFETY: `new`'s contract makes the pair callable until the box is
+        // dropped, which the borrow outlasts.
+        unsafe { CFn::new(self.f, self.ctx) }
+    }
+
+    /// Call the function, as [`CFn::call`].
+    ///
+    /// # Safety
+    ///
+    /// As [`CFn::call`].
+    #[inline]
+    pub unsafe fn call<Args, R>(&self, args: Args) -> R
+    where
+        for<'b> CFn<'b, P, CTX>: CFnCall<Args, Output = R>,
+    {
+        // SAFETY: as the caller's.
+        unsafe { self.as_fn().call(args) }
+    }
+
+    /// Give the function, its context and its release back to C, without
+    /// releasing.
+    #[inline]
+    #[must_use = "the context must be released"]
+    pub fn into_raw(self) -> (P, *mut c_void, Option<unsafe extern "C" fn(*mut c_void)>) {
+        let b = core::mem::ManuallyDrop::new(self);
+        (b.f, b.ctx, b.release)
+    }
+}
+
+impl<P, const CTX: usize> Drop for CFnBox<P, CTX> {
+    fn drop(&mut self) {
+        if let Some(release) = self.release {
+            // SAFETY: `new`'s contract: called once, with the context.
+            unsafe { release(self.ctx) }
+        }
+    }
+}
+
+impl<P, const CTX: usize> core::fmt::Debug for CFnBox<P, CTX> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CFnBox")
+            .field("ctx", &self.ctx)
+            .finish_non_exhaustive()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CCallback — either half, called and handed to C alike
+// ---------------------------------------------------------------------------
+
+/// A callback that is either a Rust closure ([`CClosure`]) or a C function
+/// with its context ([`CFn`]), used the same way whichever it is: handed to C
+/// as a function and context ([`c_form`](Self::c_form)), or called from Rust
+/// ([`call`](Self::call)).
+///
+/// What a binding's callable type holds where C keeps the callback for the
+/// call it receives, `'a`: a consumer's closure, or a callback C supplied that
+/// ported code now calls. Its consumers never see which.
+///
+/// Called from Rust, a closure runs through its trampoline, as when C calls
+/// it: a re-entrant call is refused and a panic caught, with the closure's
+/// failure value, and [`finish`](Self::finish) resumes the panic.
+#[must_use = "a CCallback does nothing until it is called"]
+pub struct CCallback<'a, P, F, R: Copy, const CTX: usize>(
+    Either<CClosure<'a, F, R>, CFn<'a, P, CTX>>,
+);
+
+/// The two halves of a callback.
+enum Either<L, R> {
+    Rust(L),
+    C(R),
+}
+
+impl<'a, P: Copy, F, R: Copy, const CTX: usize> CCallback<'a, P, F, R, CTX> {
+    /// A Rust closure, as [`CClosure::new`].
+    #[inline]
+    pub fn new(f: &'a mut F, on_failure: R) -> Self
+    where
+        F: Send,
+    {
+        Self(Either::Rust(CClosure::new(f, on_failure)))
+    }
+
+    /// A Rust closure, as [`CClosure::new_local`].
+    ///
+    /// # Safety
+    ///
+    /// As [`CClosure::new_local`]: C calls it on the calling thread only.
+    #[inline]
+    pub unsafe fn new_local(f: &'a mut F, on_failure: R) -> Self {
+        // SAFETY: as the caller's.
+        Self(Either::Rust(unsafe { CClosure::new_local(f, on_failure) }))
+    }
+
+    /// A C function and its context.
+    #[inline]
+    pub fn from_c(f: CFn<'a, P, CTX>) -> Self {
+        Self(Either::C(f))
+    }
+
+    /// The function and context to hand to C: the closure's trampoline and
+    /// context, or the C function's own pair. Valid while `self` is borrowed.
+    #[inline]
+    #[must_use]
+    pub fn c_form(&self) -> (P, *mut c_void)
+    where
+        CClosure<'a, F, R>: CTrampoline<P, CTX>,
+    {
+        match &self.0 {
+            Either::Rust(c) => (c.trampoline(), c.ctx()),
+            Either::C(f) => f.parts(),
+        }
+    }
+
+    /// Call the callback with `args`, the C arguments other than the
+    /// context, as [`CFn::call`].
+    ///
+    /// # Safety
+    ///
+    /// As [`CFn::call`]: `args` satisfy the C callback type's contract.
+    #[inline]
+    pub unsafe fn call<Args>(&self, args: Args) -> R
+    where
+        CClosure<'a, F, R>: CTrampoline<P, CTX>,
+        for<'b> CFn<'b, P, CTX>: CFnCall<Args, Output = R>,
+    {
+        let (f, ctx) = self.c_form();
+        // SAFETY: a closure's trampoline and context are callable while
+        // `self` is borrowed, and a C pair is, per its `CFn`, for `'a`.
+        let f: CFn<'_, P, CTX> = unsafe { CFn::new(f, ctx) };
+        // SAFETY: as the caller's.
+        unsafe { f.call(args) }
+    }
+
+    /// End the callback's use, resuming a panic its closure raised, as
+    /// [`CClosure::finish`].
+    #[inline]
+    pub fn finish(self) {
+        drop(self);
+    }
+}
+
+impl<P, F, R: Copy, const CTX: usize> core::fmt::Debug for CCallback<'_, P, F, R, CTX> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match &self.0 {
+            Either::Rust(c) => f.debug_tuple("CCallback").field(c).finish(),
+            Either::C(c) => f.debug_tuple("CCallback").field(c).finish(),
+        }
+    }
+}
+
+/// A callback that C keeps until it releases it, either a Rust value
+/// ([`CPayload`]) or a C function with its context and release
+/// ([`CFnBox`]): [`CCallback`]'s owned counterpart, for a binding's callable
+/// type that C stores, or that ported code stores.
+///
+/// Called from Rust, a Rust closure runs through its trampoline, as when C
+/// calls it: shared, so it is an `Fn`, and a panic in it aborts.
+#[cfg(feature = "alloc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+#[must_use = "dropping a CCallbackBox releases its callback"]
+pub struct CCallbackBox<P, F, const CTX: usize>(Either<CPayload<F>, CFnBox<P, CTX>>);
+
+#[cfg(feature = "alloc")]
+impl<P: Copy, F, const CTX: usize> CCallbackBox<P, F, CTX> {
+    /// A Rust closure or value, as [`CPayload::new`].
+    #[inline]
+    pub fn new(f: F) -> Self {
+        Self(Either::Rust(CPayload::new(f)))
+    }
+
+    /// A C function with its context and release.
+    #[inline]
+    pub fn from_c(f: CFnBox<P, CTX>) -> Self {
+        Self(Either::C(f))
+    }
+
+    /// The function and context to hand to a C call that uses them while
+    /// `self` is borrowed, and keeps neither.
+    #[inline]
+    #[must_use]
+    pub fn c_form(&self) -> (P, *mut c_void)
+    where
+        CPayload<F>: CTrampoline<P, CTX>,
+    {
+        match &self.0 {
+            Either::Rust(p) => (p.trampoline(), p.ctx()),
+            Either::C(f) => f.as_fn().parts(),
+        }
+    }
+
+    /// Surrender the callback to C, which keeps it: the function, the
+    /// context, and the routine C calls once to release the context.
+    #[inline]
+    #[must_use = "the context must be released"]
+    pub fn into_c(self) -> (P, *mut c_void, Option<unsafe extern "C" fn(*mut c_void)>)
+    where
+        CPayload<F>: CTrampoline<P, CTX>,
+        F: Send + Sync,
+    {
+        match self.0 {
+            Either::Rust(p) => {
+                let (f, release) = (p.trampoline(), CPayload::release_fn_of(&p));
+                (f, p.into_raw(), Some(release))
+            }
+            Either::C(f) => f.into_raw(),
+        }
+    }
+
+    /// Call the callback with `args`, as [`CFn::call`].
+    ///
+    /// # Safety
+    ///
+    /// As [`CFn::call`].
+    #[inline]
+    pub unsafe fn call<Args, R>(&self, args: Args) -> R
+    where
+        CPayload<F>: CTrampoline<P, CTX>,
+        for<'b> CFn<'b, P, CTX>: CFnCall<Args, Output = R>,
+    {
+        let (f, ctx) = self.c_form();
+        // SAFETY: a payload's trampoline and context are callable while
+        // `self` is borrowed, and a `CFnBox`'s pair while it lives.
+        let f: CFn<'_, P, CTX> = unsafe { CFn::new(f, ctx) };
+        // SAFETY: as the caller's.
+        unsafe { f.call(args) }
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl<P, F, const CTX: usize> core::fmt::Debug for CCallbackBox<P, F, CTX> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match &self.0 {
+            Either::Rust(p) => f.debug_tuple("CCallbackBox").field(p).finish(),
+            Either::C(c) => f.debug_tuple("CCallbackBox").field(c).finish(),
+        }
     }
 }
 
@@ -591,6 +994,20 @@ macro_rules! trampoline_at {
                     f($($b,)* $($a),*)
                 }
                 tramp::<F, R, $($b,)* $($a),*>
+            }
+        }
+
+        impl<'a, R, $($b,)* $($a),*> CFnCall<($($b,)* $($a,)*)>
+            for CFn<'a, unsafe extern "C" fn($($b,)* *mut c_void $(, $a)*) -> R, { 0 $(+ one!($b))* }>
+        {
+            type Output = R;
+
+            #[inline]
+            #[allow(non_snake_case)]
+            unsafe fn call(&self, ($($b,)* $($a,)*): ($($b,)* $($a,)*)) -> R {
+                // SAFETY: as `CFn::call`'s caller's, with the context at the
+                // position the type names.
+                unsafe { (self.f)($($b,)* self.ctx $(, $a)*) }
             }
         }
     };
