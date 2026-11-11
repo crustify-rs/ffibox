@@ -93,11 +93,9 @@ impl FrameRef<'_> {
 // `free`, with the two frees counted apart
 // ---------------------------------------------------------------------------
 
-/// `fail` makes every allocation report failure, as a NULL from C.
+/// `FAIL` makes every allocation report failure, as a NULL from C.
 #[derive(Clone, Copy, Debug, Default)]
-struct Heap {
-    fail: bool,
-}
+struct Heap<const FAIL: bool = false>;
 
 fn heap_alloc<T>(zeroed: bool) -> *mut u8 {
     ALLOCS.fetch_add(1, Ordering::SeqCst);
@@ -118,7 +116,7 @@ fn heap_free<T>(ptr: *mut u8) {
 }
 
 // SAFETY: releases a filled allocation exactly once, without reading it.
-unsafe impl CDrop<Plain> for Heap {
+unsafe impl<const FAIL: bool> CDrop<Plain> for Heap<FAIL> {
     unsafe fn c_drop(&self, ptr: NonNull<Plain>) {
         DROPS.fetch_add(1, Ordering::SeqCst);
         heap_free::<Plain>(ptr.as_ptr().cast());
@@ -126,7 +124,7 @@ unsafe impl CDrop<Plain> for Heap {
 }
 
 // SAFETY: releases unfilled storage exactly once, without reading it.
-unsafe impl CDrop<MaybeUninit<Plain>> for Heap {
+unsafe impl<const FAIL: bool> CDrop<MaybeUninit<Plain>> for Heap<FAIL> {
     unsafe fn c_drop(&self, ptr: NonNull<MaybeUninit<Plain>>) {
         DEALLOCS.fetch_add(1, Ordering::SeqCst);
         heap_free::<Plain>(ptr.as_ptr().cast());
@@ -135,9 +133,9 @@ unsafe impl CDrop<MaybeUninit<Plain>> for Heap {
 
 // SAFETY: a fresh allocation sized and aligned by `Layout::new`, which both
 // `CDrop` impls release without reading.
-unsafe impl CAlloc<Plain> for Heap {
+unsafe impl<const FAIL: bool> CAlloc<Plain> for Heap<FAIL> {
     fn c_alloc(&self) -> Option<NonNull<MaybeUninit<Plain>>> {
-        if self.fail {
+        if FAIL {
             return None;
         }
         NonNull::new(heap_alloc::<Plain>(false).cast())
@@ -145,9 +143,9 @@ unsafe impl CAlloc<Plain> for Heap {
 }
 
 // SAFETY: as `CAlloc`, all-zero, which `Plain` accepts per `CZeroable`.
-unsafe impl CAllocZeroed<Plain> for Heap {
+unsafe impl<const FAIL: bool> CAllocZeroed<Plain> for Heap<FAIL> {
     fn c_alloc_zeroed(&self) -> Option<NonNull<Plain>> {
-        if self.fail {
+        if FAIL {
             return None;
         }
         NonNull::new(heap_alloc::<Plain>(true).cast())
@@ -190,9 +188,7 @@ unsafe impl<T: CZeroable> CAllocZeroed<T> for GenericHeap {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, Default)]
-struct FrameFree {
-    fail: bool,
-}
+struct FrameFree<const FAIL: bool = false>;
 
 /// Mock `frame_alloc()` — allocates and sets the non-zero default.
 fn frame_alloc() -> *mut ffi::frame_st {
@@ -201,7 +197,7 @@ fn frame_alloc() -> *mut ffi::frame_st {
 }
 
 // SAFETY: frees a `frame_alloc` result exactly once.
-unsafe impl CDrop<Frame> for FrameFree {
+unsafe impl<const FAIL: bool> CDrop<Frame> for FrameFree<FAIL> {
     unsafe fn c_drop(&self, ptr: NonNull<Frame>) {
         DROPS.fetch_add(1, Ordering::SeqCst);
         // SAFETY: `ptr` came from `frame_alloc`'s `Box`.
@@ -210,9 +206,9 @@ unsafe impl CDrop<Frame> for FrameFree {
 }
 
 // SAFETY: `frame_alloc` returns a fresh, initialised frame `c_drop` frees.
-unsafe impl CNew<Frame> for FrameFree {
+unsafe impl<const FAIL: bool> CNew<Frame> for FrameFree<FAIL> {
     fn c_new(&self) -> Option<NonNull<Frame>> {
-        if self.fail {
+        if FAIL {
             return None;
         }
         NonNull::new(frame_alloc().cast())
@@ -257,7 +253,7 @@ fn new_runs_the_c_constructor_and_its_paired_free() {
 #[test]
 fn new_failure_is_none_and_frees_nothing() {
     let _g = reset();
-    assert!(FrameBox::new_with(FrameFree { fail: true }).is_none());
+    assert!(CBox::<Frame, FrameFree<true>>::new().is_none());
     assert_eq!(count(&NEWS), 0);
     assert_eq!(count(&DROPS), 0);
 }
@@ -265,8 +261,8 @@ fn new_failure_is_none_and_frees_nothing() {
 #[test]
 fn new_with_keeps_the_given_policy() {
     let _g = reset();
-    let frame = FrameBox::new_with(FrameFree { fail: false }).unwrap();
-    assert!(!frame.policy().fail);
+    let frame = FrameBox::new_with(FrameFree).unwrap();
+    let _: &FrameFree = frame.policy();
 }
 
 #[test]
@@ -295,8 +291,8 @@ fn new_zeroed_hands_out_an_all_zero_object() {
 #[test]
 fn new_zeroed_failure_is_none() {
     let _g = reset();
-    assert!(PlainBox::new_zeroed_with(Heap { fail: true }).is_none());
-    assert!(CArc::<Plain, Heap>::new_zeroed_with(Heap { fail: true }).is_none());
+    assert!(CBox::<Plain, Heap<true>>::new_zeroed().is_none());
+    assert!(CArc::<Plain, Heap<true>>::new_zeroed().is_none());
     assert_eq!((count(&ALLOCS), count(&DROPS)), (0, 0));
 }
 
@@ -340,7 +336,7 @@ fn c_fills_through_as_c_ptr_then_assume_init() {
 #[test]
 fn new_uninit_failure_is_none() {
     let _g = reset();
-    assert!(PlainBox::new_uninit_with(Heap { fail: true }).is_none());
+    assert!(CBox::<Plain, Heap<true>>::new_uninit().is_none());
     assert_eq!((count(&ALLOCS), count(&DEALLOCS)), (0, 0));
 }
 

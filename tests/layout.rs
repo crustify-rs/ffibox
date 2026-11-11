@@ -10,7 +10,8 @@ use core::mem::{align_of, size_of};
 use core::ptr::NonNull;
 
 use ffibox::{
-    CArc, CBorrowedPtr, CBox, CDispose, CDrop, CSlice, CStrBox, CVal, CVec, RustAlloc, define_ctype,
+    CArc, CBorrowedPtr, CBox, CBoxState, CDispose, CDrop, CSlice, CStrBox, CVal, CVec, RustAlloc,
+    define_ctype,
 };
 
 #[repr(C)]
@@ -59,8 +60,8 @@ const _: () = {
     assert!(size_of::<ObjMut<'static>>() == PTR);
     assert!(size_of::<Option<CBorrowedPtr<'static, Obj>>>() == PTR);
     assert!(size_of::<CSlice<'static, Obj>>() == 2 * PTR);
-    // A stateful policy travels with the pointer, so the owner widens.
-    assert!(size_of::<CBox<Obj, Stateful>>() == 2 * PTR);
+    // A stateful policy travels with the pointer, so its owner widens.
+    assert!(size_of::<CBoxState<Obj, Stateful>>() == 2 * PTR);
 };
 
 #[test]
@@ -70,4 +71,26 @@ fn a_none_owner_is_a_null_pointer() {
     // and reading its bytes as one reads no padding.
     let raw: *mut obj_st = unsafe { core::mem::transmute(none) };
     assert!(raw.is_null());
+}
+
+/// The owners and handles are FFI-safe in an `extern "C"` signature: the
+/// lint that rejects a type Rust does not lay out as C's is denied here.
+#[deny(improper_ctypes_definitions)]
+mod ffi_safe {
+    use super::*;
+
+    pub extern "C" fn owners(
+        _: Option<CBox<Obj, Stateless>>,
+        _: Option<CArc<Obj, Stateless>>,
+        _: Option<CStrBox<RustAlloc>>,
+        _: Option<ObjRef<'_>>,
+        _: Option<ObjMut<'_>>,
+    ) -> Option<CBox<Obj, Stateless>> {
+        None
+    }
+}
+
+#[test]
+fn owners_cross_extern_c_by_value() {
+    assert!(ffi_safe::owners(None, None, None, None, None).is_none());
 }

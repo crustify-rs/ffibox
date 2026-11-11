@@ -20,7 +20,9 @@
 //! | [`CAllocZeroed<T>`] | `c_alloc_zeroed` — zeroed storage (`calloc`) | `CBox::new_zeroed`, `CArc::new_zeroed` |
 //!
 //! Every method takes `&self`, so a policy may carry runtime state (the
-//! element-free function of a `list_pop_free(list, elem_free)`). A ZST policy costs nothing.
+//! element-free function of a `list_pop_free(list, elem_free)`), held by a
+//! [`CBoxState`](crate::CBoxState). [`CBox`], [`CArc`] and [`CStrBox`] take a
+//! stateless policy, which costs nothing.
 //!
 //! The construction traits are sub-traits of [`CDrop`] on the same policy, so
 //! every safe path into an owner goes through the policy that will free it.
@@ -56,7 +58,8 @@ use crate::shared::{CArc, CGuard, CGuardedRef};
 /// Implemented on the policy `Self`, not on `T`, so one `T` may have several,
 /// and the owner's type says which runs.
 /// [`impl_cdrop!`](crate::impl_cdrop) binds a C routine; write the impl by
-/// hand when teardown needs runtime state. A destructor that must be
+/// hand when teardown needs runtime state, and hold the object in a
+/// [`CBoxState`](crate::CBoxState). A destructor that must be
 /// suppressed on some paths folds the gate into `c_drop`.
 ///
 /// # Safety

@@ -156,29 +156,58 @@ mod ffi_export {
 #[test]
 fn exports_offer_the_policy_to_c() {
     use ffi_export::*;
-    let p = test_point_new();
-    assert!(!p.is_null());
-    // SAFETY: a live point from `test_point_new`.
-    unsafe { (*p).x = 3 };
-    // SAFETY: a live point.
-    let q = unsafe { test_point_dup(p) };
-    // SAFETY: as above.
-    assert_eq!(unsafe { ((*q).x, (*q).y) }, (3, 0));
-    // SAFETY: NULL in, NULL out.
-    assert!(unsafe { test_point_dup(null_mut()) }.is_null());
-    // SAFETY: each point is released once; NULL is a no-op.
-    unsafe {
-        test_point_free(p);
-        test_point_free(q);
-        test_point_free(null_mut());
-    }
+    let mut p = test_point_new().unwrap();
+    p.as_mut().set_x(3);
+    let q = test_point_dup(Some(p.as_ref())).unwrap();
+    assert_eq!(q.as_ref().x(), 3);
+    assert_ne!(q.as_ptr(), p.as_ptr());
+    assert!(test_point_dup(None).is_none());
+    test_point_free(Some(p));
+    test_point_free(None);
+    // The copy is owned under `PointCopy`, so Rust will not pass it to
+    // `test_point_free`, which takes a `RustAlloc` box; it drops under its own
+    // policy. C, holding plain pointers, frees it with `test_point_free`,
+    // which `PointCopy` allows by freeing through `RustAlloc`.
+    drop(q);
 }
 
+/// What C calls: each export through the signature C declares, with plain
+/// `point_st *` arguments and results.
 #[test]
-fn an_exported_object_is_adopted_back_by_its_policy() {
-    let p = ffi_export::test_point_new();
-    // SAFETY: `test_point_new` allocates through `RustAlloc`, which the box
-    // frees.
-    let b = unsafe { PointBox::from_c(p) }.unwrap();
-    assert_eq!(b.as_ref().x(), 0);
+fn exports_are_called_through_the_c_signatures() {
+    // As C declares them.
+    type New = unsafe extern "C" fn() -> *mut point_st;
+    type Dup = unsafe extern "C" fn(*const point_st) -> *mut point_st;
+    type Free = unsafe extern "C" fn(*mut point_st);
+    // As Rust defines them.
+    type RustNew = extern "C" fn() -> Option<PointBox>;
+    type RustDup =
+        for<'a> extern "C" fn(Option<PointRef<'a>>) -> Option<CBox<Point, ffi_export::PointCopy>>;
+    type RustFree = extern "C" fn(Option<PointBox>);
+    // SAFETY: an `Option` of an owner or a handle is `#[repr(transparent)]`
+    // over a `NonNull`, with `None` as NULL, which Rust makes ABI-compatible
+    // with the raw pointer; Miri checks every call below.
+    let (new, dup, free) = unsafe {
+        (
+            core::mem::transmute::<RustNew, New>(ffi_export::test_point_new),
+            core::mem::transmute::<RustDup, Dup>(ffi_export::test_point_dup),
+            core::mem::transmute::<RustFree, Free>(ffi_export::test_point_free),
+        )
+    };
+    // SAFETY: C's side of the protocol: each object is live until freed, and
+    // freed once; NULL is accepted everywhere.
+    unsafe {
+        let p = new();
+        assert!(!p.is_null());
+        (*p).x = 3;
+        let q = dup(p);
+        assert_eq!(((*q).x, (*q).y), (3, 0));
+        assert!(dup(null_mut()).is_null());
+        free(p);
+        free(q);
+        free(null_mut());
+        // An object C allocated is adopted back by the policy that frees it.
+        let b = PointBox::from_c(new()).unwrap();
+        assert_eq!(b.as_ref().x(), 0);
+    }
 }

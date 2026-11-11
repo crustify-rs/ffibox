@@ -22,20 +22,28 @@
 //! Like `Box` and `Vec`, the owners adopt a raw pointer with an `unsafe`
 //! `from_raw` and give one out with a safe `into_raw` / `as_ptr`. Teardown is a type
 //! parameter — a policy implementing [`CDrop`], [`CLenDrop`] or [`CDispose`],
-//! stored inline — so an owner cannot be named without its destructor, and
-//! one C type can have several. A type alias names the pair:
+//! held by the owner — so an owner cannot be named without its destructor,
+//! and one C type can have several. A type alias names the pair:
 //! `pub type FooBox = CBox<Foo, FooFree>;`.
 //!
 //! ## Layout
 //!
-//! The owners are `#[repr(C)]` with the pointer (or value) first. With a ZST
-//! policy, [`CBox`] and [`CStrBox`] are pointer-sized and `Option<_>` takes
-//! the null niche, so they substitute for a `*mut T` field in a `#[repr(C)]`
-//! struct, and [`CVal`] is the size of its value. They are not
-//! `#[repr(transparent)]` — the compiler cannot prove a generic policy is a
-//! 1-ZST — so passing one *by value* in place of a pointer across `extern "C"`
-//! is not ABI-guaranteed. [`CVec`] stores pointer + length, the pointer NULL
-//! when empty, as C's `{ T *ptr; size_t len; }`.
+//! [`CBox`], [`CArc`](crate::CArc) and [`CStrBox`] are `#[repr(transparent)]`
+//! over their pointer. Their policy is stateless and held in no bytes, so each
+//! is the `T *` it stands in for, and `Option<_>` is the nullable one, `None`
+//! being NULL, as Rust guarantees for `Option<NonNull<T>>`. They take a
+//! `T *`'s place wherever C has one: an `extern "C"` parameter or return, a
+//! `#[repr(C)]` struct field, an element of a `T **` buffer.
+//!
+//! A policy with state (an allocator context, a callback the release runs
+//! through) is rejected by those three at compile time. It is held by
+//! [`CBoxState`], `#[repr(C)]` over `{ptr, policy}`, which takes no `T *`'s
+//! place: it crosses as [`into_raw`](CBoxState::into_raw) and comes back as
+//! [`from_raw_with`](CBoxState::from_raw_with).
+//!
+//! [`CVal`] is `#[repr(C)]` with its value first, the size of its value with a
+//! ZST policy. [`CVec`] stores pointer + length, the pointer NULL when empty,
+//! as C's `{ T *ptr; size_t len; }`.
 
 use core::ffi::c_char;
 use core::fmt;
@@ -245,6 +253,80 @@ pub(crate) unsafe fn disarm<O, R>(owner: O, read: impl FnOnce(&O) -> R) -> R {
     read(&owner)
 }
 
+/// The policy slot of a `#[repr(transparent)]` owner: a policy of size zero,
+/// held in no bytes.
+///
+/// A ZST has no bytes to store, so the slot keeps none: [`new`](Self::new)
+/// takes the policy and forgets it, [`Deref`](core::ops::Deref) hands out a
+/// `&D` at a dangling, well-aligned address, where a reference to a ZST is
+/// valid, and `Drop` drops it with the owner. To the compiler the slot is a
+/// `PhantomData<D>`, a 1-ZST whatever `D` is, which is what lets the owner be
+/// transparent; its auto traits and drop check follow `D`, as a field of type
+/// `D` would.
+///
+/// A policy with state cannot live in it, and every path to the policy
+/// rejects one at compile time: filling the slot, reaching the policy, and
+/// dropping it. An owner that never went through [`new`](Self::new), such as
+/// one C passes to an `extern "C"` routine, still reaches its policy only
+/// through the checked paths.
+pub(crate) struct ZstPolicy<D>(PhantomData<D>);
+
+impl<D> ZstPolicy<D> {
+    /// Fails the build for a `D` with state.
+    const STATELESS: () = assert!(
+        core::mem::size_of::<D>() == 0,
+        "ffibox: CBox, CArc and CStrBox hold a stateless (zero-sized) policy; \
+         a policy with state needs CBoxState",
+    );
+
+    /// Hold `policy`, which must be a ZST.
+    #[inline(always)]
+    pub(crate) fn new(policy: D) -> Self {
+        let () = Self::STATELESS;
+        core::mem::forget(policy);
+        Self(PhantomData)
+    }
+
+    /// The policy, moved out of the slot.
+    #[inline(always)]
+    pub(crate) fn into_inner(self) -> D {
+        let () = Self::STATELESS;
+        let _slot = ManuallyDrop::new(self);
+        // SAFETY: `D` is a ZST (`STATELESS` asserts it), so reading one at a
+        // dangling, well-aligned address reads no bytes. The slot owns the
+        // value `new` forgot and is not dropped, so the value moves out once.
+        unsafe { NonNull::<D>::dangling().as_ptr().read() }
+    }
+}
+
+impl<D> core::ops::Deref for ZstPolicy<D> {
+    type Target = D;
+
+    #[inline(always)]
+    fn deref(&self) -> &D {
+        let () = Self::STATELESS;
+        // SAFETY: as `into_inner`: a reference to a ZST is valid at any
+        // dangling, well-aligned address, and the slot owns a value of `D`.
+        unsafe { NonNull::<D>::dangling().as_ref() }
+    }
+}
+
+impl<D: Clone> Clone for ZstPolicy<D> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self::new(D::clone(self))
+    }
+}
+
+impl<D> Drop for ZstPolicy<D> {
+    #[inline]
+    fn drop(&mut self) {
+        let () = Self::STATELESS;
+        // SAFETY: as `into_inner`; the slot's value is dropped once, here.
+        unsafe { NonNull::<D>::dangling().as_ptr().drop_in_place() }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CBox<T, D> — the sole owner of a C-allocated object
 // ---------------------------------------------------------------------------
@@ -277,13 +359,29 @@ pub(crate) unsafe fn disarm<O, R>(owner: O, read: impl FnOnce(&O) -> R) -> R {
 /// `up_ref`.
 ///
 /// `Send` / `Sync` on `Box`'s terms: `T: Send` / `T: Sync`, plus the policy's.
-/// `#[repr(C)]` over `{ptr, policy}`: pointer-sized with a ZST policy, with the
-/// null niche (see the [module docs](self#layout)).
-#[repr(C)]
+///
+/// `#[repr(transparent)]` over the pointer, so `Option<CBox<T, D>>` is a
+/// nullable `T *` (see the [module docs](self#layout)). The policy is
+/// stateless; one with state fails to build, and is held by a [`CBoxState`]:
+///
+/// ```compile_fail,E0080
+/// # use core::ptr::NonNull;
+/// # use ffibox::{define_ctype, CBox, CDrop};
+/// # mod ffi { #[repr(C)] pub struct foo_st { pub x: u32 } }
+/// # define_ctype!(Foo, FooRef, FooMut, ffi::foo_st);
+/// /// Frees into a pool: the policy holds the pool's handle.
+/// struct PoolFree(usize);
+/// // SAFETY: never called; the box below must not build.
+/// unsafe impl CDrop<Foo> for PoolFree {
+///     unsafe fn c_drop(&self, _: NonNull<Foo>) {}
+/// }
+/// let _ = unsafe { CBox::<Foo, PoolFree>::from_raw_with(core::ptr::null_mut(), PoolFree(1)) };
+/// ```
+#[repr(transparent)]
 #[must_use = "dropping a CBox runs its teardown policy"]
 pub struct CBox<T, D: CDrop<T>> {
     ptr: NonNull<T>,
-    policy: D,
+    policy: ZstPolicy<D>,
 }
 
 impl<T: CCell, D: CDrop<T>> CBox<T, D> {
@@ -310,7 +408,10 @@ impl<T: CCell, D: CDrop<T>> CBox<T, D> {
     /// As [`from_raw`](Self::from_raw), with `policy` releasing it.
     #[inline]
     pub unsafe fn from_raw_with(ptr: *mut T, policy: D) -> Option<Self> {
-        NonNull::new(ptr).map(|ptr| Self { ptr, policy })
+        NonNull::new(ptr).map(|ptr| Self {
+            ptr,
+            policy: ZstPolicy::new(policy),
+        })
     }
 
     /// Raw pointer for passing to C. Ownership is retained.
@@ -341,7 +442,11 @@ impl<T: CCell, D: CDrop<T>> CBox<T, D> {
     pub fn into_raw_with(self) -> (*mut T, D) {
         // SAFETY: each field is read out exactly once and `self` is not
         // dropped.
-        unsafe { disarm(self, |o| (o.ptr.as_ptr(), core::ptr::read(&o.policy))) }
+        unsafe {
+            disarm(self, |o| {
+                (o.ptr.as_ptr(), core::ptr::read(&o.policy).into_inner())
+            })
+        }
     }
 
     /// Swap the teardown policy, returning the old one.
@@ -359,7 +464,13 @@ impl<T: CCell, D: CDrop<T>> CBox<T, D> {
         // SAFETY: `ptr` was non-null in `self`; the caller vouches that
         // `policy` releases it.
         let ptr = unsafe { NonNull::new_unchecked(ptr) };
-        (CBox { ptr, policy }, old)
+        (
+            CBox {
+                ptr,
+                policy: ZstPolicy::new(policy),
+            },
+            old,
+        )
     }
 }
 
@@ -475,7 +586,10 @@ impl<T: CCell, D: CDrop<T>> CBox<T, D> {
         D: CNew<T>,
     {
         let ptr = policy.c_new()?;
-        Some(Self { ptr, policy })
+        Some(Self {
+            ptr,
+            policy: ZstPolicy::new(policy),
+        })
     }
 
     /// Allocate an all-zero `T` through the policy's zeroing allocator
@@ -497,7 +611,10 @@ impl<T: CCell, D: CDrop<T>> CBox<T, D> {
         D: CAllocZeroed<T>,
     {
         let ptr = policy.c_alloc_zeroed()?;
-        Some(Self { ptr, policy })
+        Some(Self {
+            ptr,
+            policy: ZstPolicy::new(policy),
+        })
     }
 
     /// Allocate uninitialised storage through the policy's allocator
@@ -527,7 +644,10 @@ impl<T: CCell, D: CDrop<T>> CBox<T, D> {
         D: CAlloc<T>,
     {
         let ptr = policy.c_alloc()?;
-        Some(CBox { ptr, policy })
+        Some(CBox {
+            ptr,
+            policy: ZstPolicy::new(policy),
+        })
     }
 }
 
@@ -642,6 +762,284 @@ unsafe impl<T: Send, D: CDrop<T> + Send> Send for CBox<T, D> {}
 unsafe impl<T: Sync, D: CDrop<T> + Sync> Sync for CBox<T, D> {}
 
 // ---------------------------------------------------------------------------
+// CBoxState<T, D> — the sole owner, under a policy with state
+// ---------------------------------------------------------------------------
+
+/// [`CBox`] under a policy with state: an allocator context
+/// (`pool_free(pool, p)`), an arena, a callback the release runs through.
+///
+/// The policy is stored beside the pointer, so a `CBoxState` is `#[repr(C)]`
+/// over `{ptr, policy}` and takes no `T *`'s place: across `extern "C"`, in a
+/// `#[repr(C)]` field or in a `T **` buffer, it goes as
+/// [`into_raw`](Self::into_raw) and comes back as
+/// [`from_raw_with`](Self::from_raw_with).
+///
+/// It offers `CBox`'s core: adopting and surrendering, the handles, the
+/// constructors that allocate through the policy, and `Clone`. A [`CBox`]
+/// converts into one with `From`.
+///
+/// ```
+/// use core::ptr::NonNull;
+/// use ffibox::{define_ctype, CBoxState, CDrop};
+///
+/// mod ffi {
+///     #[repr(C)]
+///     pub struct foo_st { pub x: u32 }
+///     #[repr(C)]
+///     pub struct pool_st { pub live: usize }
+///     // Stand-ins for a pool allocator's pair.
+///     pub unsafe fn pool_alloc(pool: *mut pool_st) -> *mut foo_st {
+///         unsafe { (*pool).live += 1 };
+///         Box::into_raw(Box::new(foo_st { x: 0 }))
+///     }
+///     pub unsafe fn pool_free(pool: *mut pool_st, p: *mut foo_st) {
+///         unsafe { (*pool).live -= 1 };
+///         drop(unsafe { Box::from_raw(p) });
+///     }
+/// }
+/// define_ctype!(Foo, FooRef, FooMut, ffi::foo_st);
+///
+/// /// Frees into the pool it names.
+/// struct PoolFree(*mut ffi::pool_st);
+/// // SAFETY: frees an object `pool_alloc` allocated from the same pool.
+/// unsafe impl CDrop<Foo> for PoolFree {
+///     unsafe fn c_drop(&self, p: NonNull<Foo>) {
+///         unsafe { ffi::pool_free(self.0, p.as_ptr().cast()) }
+///     }
+/// }
+///
+/// let mut pool = ffi::pool_st { live: 0 };
+/// let pool = &raw mut pool;
+/// // SAFETY: a fresh object from `pool`, which outlives the box.
+/// let foo = unsafe { CBoxState::from_c_with(ffi::pool_alloc(pool), PoolFree(pool)) }.unwrap();
+/// assert_eq!(unsafe { (*pool).live }, 1);
+/// drop(foo); // pool_free(pool, foo)
+/// assert_eq!(unsafe { (*pool).live }, 0);
+/// ```
+///
+/// `Send` / `Sync` on `Box`'s terms, plus the policy's.
+#[repr(C)]
+#[must_use = "dropping a CBoxState runs its teardown policy"]
+pub struct CBoxState<T, D: CDrop<T>> {
+    ptr: NonNull<T>,
+    policy: D,
+}
+
+impl<T: CCell, D: CDrop<T>> CBoxState<T, D> {
+    /// Take ownership of a raw pointer under `policy`; `None` if null.
+    ///
+    /// # Safety
+    ///
+    /// As [`CBox::from_raw`], with `policy` releasing it.
+    #[inline]
+    pub unsafe fn from_raw_with(ptr: *mut T, policy: D) -> Option<Self> {
+        NonNull::new(ptr).map(|ptr| Self { ptr, policy })
+    }
+
+    /// [`from_raw_with`](Self::from_raw_with) from the C type's pointer.
+    ///
+    /// # Safety
+    ///
+    /// As [`CBox::from_raw`], with `policy` releasing it.
+    #[inline]
+    pub unsafe fn from_c_with(ptr: *mut T::C, policy: D) -> Option<Self> {
+        // SAFETY: `T` is layout-compatible with `T::C` per `CCell`; the caller
+        // upholds the rest.
+        unsafe { Self::from_raw_with(ptr.cast(), policy) }
+    }
+
+    /// Raw pointer for passing to C. Ownership is retained.
+    #[inline]
+    #[must_use]
+    pub fn as_ptr(&self) -> *mut T {
+        self.ptr.as_ptr()
+    }
+
+    /// [`as_ptr`](Self::as_ptr) as the C type's pointer.
+    #[inline]
+    #[must_use]
+    pub fn as_c_ptr(&self) -> *mut T::C {
+        self.as_ptr().cast()
+    }
+
+    /// The policy that will release the object.
+    #[inline]
+    #[must_use]
+    pub fn policy(&self) -> &D {
+        &self.policy
+    }
+
+    /// Give up ownership without running the policy, which is dropped. The
+    /// caller becomes responsible for releasing the object.
+    #[inline]
+    #[must_use = "the returned pointer owns the object and must be freed"]
+    pub fn into_raw(self) -> *mut T {
+        self.into_raw_with().0
+    }
+
+    /// As [`into_raw`](Self::into_raw), also returning the policy.
+    #[inline]
+    #[must_use = "the returned pointer owns the object and must be freed"]
+    pub fn into_raw_with(self) -> (*mut T, D) {
+        // SAFETY: each field is read out exactly once and `self` is not
+        // dropped.
+        unsafe { disarm(self, |o| (o.ptr.as_ptr(), core::ptr::read(&o.policy))) }
+    }
+
+    /// [`into_raw`](Self::into_raw) as the C type's pointer.
+    #[inline]
+    #[must_use = "the returned pointer owns the object and must be freed"]
+    pub fn into_c(self) -> *mut T::C {
+        self.into_raw().cast()
+    }
+
+    /// Shared handle to the object, as [`CBox::as_ref`].
+    #[inline]
+    #[must_use]
+    pub fn as_ref(&self) -> T::Ref<'_> {
+        // SAFETY: `self.ptr` addresses a live `T` we own; the handle is bound
+        // to this borrow.
+        unsafe { handle_ref(self.ptr) }
+    }
+
+    /// Exclusive handle to the object, as [`CBox::as_mut`].
+    #[inline]
+    #[must_use]
+    pub fn as_mut(&mut self) -> T::Mut<'_> {
+        // SAFETY: as `as_ref`, from an exclusive borrow of the sole owner.
+        unsafe { handle_mut(self.ptr) }
+    }
+}
+
+/// The safe constructors, as [`CBox`]'s `*_with` ones.
+impl<T: CCell, D: CDrop<T>> CBoxState<T, D> {
+    /// Construct through the policy's C constructor ([`CNew`]); `None` on
+    /// failure.
+    #[inline]
+    pub fn new_with(policy: D) -> Option<Self>
+    where
+        D: CNew<T>,
+    {
+        let ptr = policy.c_new()?;
+        Some(Self { ptr, policy })
+    }
+
+    /// Allocate an all-zero `T` through the policy ([`CAllocZeroed`]); `None`
+    /// on failure.
+    #[inline]
+    pub fn new_zeroed_with(policy: D) -> Option<Self>
+    where
+        T: CZeroable,
+        D: CAllocZeroed<T>,
+    {
+        let ptr = policy.c_alloc_zeroed()?;
+        Some(Self { ptr, policy })
+    }
+
+    /// Allocate uninitialised storage through the policy ([`CAlloc`]), as
+    /// [`CBox::new_uninit`]; `None` on failure.
+    #[inline]
+    pub fn new_uninit_with(policy: D) -> Option<CBoxState<MaybeUninit<T>, D>>
+    where
+        D: CAlloc<T>,
+    {
+        let ptr = policy.c_alloc()?;
+        Some(CBoxState { ptr, policy })
+    }
+}
+
+impl<T: CCell, D: CAlloc<T>> CBoxState<MaybeUninit<T>, D> {
+    /// Treat the storage as holding a `T`, as [`CBox::assume_init`].
+    ///
+    /// # Safety
+    ///
+    /// As [`CBox::assume_init`].
+    #[inline]
+    pub unsafe fn assume_init(self) -> CBoxState<T, D> {
+        // SAFETY: each field is read out exactly once and `self` is not
+        // dropped.
+        let (ptr, policy) = unsafe { disarm(self, |o| (o.ptr, core::ptr::read(&o.policy))) };
+        CBoxState {
+            ptr: ptr.cast(),
+            policy,
+        }
+    }
+
+    /// The storage as the C type's pointer, for a C routine to fill in place.
+    #[inline]
+    #[must_use]
+    pub fn as_c_ptr(&mut self) -> *mut T::C {
+        self.ptr.as_ptr().cast()
+    }
+}
+
+impl<T, D: CDrop<T>> Drop for CBoxState<T, D> {
+    #[inline]
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` is a live `T` we own; the policy releases it once.
+        unsafe { self.policy.c_drop(self.ptr) }
+    }
+}
+
+impl<T: CCell, D: CDupClone<T> + Clone> CBoxState<T, D> {
+    /// Deep copy through [`CDupClone::c_dup`], as [`CBox::try_clone`].
+    #[inline]
+    pub fn try_clone(&self) -> Option<Self> {
+        // SAFETY: `self.ptr` is live; per `CDupClone` a `Some` is a fresh,
+        // independent object a clone of the policy releases.
+        let ptr = unsafe { self.policy.c_dup(self.ptr) }?;
+        Some(Self {
+            ptr,
+            policy: self.policy.clone(),
+        })
+    }
+}
+
+impl<T: CCell, D: CDupClone<T> + Clone> Clone for CBoxState<T, D> {
+    #[inline]
+    fn clone(&self) -> Self {
+        // Abort on a failed copy, as `CBox` does.
+        match self.try_clone() {
+            Some(b) => b,
+            None => abort_process(),
+        }
+    }
+}
+
+impl<T, D: CDrop<T>> From<CBox<T, D>> for CBoxState<T, D> {
+    /// Hold a box's object under the same policy, now stored.
+    #[inline]
+    fn from(b: CBox<T, D>) -> Self {
+        // SAFETY: each field is read out exactly once and `b` is not dropped.
+        let (ptr, policy) = unsafe { disarm(b, |o| (o.ptr, core::ptr::read(&o.policy))) };
+        Self {
+            ptr,
+            policy: policy.into_inner(),
+        }
+    }
+}
+
+impl<T, D: CDrop<T>> fmt::Debug for CBoxState<T, D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("CBoxState")
+            .field(&self.ptr.as_ptr())
+            .finish()
+    }
+}
+
+impl<T, D: CDrop<T>> fmt::Pointer for CBoxState<T, D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Pointer::fmt(&self.ptr.as_ptr(), f)
+    }
+}
+
+// SAFETY: as `CBox`: the sole owner of its `T`, with the policy travelling
+// with the pointer and running on whichever thread drops it.
+unsafe impl<T: Send, D: CDrop<T> + Send> Send for CBoxState<T, D> {}
+// SAFETY: as above; `&CBoxState<T, D>` hands out `T::Ref<'_>` and `&D`.
+unsafe impl<T: Sync, D: CDrop<T> + Sync> Sync for CBoxState<T, D> {}
+
+// ---------------------------------------------------------------------------
 // CStrBox<D> — owned NUL-terminated C string
 // ---------------------------------------------------------------------------
 
@@ -658,11 +1056,16 @@ unsafe impl<T: Sync, D: CDrop<T> + Sync> Sync for CBox<T, D> {}
 /// unit-struct policy is `Send + Sync`, so by default the string crosses
 /// threads and is freed wherever it drops; a policy for an allocator that must
 /// free on the allocating thread opts out by carrying `PhantomData<*const ()>`.
-#[repr(C)]
+///
+/// `#[repr(transparent)]` over the pointer, as [`CBox`] is, so
+/// `Option<CStrBox<D>>` is a nullable `char *`, and the policy is stateless.
+// TODO(CStrBoxState): a string under a policy with state, as `CBoxState` is
+// for `CBox`, once a campaign frees strings through an allocator context.
+#[repr(transparent)]
 #[must_use = "dropping a CStrBox runs its teardown policy"]
 pub struct CStrBox<D: CDrop<c_char>> {
     ptr: NonNull<c_char>,
-    policy: D,
+    policy: ZstPolicy<D>,
 }
 
 impl<D: CDrop<c_char>> CStrBox<D> {
@@ -688,7 +1091,10 @@ impl<D: CDrop<c_char>> CStrBox<D> {
     /// As [`from_raw`](Self::from_raw), with `policy` releasing it.
     #[inline]
     pub unsafe fn from_raw_with(ptr: *mut c_char, policy: D) -> Option<Self> {
-        NonNull::new(ptr).map(|ptr| Self { ptr, policy })
+        NonNull::new(ptr).map(|ptr| Self {
+            ptr,
+            policy: ZstPolicy::new(policy),
+        })
     }
 
     /// Adopt the string a C routine returns through an out-parameter
@@ -734,7 +1140,11 @@ impl<D: CDrop<c_char>> CStrBox<D> {
     pub fn into_raw_with(self) -> (*mut c_char, D) {
         // SAFETY: each field is read out exactly once and `self` is not
         // dropped.
-        unsafe { disarm(self, |o| (o.ptr.as_ptr(), core::ptr::read(&o.policy))) }
+        unsafe {
+            disarm(self, |o| {
+                (o.ptr.as_ptr(), core::ptr::read(&o.policy).into_inner())
+            })
+        }
     }
 
     /// Borrowed [`CStr`](core::ffi::CStr) view (computes `strlen`).
@@ -805,7 +1215,10 @@ impl<D: CDupClone<c_char>> CStrBox<D> {
         // `CDupClone<c_char>` lets `c_dup` copy wherever it lives, reading
         // it only; a `Some` is a fresh copy the policy releases.
         let ptr = unsafe { policy.c_dup(src) }?;
-        Some(Self { ptr, policy })
+        Some(Self {
+            ptr,
+            policy: ZstPolicy::new(policy),
+        })
     }
 }
 

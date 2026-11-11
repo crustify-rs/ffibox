@@ -10,11 +10,12 @@ lifetime-carrying layout type — needs this layer.
 | `CBorrowedPtr<'a, T>` | what every handle wraps: one pointer tagged with the borrow's lifetime, `Copy` and covariant like `&'a T`. | `src/refs.rs` |
 | `CPlainElem` | marker for plain-data elements: every bit pattern is a valid value and there is no C-side identity. It admits `&[T]` from a `CVec` (a wrapped C type implements `CCell` instead, so `&[Foo]` does not typecheck) and makes copies read out of memory C keeps writing sound. Not the same as initialized: an unfilled buffer is `CVec<MaybeUninit<T>, _>` until `assume_init`. | `src/traits.rs` |
 
-**Layout.** With a zero-sized policy, `CBox<Foo, P>` and the arcs are
-pointer-sized and `Option<CBox<Foo, P>>` is a null-niche `*mut ffi::foo`, so it
-substitutes for a raw pointer field in a `#[repr(C)]` struct; `CVal<Foo, P>` is the size of
-`Foo`. The owners are `#[repr(C)]`, not `#[repr(transparent)]` (the compiler
-cannot prove a generic policy is a 1-ZST), so passing one *by value* in place
-of a pointer across an `extern "C"` signature is not ABI-guaranteed. A
-stateful policy makes the owner fat; a buffer is pointer + length, the pointer
-NULL when empty, as C's `{ T *ptr; size_t len; }`.
+**Layout.** `CBox`, `CArc` and `CStrBox` are `#[repr(transparent)]` over their
+pointer, and their policy is stateless, held in no bytes: `Option<CBox<Foo, P>>`
+is a `ffi::foo *`, NULL for `None`, as Rust guarantees for `Option<NonNull<_>>`.
+So it takes a raw pointer's place in a `#[repr(C)]` struct, a `foo **` buffer
+and an `extern "C"` signature alike. A policy with state fails to build in
+them; it is held by `CBoxState<Foo, P>`, `#[repr(C)]` over `{ptr, policy}`,
+which crosses as a raw pointer. `CVal<Foo, P>` is the size of `Foo`; a buffer
+is pointer + length, the pointer NULL when empty, as C's
+`{ T *ptr; size_t len; }`.

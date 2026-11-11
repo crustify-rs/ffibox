@@ -72,7 +72,7 @@ use core::fmt;
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 
-use crate::refs::{CBorrowedPtr, CBox, abort_process, disarm, handle_mut, handle_ref};
+use crate::refs::{CBorrowedPtr, CBox, ZstPolicy, abort_process, disarm, handle_mut, handle_ref};
 #[allow(unused_imports)] // doc links
 use crate::traits::LockWhole;
 use crate::traits::{
@@ -115,11 +115,18 @@ use crate::traits::{
 /// ```
 ///
 /// `Send` / `Sync` on `Arc`'s terms: `T: Send + Sync`, plus the policy's.
-#[repr(C)]
+///
+/// `#[repr(transparent)]` over the pointer, as [`CBox`] is, so
+/// `Option<CArc<T, D>>` is a nullable `T *` holding one counted reference, and
+/// the policy is stateless.
+// TODO(CArcState): a counted reference under a policy with state, as
+// `CBoxState` is for `CBox`, once a campaign releases references through a
+// context.
+#[repr(transparent)]
 #[must_use = "dropping a CArc releases its reference"]
 pub struct CArc<T, D: CDrop<T>> {
     ptr: NonNull<T>,
-    policy: D,
+    policy: ZstPolicy<D>,
 }
 
 impl<T: CCell, D: CDrop<T>> CArc<T, D> {
@@ -145,7 +152,10 @@ impl<T: CCell, D: CDrop<T>> CArc<T, D> {
     /// As [`from_raw`](Self::from_raw), with `policy` releasing it.
     #[inline]
     pub unsafe fn from_raw_with(ptr: *mut T, policy: D) -> Option<Self> {
-        NonNull::new(ptr).map(|ptr| Self { ptr, policy })
+        NonNull::new(ptr).map(|ptr| Self {
+            ptr,
+            policy: ZstPolicy::new(policy),
+        })
     }
 
     /// Raw pointer for passing to C. The reference is retained.
@@ -175,7 +185,11 @@ impl<T: CCell, D: CDrop<T>> CArc<T, D> {
     pub fn into_raw_with(self) -> (*mut T, D) {
         // SAFETY: each field is read out exactly once and `self` is not
         // dropped.
-        unsafe { disarm(self, |o| (o.ptr.as_ptr(), core::ptr::read(&o.policy))) }
+        unsafe {
+            disarm(self, |o| {
+                (o.ptr.as_ptr(), core::ptr::read(&o.policy).into_inner())
+            })
+        }
     }
 }
 
@@ -249,7 +263,7 @@ impl<T: CCell, D: CRefClone<T>> CArc<T, D> {
         // SAFETY: our reference keeps the object live; per the contract, a
         // `true` means no other reference can reach it, and `&mut self` keeps
         // this one from being cloned meanwhile.
-        unsafe { sole_mut(self.ptr, &self.policy) }
+        unsafe { sole_mut(self.ptr, &*self.policy) }
     }
 
     /// Exclusive handle, copying the object first through [`CDupClone`] unless
@@ -263,9 +277,9 @@ impl<T: CCell, D: CRefClone<T>> CArc<T, D> {
         // object's lock, and a `CDupClone` for a `CGuarded` type takes that
         // lock itself (`CGuarded`'s contract), so the copy reads a quiescent
         // object.
-        let copy = unsafe { copy_unless_sole(self.ptr, &self.policy) }?;
+        let copy = unsafe { copy_unless_sole(self.ptr, &*self.policy) }?;
         // SAFETY: `copy` came from `copy_unless_sole` on our reference.
-        unsafe { adopt_copy(&mut self.ptr, &self.policy, copy) };
+        unsafe { adopt_copy(&mut self.ptr, &*self.policy, copy) };
         // SAFETY: `self.ptr` is now the sole reference, exclusively borrowed.
         Some(unsafe { handle_mut(self.ptr) })
     }
@@ -376,7 +390,10 @@ impl<T: CCell, D: CDrop<T>> From<CBox<T, D>> for CArc<T, D> {
         // SAFETY: `ptr` came from a live box, so it is non-null, and the box
         // owned one reference.
         let ptr = unsafe { NonNull::new_unchecked(ptr) };
-        Self { ptr, policy }
+        Self {
+            ptr,
+            policy: ZstPolicy::new(policy),
+        }
     }
 }
 
@@ -461,7 +478,7 @@ unsafe impl<T: Send + Sync, D: CDrop<T> + Send + Sync> Send for CArc<T, D> {}
 // SAFETY: as above.
 unsafe impl<T: Send + Sync, D: CDrop<T> + Send + Sync> Sync for CArc<T, D> {}
 
-// SAFETY: a `CArc` is a pointer and its policy, a Rust value; the object is
+// SAFETY: a `CArc` is a pointer and its stateless policy; the object is
 // reached only through handles, so a `CVec` of them hands out a real slice.
 unsafe impl<T, D: CDrop<T>> crate::CSliceElem for CArc<T, D> {}
 // SAFETY: as above; `None` is a NULL slot.

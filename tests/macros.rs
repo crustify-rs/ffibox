@@ -26,8 +26,8 @@ use core::ptr::NonNull;
 use std::ffi::CString;
 
 use ffibox::{
-    CBox, CDrop, CDupClone, CLenDrop, CMutSeam, CRefClone, CRefSeam, CSlice, CSliceMut, CStrBox,
-    CVal, CVec, CZeroable as _, define_ctype, impl_cdispose, impl_cdrop, impl_cdrop_str,
+    CBox, CBoxState, CDrop, CDupClone, CLenDrop, CMutSeam, CRefClone, CRefSeam, CSlice, CSliceMut,
+    CStrBox, CVal, CVec, CZeroable as _, define_ctype, impl_cdispose, impl_cdrop, impl_cdrop_str,
     impl_cdupclone, impl_cdupclone_str, impl_clenclone, impl_clendrop, impl_crefclone,
 };
 
@@ -600,7 +600,7 @@ fn a_policy_without_cdupclone_yields_a_non_clone_owner() {
 }
 
 // ---------------------------------------------------------------------------
-// CBox — hand-written policies (typed and void, with/without clone)
+// CBoxState — hand-written policies with state (with/without clone)
 // ---------------------------------------------------------------------------
 
 static TAGGED_FREES: AtomicUsize = AtomicUsize::new(0);
@@ -644,8 +644,8 @@ unsafe impl CDupClone<Bar> for TaggedDup {
     }
 }
 
-pub type BarTagged = CBox<Bar, Tagged>;
-pub type BarTaggedDup = CBox<Bar, TaggedDup>;
+pub type BarTagged = CBoxState<Bar, Tagged>;
+pub type BarTaggedDup = CBoxState<Bar, TaggedDup>;
 
 #[test]
 fn stateful_non_default_policy_works_through_from_raw_with() {
@@ -736,28 +736,29 @@ impl_cdupclone_str!(
 /// A string from the mock allocator.
 pub type MockStr = CStrBox<MockStrFree>;
 
-/// A hand-written string policy carrying a tag.
-#[derive(Clone)]
-pub struct StrTagged(usize);
+/// A hand-written string policy, its tag a type parameter: a `CStrBox`
+/// holds a stateless policy.
+#[derive(Clone, Copy, Default)]
+pub struct StrTagged<const TAG: usize>;
 
 // SAFETY: frees a `CString::into_raw` string exactly once.
-unsafe impl CDrop<c_char> for StrTagged {
+unsafe impl<const TAG: usize> CDrop<c_char> for StrTagged<TAG> {
     unsafe fn c_drop(&self, ptr: NonNull<c_char>) {
-        TAGGED_STR_FREES.fetch_add(self.0, Ordering::SeqCst);
+        TAGGED_STR_FREES.fetch_add(TAG, Ordering::SeqCst);
         // SAFETY: caller upholds the trait contract.
         drop(unsafe { CString::from_raw(ptr.as_ptr()) });
     }
 }
 
 // SAFETY: copies into a fresh `CString` this policy frees.
-unsafe impl CDupClone<c_char> for StrTagged {
+unsafe impl<const TAG: usize> CDupClone<c_char> for StrTagged<TAG> {
     unsafe fn c_dup(&self, ptr: NonNull<c_char>) -> Option<NonNull<c_char>> {
         // SAFETY: caller upholds the trait contract.
         NonNull::new(unsafe { mock_strdup(ptr.as_ptr()) })
     }
 }
 
-pub type TaggedStr = CStrBox<StrTagged>;
+pub type TaggedStr = CStrBox<StrTagged<5>>;
 
 #[test]
 fn cstr_macro_bound_policy() {
@@ -797,13 +798,12 @@ fn cstr_macro_bound_policy() {
 #[test]
 fn cstr_hand_written_policy() {
     // SAFETY: a fresh, uniquely-owned NUL-terminated string.
-    let s = unsafe { TaggedStr::from_raw_with(mock_str(""), StrTagged(5)) }.unwrap();
+    let s = unsafe { TaggedStr::from_raw_with(mock_str(""), StrTagged) }.unwrap();
     assert!(s.is_empty());
     let t = s.try_clone().unwrap();
-    let (raw, StrTagged(tag)) = t.into_raw_with();
-    assert_eq!(tag, 5, "the policy was cloned with the string");
+    let (raw, StrTagged::<5>) = t.into_raw_with();
     // SAFETY: from `into_raw_with` above.
-    drop(unsafe { TaggedStr::from_raw_with(raw, StrTagged(1)) });
+    drop(unsafe { CStrBox::<StrTagged<1>>::from_raw_with(raw, StrTagged) });
     drop(s);
     assert_eq!(TAGGED_STR_FREES.load(Ordering::SeqCst), 6);
 }

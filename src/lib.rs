@@ -25,6 +25,7 @@
 //! |------|------|
 //! | [`define_ctype!`] | per C type: the layout type `Foo` and its handles `FooRef<'a>` / `FooMut<'a>` |
 //! | [`CBox<T, D>`] | the sole owner of a C-allocated object of a [`CCell`] layout type |
+//! | [`CBoxState<T, D>`] | the same, under a policy with state; [`CBox`] and the other pointer owners take a stateless one |
 //! | [`CArc<T, D>`] | one counted reference to a refcounted object; [`lock`](CArc::lock) takes the C lock a [`CGuarded`] object carries |
 //! | [`CGuard<'a, T>`] | a held C lock, released on drop; hands out the `FooLocked<'a>` handle |
 //! | [`CGuardedRef<'a, T>`] | a borrow reached only through the object's lock, never released — a C global under its C lock |
@@ -136,7 +137,7 @@ pub struct DocExamples;
 pub use crate::callback::CClosure;
 #[cfg(feature = "alloc")]
 pub use crate::callback::CPayload;
-pub use crate::refs::{CBorrowedPtr, CBox, CSlice, CSliceMut, CStrBox, CVal, CVec};
+pub use crate::refs::{CBorrowedPtr, CBox, CBoxState, CSlice, CSliceMut, CStrBox, CVal, CVec};
 #[cfg(feature = "alloc")]
 pub use crate::rust_alloc::RustAlloc;
 pub use crate::shared::{CArc, CGuard, CGuardedRef};

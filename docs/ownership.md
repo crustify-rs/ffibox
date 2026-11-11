@@ -13,6 +13,7 @@ For the borrowed side — handles over objects C or a parent releases — see
 | Scope | Type | From | Role |
 |-------|------|------|------|
 | owners | `CBox<Foo, P>` | ffibox | the sole owner of an object behind a pointer, released by `P` on drop; `Clone` when `P` deep-copies; built safely by `new` / `new_zeroed` / `new_uninit` when `P` constructs |
+| | `CBoxState<Foo, P>` | ffibox | `CBox` under a policy with state (an allocator context, an element-free callback), stored beside the pointer; crosses to C as a raw pointer |
 | | `CVal<Foo, P>` | ffibox | an owned value held inline, its resources disposed by `P` on drop |
 | | `CStrBox<P>` | ffibox | an owned NUL-terminated `char *`; read-only `CStr` / `str` / byte views |
 | | `CVec<T, P>` | ffibox | an owned `(ptr, len)` array, NULL when empty; drops its elements, then frees the buffer; `&[T]` for plain elements and owners, `CSlice` for wrapped C objects; `from_fn` / `new_uninit` build one in `P`'s allocator, `from_slice` copies a Rust slice into it |
@@ -175,11 +176,14 @@ adapter passed by path. Teardown is unconditional: a gate that suppresses it on
 some paths folds into the routine itself.
 
 **Runtime-state policies.** When teardown needs a value chosen at the wrapping
-site (`list_pop_free(list, elem_free_fn)`), write the policy by hand — a
-struct holding the state, implementing `CDrop<T>` (and `CDupClone<T>` + `Clone`
-to clone). Without `Default` there is no `from_raw(ptr)`; adopt with
-`from_raw_with(ptr, ElemFree(f))` and release with `into_raw_with()`. The box
-then carries the state and is no longer pointer-sized.
+site (`list_pop_free(list, elem_free_fn)`, `pool_free(pool, p)`), write the
+policy by hand — a struct holding the state, implementing `CDrop<T>` (and
+`CDupClone<T>` + `Clone` to clone) — and hold the object in a `CBoxState`,
+which stores the policy beside the pointer. Adopt with
+`from_raw_with(ptr, ElemFree(f))` and release with `into_raw_with()`. `CBox`,
+`CArc` and `CStrBox` hold a stateless policy, so that each is the pointer it
+stands in for; one with state fails to build in them. A routine known at
+compile time needs no state: a unit-struct policy per routine names it.
 
 **Construction goes through the policy too.** Bind a constructor to the policy
 and the owner's type pairs allocation with teardown, just as it pairs `*_dup`

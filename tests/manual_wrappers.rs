@@ -20,7 +20,9 @@ use core::ptr::{NonNull, addr_of, addr_of_mut};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use ffibox::{CBorrowedPtr, CBox, CCell, CDrop, CMutSeam, CRefSeam, define_ctype, impl_cdrop};
+use ffibox::{
+    CBorrowedPtr, CBox, CBoxState, CCell, CDrop, CMutSeam, CRefSeam, define_ctype, impl_cdrop,
+};
 
 #[repr(C)]
 pub struct foo_st {
@@ -227,7 +229,7 @@ fn owning_handles_hand_out_handles_not_references() {
 }
 
 // ---------------------------------------------------------------------------
-// CBox<T, D> with a stateful policy, and the construction-phase handle
+// CBoxState<T, D> with a stateful policy, and the construction-phase handle
 // ---------------------------------------------------------------------------
 
 static POP_FREE_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -253,9 +255,9 @@ unsafe impl CDrop<Stack<Item, Borrowed>> for ElemFree {
     }
 }
 
-// A hand-written, stateful policy: no `Default`, so the box is built with
-// `from_c_with`, which takes the policy value.
-pub type StackOwned = CBox<Stack<Item, Borrowed>, ElemFree>;
+// A hand-written, stateful policy: stored beside the pointer, so the owner
+// is a `CBoxState`, built with `from_c_with`, which takes the policy value.
+pub type StackOwned = CBoxState<Stack<Item, Borrowed>, ElemFree>;
 
 #[test]
 fn stateful_policy_runs_with_runtime_state() {
@@ -363,7 +365,7 @@ fn owned_ptr_layout_thin_vs_fat() {
     );
     // With real state it is genuinely ptr + inline state (here a fn pointer).
     assert_eq!(
-        size_of::<CBox<Stack<Item, Borrowed>, ElemFree>>(),
+        size_of::<CBoxState<Stack<Item, Borrowed>, ElemFree>>(),
         size_of::<*mut stack_st>() + size_of::<ElemFree>(),
     );
 }

@@ -21,8 +21,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use ffibox::{
-    CBorrowedPtr, CBox, CCell, CDrop, CMutSeam, CRefClone, CRefSeam, CSlice, CSliceMut, CVec,
-    CZeroable as _, impl_cdrop, impl_cdupclone, impl_clendrop, impl_crefclone,
+    CBorrowedPtr, CBox, CBoxState, CCell, CDrop, CMutSeam, CRefClone, CRefSeam, CSlice, CSliceMut,
+    CVec, CZeroable as _, impl_cdrop, impl_cdupclone, impl_clendrop, impl_crefclone,
 };
 
 // ---------------------------------------------------------------------------
@@ -868,9 +868,9 @@ fn zst_policy_keeps_the_storage_pointer_sized() {
         size_of::<*mut Saturating>()
     );
 
-    // A stateful policy is stored inline, so the owner is genuinely fat.
+    // A stateful policy is stored beside the pointer, in a `CBoxState`.
     assert_eq!(
-        size_of::<CBox<Boxed, StatefulFree>>(),
+        size_of::<CBoxState<Boxed, StatefulFree>>(),
         size_of::<*mut Boxed>() + size_of::<usize>()
     );
 }
