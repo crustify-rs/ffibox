@@ -4,16 +4,15 @@ ffibox is one vocabulary for every value that crosses the boundary between
 Rust and a foreign language, in both directions: memory the foreign side
 allocates, frees, copies, refcounts or locks, held from Rust (**inbound**),
 and memory Rust owns that the foreign side holds, calls or reads
-(**outbound**). C is the first foreign language; the vocabulary is meant for
-others, such as C++ and Go.
+(**outbound**). The foreign language is C, as G8 states.
 
 Two parties use each primitive:
 
 - a **producer** implements its unsafe internals: a policy, a layout type, a
   seam, an export. A producer may be a human, an agent or a static analysis
   tool;
-- a **consumer** uses it through its safe API, without knowing which language
-  sits behind it.
+- a **consumer** uses it through its safe API, without knowing whether C or
+  Rust sits behind it.
 
 ffibox is needed only where the foreign side **aliases** a value: keeps a
 pointer to it beyond a call, frees it, or shares its refcount or lock. A
@@ -59,9 +58,8 @@ handle, policy, seam, adopt, surrender), its naming patterns (`C`-prefixed
 owners, `Foo` / `FooRef` / `FooMut` per type, `impl_*!` per policy trait) and
 its preference for reusing one primitive across cases over adding one per
 case. This is a direction, not a freeze: a new term, name or primitive is
-welcome where it is clearer than stretching an existing one, or where a
-foreign language's own vocabulary serves its layer better, and it states what
-it adds and how it relates to the terms beside it.
+welcome where it is clearer than stretching an existing one, and it states
+what it adds and how it relates to the terms beside it.
 
 *Checked by:* the documentation's walk from a foreign declaration to its
 wrapper stays a short decision table per direction, and each term it uses is
@@ -91,7 +89,7 @@ conventions, and the primitive supplies the Rust side.
 
 | foreign pattern | Rust pattern |
 |-----------------|--------------|
-| a cursor advanced by `next(it)` until NULL or a status; a `count` and `get(i)` pair; a `->next` chain; a sentinel-terminated array; C++'s `begin` / `end` | `Iterator`, `IntoIterator`, slices |
+| a cursor advanced by `next(it)` until NULL or a status; a `count` and `get(i)` pair; a `->next` chain; a sentinel-terminated array | `Iterator`, `IntoIterator`, slices |
 | a `foreach(callback, context)` visitor | a closure, or an `Iterator` where the visit can be suspended |
 | a status code, `errno`, an error out-parameter | `Result` with a typed error |
 | out-parameters | return values |
@@ -131,17 +129,20 @@ for each combination.
 
 *Checked by:* a new combination of axes needs no new primitive.
 
-### G8. A language-agnostic core, with language layers
+### G8. C first
 
-The core, owners, handles, policies, seams and their traits, names no
-language. Each foreign language adds a layer of policies, traits and seams for
-its own conventions, C's `free`, refcounts and `longjmp`; C++'s move
-constructors, exceptions and `shared_ptr` control blocks; Go's pointer-passing
-rules and pinning, and facilitates the properties its idioms make
-recoverable: the ownership a C++ smart pointer states, the nullability a
-`_Nonnull` annotation states. A layer extends the core and never forks it.
+ffibox targets C. Its names, the `C`-prefixed owners, `c_drop`, `as_c_ptr`,
+are C's, and so are the conventions its primitives encode: `malloc` and
+`free`, refcounts, C locks, NUL-terminated strings, status codes and `errno`,
+callbacks with a context pointer. No primitive is shaped for a language ffibox
+does not serve yet: C++'s move constructors, exceptions and smart pointers,
+and Go's pointer-passing rules, are out of scope for now.
 
-*Checked by:* the core compiles and is tested without any language layer.
+When another language is taken on, its conventions are added beside C's
+rather than folded into them, and what the two share is factored out then,
+from what they actually share, without changing what C bindings write.
+
+*Checked by:* every primitive serves a convention a C API uses.
 
 ## Safety
 
@@ -273,9 +274,8 @@ yields a sound binding, and establishing the fact later relaxes it.
 ### G19. Stable through migration
 
 A consumer's code does not change when the producer behind a primitive
-changes: a foreign allocator replaced by Rust's, a foreign implementation by a
-Rust port, one foreign language by another. Only the policy, or the layer,
-changes. This is what lets a codebase be ported one module at a time.
+changes: a C allocator replaced by Rust's, a C implementation by a Rust
+port. Only the policy changes. This is what lets a codebase be ported one module at a time.
 
 *Checked by:* a ported module's consumers compile unchanged against the port.
 
@@ -300,3 +300,4 @@ by hand, and fits on a screen.
 - **Generating bindings.** ffibox is what bindings are written in, not a
   generator. Its regularity serves generators.
 - **Memory the foreign side does not alias.** That is standard Rust's.
+- **Foreign languages other than C, for now.** See G8.
