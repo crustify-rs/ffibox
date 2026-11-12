@@ -50,3 +50,27 @@ Changes on `devel` since 0.1.1.
   `cargo check` does not. Hold the object in a `CBoxState`, adopted with
   `from_raw_with`; a counted object or a string under such a policy has no
   stateful owner yet.
+
+### Additions
+
+- **`define_ctype!` takes lifetimes** (`9c1a54c`).
+  `define_ctype!(Reference<'r>, ReferenceRef, ReferenceMut, ffi::git_reference, phantom = &'r ())`
+  declares `Reference<'r>`, `ReferenceRef<'a, 'r>` and `ReferenceMut<'a, 'r>`,
+  `CCell` for every `Reference<'r>` and the seams, the triple a
+  lifetime-carrying layout type wrote by hand. `phantom` decides the
+  variance; the macro adds the `*const ()` itself, so the type stays `!Send`
+  / `!Sync`. Lifetimes only: a layout type generic over a type is still
+  hand-written. The form without lifetimes expands as before.
+- **`impl_cdupclone!` and `impl_cguarded!` take a leading lifetime list**
+  (`9c1a54c`), `impl_cdupclone!(<'r> ReferenceFree, Reference<'r>, f)`, for a
+  layout type with a lifetime, which neither took before: the deep copy and
+  the lock over such a type need no hand-written impl. `impl_cguarded!`'s
+  locked handle is then `FooLocked<'a, 'r>`.
+
+  A hand-written lifetime-carrying triple is the same layout and keeps
+  compiling; moving one to the macro is optional. Moving it, mind that the
+  macro adds `as_ref` / `as_mut` on the layout type, as it does for every
+  `define_ctype!` type, which clash with inherent methods of those names; that
+  a marker without `*const ()` over a C type that is `Send` loses `Send` and
+  `Sync`, which then take an `unsafe impl`; and that `Debug` stays the
+  wrapper's.
