@@ -153,7 +153,7 @@ code. Each hazard is excluded by a primitive or a producer's contract:
 
 | hazard | excluded by |
 |--------|-------------|
-| aliasing a foreign object through a reference | handles: no Rust reference over foreign memory |
+| aliasing a foreign object through a reference | handles: no Rust reference over foreign memory that anything may write or free while the reference lives (C, another handle, another thread), and no `&mut` over memory anything else may access |
 | moving an address-sensitive object | pinned owners; inline values only for movable layouts |
 | null dereference | `NonNull`, `Option` with the null niche |
 | invalid values (`_Bool`, `char`, out-of-range enums) | plain-element markers, open enums |

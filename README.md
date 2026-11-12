@@ -28,7 +28,9 @@ policy; a type alias names the pair: `pub type FooBox = CBox<Foo, FooFree>;`.
 
 ## Mental model in one paragraph
 
-No reference to C-owned memory is ever formed. Each C type gets a layout type
+No reference to C-owned memory is formed while anything may write or free it:
+objects are reached through handles, and only a run of bytes nothing writes
+while it is lent is a `&CStr` or `&[u8]`. Each C type gets a layout type
 `Foo` (`#[repr(transparent)]` over `ffi::foo`) and two borrowed handles,
 `FooRef<'a>` / `FooMut<'a>`, each one pointer wide and carrying the getters and
 setters; field access projects a raw pointer out of the handle. Ownership

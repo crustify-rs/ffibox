@@ -41,7 +41,7 @@ the macros where they take the type, as they do for one with a lifetime.
   `Deref::Target` cannot name a lifetime taken from `&self`, and since `FooRef`
   is `Copy`, a `Deref<Target = FooRef<'a>>` on `FooMut` would let safe code copy
   a shared handle out while keeping the exclusive one.
-- **No reference covers C memory.** `&FooRef` covers one pointer of Rust stack,
+- **No reference covers C memory anything may write.** `&FooRef` covers one pointer of Rust stack,
   never the object. The one place a reference covers a C struct's bytes is
   `Foo::as_ref` / `as_mut` on a value Rust holds inline. A run of bytes an
   object lends, a NUL string or a counted run, is lent as `&CStr` or `&[u8]`
