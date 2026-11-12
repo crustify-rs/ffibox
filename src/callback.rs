@@ -163,8 +163,16 @@ struct ScopedState<F, R> {
     busy: AtomicBool,
     /// Set when an invocation was refused; reported by `finish`.
     refused: AtomicBool,
-    /// The first panic the closure raised, resumed by `finish`. Written only
-    /// by the invocation holding `busy`.
+    /// Set once the closure has panicked, after `panic` is stored: what
+    /// `failed` reads, and what refuses every later invocation. An atomic,
+    /// so that `failed` may be asked while an invocation runs, from inside
+    /// it or from another thread.
+    #[cfg(feature = "std")]
+    panicked: AtomicBool,
+    /// The first panic the closure raised, resumed by `finish`. Stored once,
+    /// by the invocation holding `busy`, through the cell's raw pointer and
+    /// only for the store, never borrowed across the closure's call; taken
+    /// only by `drop`, through `&mut`, when no invocation runs.
     #[cfg(feature = "std")]
     panic: core::cell::UnsafeCell<Option<std::boxed::Box<dyn core::any::Any + Send>>>,
 }
@@ -228,6 +236,8 @@ impl<'a, F, R: Copy> CClosure<'a, F, R> {
                 busy: AtomicBool::new(false),
                 refused: AtomicBool::new(false),
                 #[cfg(feature = "std")]
+                panicked: AtomicBool::new(false),
+                #[cfg(feature = "std")]
                 panic: core::cell::UnsafeCell::new(None),
             },
             _borrow: PhantomData,
@@ -259,6 +269,11 @@ impl<'a, F, R: Copy> CClosure<'a, F, R> {
 
     /// Whether an invocation failed: the closure panicked, or an invocation
     /// was refused while another ran.
+    ///
+    /// May be asked at any time, also while an invocation runs: from the
+    /// closure itself, or from another callback during the C call, on any
+    /// thread. It then reports the failures so far; an invocation still
+    /// running has not failed yet.
     #[inline]
     #[must_use]
     pub fn failed(&self) -> bool {
@@ -267,10 +282,7 @@ impl<'a, F, R: Copy> CClosure<'a, F, R> {
 
     #[cfg(feature = "std")]
     fn panicked(&self) -> bool {
-        // SAFETY: called with no invocation running (the C call that could
-        // run one has returned, which a scoped callback's contract orders
-        // before this), so nothing writes the slot meanwhile.
-        unsafe { (*self.state.panic.get()).is_some() }
+        self.state.panicked.load(Ordering::Acquire)
     }
 
     #[cfg(not(feature = "std"))]
@@ -294,8 +306,9 @@ impl<F, R: Copy> Drop for CClosure<'_, F, R> {
             if std::thread::panicking() {
                 return;
             }
-            // SAFETY: the C call has returned, so no invocation runs.
-            if let Some(payload) = unsafe { (*self.state.panic.get()).take() } {
+            // `&mut self`: the C call has returned, and with it every
+            // invocation and its store, on whichever thread it ran.
+            if let Some(payload) = self.state.panic.get_mut().take() {
                 std::panic::resume_unwind(payload);
             }
         }
@@ -320,29 +333,35 @@ impl<F, R: Copy> core::fmt::Debug for CClosure<'_, F, R> {
 /// `ctx` is the context of a live `CClosure<'_, F, R>`.
 unsafe fn invoke_scoped<F, R: Copy>(ctx: *mut c_void, call: impl FnOnce(&mut F) -> R) -> R {
     // SAFETY: the caller passes a live `ScopedState<F, R>`, shared between
-    // invocations; its mutable parts are atomics and the panic slot the
-    // `busy` holder alone writes.
+    // invocations and with `CClosure::failed`; its mutable parts are atomics
+    // and the panic slot, which only the `busy` holder writes, through the
+    // cell's pointer.
     let state = unsafe { &*ctx.cast::<ScopedState<F, R>>() };
     if state.busy.swap(true, Ordering::Acquire) {
         state.refused.store(true, Ordering::Release);
         return state.on_failure;
     }
     #[cfg(feature = "std")]
-    let ret = {
-        // SAFETY: `busy` makes this the only invocation, so the slot is ours.
-        let slot = unsafe { &mut *state.panic.get() };
-        if slot.is_some() {
-            state.on_failure
-        } else {
-            // SAFETY: `f` came from the `&'a mut F` the `CClosure` borrows,
-            // and `busy` makes this the only `&mut F` derived from it.
-            let f = unsafe { &mut *state.f.as_ptr() };
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call(f))) {
-                Ok(ret) => ret,
-                Err(payload) => {
-                    *slot = Some(payload);
-                    state.on_failure
-                }
+    let ret = if state.panicked.load(Ordering::Acquire) {
+        state.on_failure
+    } else {
+        // SAFETY: `f` came from the `&'a mut F` the `CClosure` borrows,
+        // and `busy` makes this the only `&mut F` derived from it.
+        let f = unsafe { &mut *state.f.as_ptr() };
+        // No reference to the panic slot is held across the call: the
+        // closure may reach its `CClosure` and ask `failed`, which reads
+        // `panicked` only.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call(f))) {
+            Ok(ret) => ret,
+            Err(payload) => {
+                // SAFETY: `busy` makes this the only invocation, the only
+                // writer, and `panicked` was unset, so no store came before;
+                // nothing reads the slot while an invocation can run, and no
+                // reference to it is live: the write is the slot's only
+                // access.
+                unsafe { *state.panic.get() = Some(payload) };
+                state.panicked.store(true, Ordering::Release);
+                state.on_failure
             }
         }
     };

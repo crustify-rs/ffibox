@@ -7,7 +7,7 @@ use core::cell::Cell;
 use core::ffi::{c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use ffibox::callback::{CClosure, CPayload, barrier};
 
@@ -168,6 +168,82 @@ fn a_send_closure_may_be_called_back_on_another_thread() {
     });
     cb.finish();
     assert_eq!(total, 11);
+}
+
+#[test]
+fn failed_may_be_asked_from_inside_the_invocation_that_then_panics() {
+    // The closure reaches its own `CClosure`, through a thread-local
+    // `&dyn Fn`, asks `failed()`, then panics: the read and the trampoline's
+    // later store of the panic must not overlap. Safe code throughout but the
+    // call standing in for C's.
+    thread_local! {
+        static ASK: Cell<Option<&'static dyn Fn() -> bool>> = const { Cell::new(None) };
+        static SEEN: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+    /// Keeps what the test leaks, and the panic `cb` holds, reachable, so
+    /// Miri's leak check passes it over.
+    static KEEP: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+    let f = Box::leak(Box::new(|| -> c_int {
+        SEEN.set(ASK.with(|a| a.get().map(|ask| ask())));
+        panic!("after asking failed()");
+    }));
+    let cb: &'static CClosure<'static, _, c_int> = Box::leak(Box::new(CClosure::new(f, -1)));
+    let ask: &'static dyn Fn() -> bool = Box::leak(Box::new(move || cb.failed()));
+    ASK.with(|a| a.set(Some(ask)));
+    KEEP.store(
+        core::ptr::from_ref(ask).cast::<()>().cast_mut(),
+        Ordering::Relaxed,
+    );
+    let tramp: unsafe extern "C" fn(*mut c_void) -> c_int = cb.trampoline();
+    // SAFETY: the context of `cb`, which is never dropped, called back during
+    // the call on this thread.
+    let rc = unsafe { tramp(cb.ctx()) };
+    ASK.with(|a| a.set(None));
+    assert_eq!(rc, -1, "the panic became the failure value");
+    assert_eq!(SEEN.get(), Some(false), "nothing had failed yet");
+    assert!(cb.failed());
+}
+
+#[test]
+fn failed_may_be_asked_while_another_thread_invokes() {
+    // A C routine calls `cb` back on a worker and, meanwhile, another
+    // callback on the calling thread that asks `cb.failed()`, while the
+    // worker's invocation panics and stores the panic: the read must not
+    // race the store.
+    type Each = unsafe extern "C" fn(*mut c_void) -> c_int;
+    type Ask = unsafe extern "C" fn(*mut c_void) -> bool;
+    /// The context, sent to the worker as C would pass it: by pointer.
+    struct Ctx(*mut c_void);
+    // SAFETY: the closure is `Send`, and only the worker uses the context.
+    unsafe impl Send for Ctx {}
+    /// Stands in for a C routine that calls `cb` on a worker it joins, and
+    /// `ask` on the calling thread meanwhile.
+    unsafe extern "C" fn both(cb: Each, ctx: *mut c_void, ask: Ask, ask_ctx: *mut c_void) -> bool {
+        let ctx = Ctx(ctx);
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                let ctx = ctx;
+                // SAFETY: the caller's callback and its live context.
+                unsafe { cb(ctx.0) }
+            });
+            // SAFETY: the caller's callback and its live context.
+            unsafe { ask(ask_ctx) }
+        })
+    }
+
+    let mut f = || -> c_int { panic!("on the worker") };
+    let cb = CClosure::new(&mut f, -1);
+    let mut ask = || cb.failed();
+    // SAFETY: `both` calls `ask` back on this thread only.
+    let asker = unsafe { CClosure::new_local(&mut ask, true) };
+    // SAFETY: `both` calls each back during the call only, `cb` from one
+    // thread at a time and `asker` on this thread.
+    let _ = unsafe { both(cb.trampoline(), cb.ctx(), asker.trampoline(), asker.ctx()) };
+    asker.finish();
+    assert!(cb.failed());
+    let resumed = catch_unwind(AssertUnwindSafe(|| cb.finish()));
+    let msg = resumed.unwrap_err();
+    assert_eq!(*msg.downcast_ref::<&str>().unwrap(), "on the worker");
 }
 
 #[test]
