@@ -40,6 +40,7 @@
 //! | [`CClosure`] / [`CPayload`] | a Rust closure C calls, for one call or until C releases it |
 //! | [`CFn`] / [`CFnBox`] | a C function and its context that Rust calls, borrowed or owned |
 //! | [`CCallback`] / [`CCallbackBox`] | either: a callback called from Rust and handed to C alike |
+//! | [`CTable<T, S>`] / [`impl_cvtable!`] | Rust state behind a C table of function pointers C calls into, its slots minted from the trait the state implements |
 //! | [`RustAlloc`] | the policy over Rust's global allocator, for what Rust allocates and C frees |
 //!
 //! Like `Box`, the owners adopt a raw pointer with an `unsafe` `from_raw` and
@@ -109,10 +110,10 @@
 //! `#![no_std]`. The `std` feature (default) selects
 //! [`std::process::abort`](https://doc.rust-lang.org/std/process/fn.abort.html) for the unrecoverable-failure path, where
 //! without it that path is a double-panic, and lets [`CClosure`] and
-//! [`callback::barrier`] catch a panic before it reaches C. The `alloc`
-//! feature, which `std` enables, adds [`RustAlloc`], [`CPayload`] and
-//! [`CCallbackBox`], which allocate through Rust's global allocator; nothing
-//! else allocates.
+//! [`callback::barrier`] catch a panic before it reaches C, as [`CTable`]'s
+//! slots do. The `alloc` feature, which `std` enables, adds [`RustAlloc`],
+//! [`CPayload`], [`CCallbackBox`] and [`CTable`], which allocate through Rust's
+//! global allocator; nothing else allocates.
 //!
 //! [README]: https://github.com/crustify-rs/ffibox#readme
 
@@ -137,6 +138,9 @@ pub mod rust_alloc;
 pub mod shared;
 pub mod status;
 pub mod traits;
+#[cfg(feature = "alloc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+pub mod vtable;
 
 // Compiles every Rust block the docs carry, so no example can drift from the
 // API. The examples live in `docs/examples.md`; the README is included too, so
@@ -160,3 +164,5 @@ pub use crate::traits::{
     CLenClone, CLenDrop, CLockedSeam, CMutSeam, CNew, CPlainElem, CRefClone, CRefSeam, CSliceElem,
     CZeroable, LockFields, LockScope, LockWhole,
 };
+#[cfg(feature = "alloc")]
+pub use crate::vtable::{CTable, CVtable};
