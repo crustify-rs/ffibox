@@ -87,7 +87,9 @@ const PANICKED: c_int = -100;
 const BUSY: c_int = -200;
 
 impl_cvtable! {
-    impl<B: Backend> CVtable<B> for Store {
+    // SAFETY: the stand-in library passes each slot its table, `scan` last.
+    unsafe impl<B: Backend> CVtable<B> for Store {
+        base = base();
         /// `store.get` over `Backend::get`, shared.
         fn get(@table, k: c_int) -> c_int {
             on panic: PANICKED,
@@ -170,7 +172,7 @@ fn base() -> ffi::store {
 #[test]
 fn slots_reach_the_state_and_keep_the_base() {
     let (map, drops) = Map::counted();
-    let table = CTable::<Store, _>::new(base(), map);
+    let table = CTable::<Store, _>::new(map);
     let p = table.into_c().as_ptr();
     // SAFETY: `p` is a live table C holds until its release.
     unsafe {
@@ -235,7 +237,7 @@ fn a_panicking_slot_returns_its_declared_result() {
         calls: Cell::new(0),
         drops: drops.clone(),
     };
-    let mut table = CTable::<Store, _>::new(base(), backend);
+    let mut table = CTable::<Store, _>::new(backend);
     let p = table.as_c_ptr();
     // SAFETY: the owner's live table, lent for these calls.
     unsafe {
@@ -263,19 +265,19 @@ fn a_panicking_slot_returns_its_declared_result() {
 fn release_reclaims_exactly_once_whoever_releases() {
     // C releases a surrendered table.
     let (map, drops) = Map::counted();
-    let p = CTable::<Store, _>::new(base(), map).into_c().as_ptr();
+    let p = CTable::<Store, _>::new(map).into_c().as_ptr();
     // SAFETY: C's table, released once.
     unsafe { lib::free(p) };
     assert_eq!(drops.get(), 1);
 
     // The owner drops a table it kept.
     let (map, drops) = Map::counted();
-    drop(CTable::<Store, _>::new(base(), map));
+    drop(CTable::<Store, _>::new(map));
     assert_eq!(drops.get(), 1);
 
     // C releases a table it was only lent: deferred to the owner's drop.
     let (map, drops) = Map::counted();
-    let mut table = CTable::<Store, _>::new(base(), map);
+    let mut table = CTable::<Store, _>::new(map);
     // SAFETY: the owner's live table, lent; its release is deferred.
     unsafe { lib::free(table.as_c_ptr()) };
     assert_eq!(drops.get(), 0);
@@ -297,7 +299,7 @@ fn release_reclaims_exactly_once_whoever_releases() {
 #[test]
 fn into_inner_and_from_c_hand_the_allocation_over() {
     let (map, drops) = Map::counted();
-    let table = CTable::<Store, _>::new(base(), map);
+    let table = CTable::<Store, _>::new(map);
     // SAFETY: the owner's live table, lent.
     unsafe { lib::set(table.as_c_ptr(), 4, 40) };
     let p = table.into_c();
@@ -312,10 +314,12 @@ fn into_inner_and_from_c_hand_the_allocation_over() {
 
 #[test]
 fn handles_designate_the_table() {
-    let mut table = CTable::<Store, _>::new(base(), Map::default());
+    let mut table = CTable::<Store, _>::new(Map::default());
     let p = table.as_c_ptr();
-    assert_eq!(table.as_ref().as_ptr(), p.cast_const());
-    assert_eq!(table.as_mut().as_mut_ptr(), p);
+    // SAFETY: `StoreRef` and `StoreMut` are neither `Send` nor `Sync`.
+    assert_eq!(unsafe { table.as_ref_local() }.as_ptr(), p.cast_const());
+    // SAFETY: as above.
+    assert_eq!(unsafe { table.as_mut_local() }.as_mut_ptr(), p);
     assert_eq!(table.into_c().as_ptr(), p);
     // SAFETY: C's table, released once.
     unsafe { lib::free(p) };
@@ -384,7 +388,7 @@ fn reentrant(from_get: c_int, from_set: c_int) -> (CTable<Store, Reentrant>, Rc<
         drops: Rc::new(Cell::new(0)),
     };
     let drops = backend.drops.clone();
-    (CTable::new(base(), backend), drops)
+    (CTable::new(backend), drops)
 }
 
 /// Records each nesting level's result: a shared slot re-entered from a
@@ -432,7 +436,7 @@ fn reentry_follows_each_slots_receiver() {
         inner: RefCell::new(Vec::new()),
         from_set: Cell::new(0),
     };
-    let mut table = CTable::<Store, _>::new(base(), nest);
+    let mut table = CTable::<Store, _>::new(nest);
     let p = table.as_c_ptr();
     // SAFETY: the owner's live table, lent for the call.
     assert_eq!(unsafe { lib::get(p, 0) }, 1);
@@ -499,7 +503,7 @@ fn a_slot_after_a_release_inside_a_slot_is_refused() {
     let backend = Releasing {
         after: after.clone(),
     };
-    let p = CTable::<Store, _>::new(base(), backend).into_c().as_ptr();
+    let p = CTable::<Store, _>::new(backend).into_c().as_ptr();
     // SAFETY: C's live table.
     assert_eq!(unsafe { lib::set(p, 0, 0) }, 0);
     assert_eq!(after.get(), BUSY);
@@ -507,7 +511,7 @@ fn a_slot_after_a_release_inside_a_slot_is_refused() {
 
 #[test]
 fn the_owners_shared_state_refuses_exclusive_slots_until_borrowed_mutably() {
-    let mut table = CTable::<Store, _>::new(base(), Map::default());
+    let mut table = CTable::<Store, _>::new(Map::default());
     let p = table.as_c_ptr();
     assert_eq!(table.state().unwrap().count(), 0);
     // SAFETY: the owner's live table, lent for each call.
@@ -515,7 +519,8 @@ fn the_owners_shared_state_refuses_exclusive_slots_until_borrowed_mutably() {
         assert_eq!(lib::set(p, 1, 1), BUSY, "the owner may still hold `&S`");
         assert_eq!(lib::get(p, 1), -1, "shared slots still run");
     }
-    let _ = table.as_mut();
+    // SAFETY: `StoreMut` is neither `Send` nor `Sync`.
+    let _ = unsafe { table.as_mut_local() };
     // SAFETY: as above.
     assert_eq!(unsafe { lib::set(p, 1, 1) }, 0);
     let _ = table.state();
@@ -568,7 +573,7 @@ fn the_owners_shared_state_is_refused_inside_an_exclusive_slot() {
     let peek = Peek {
         seen: Cell::new(None),
     };
-    let mut table = CTable::<Store, _>::new(base(), peek);
+    let mut table = CTable::<Store, _>::new(peek);
     let p = table.as_c_ptr();
     // The owner, lent through `&table` for the call; set again after each
     // `&mut table`, which ends the shared borrow.
@@ -616,7 +621,7 @@ unsafe impl Sync for Store {}
 
 #[test]
 fn slots_run_from_several_threads() {
-    let mut table = CTable::<Store, _>::new(base(), Atomic::default());
+    let mut table = CTable::<Store, _>::new(Atomic::default());
     // SAFETY: the owner's live table, lent.
     assert_eq!(unsafe { lib::set(table.as_c_ptr(), 0, 5) }, 0);
     let threads = if cfg!(miri) { 2 } else { 8 };
@@ -655,7 +660,7 @@ mod by_hand {
     use core::ffi::c_int;
 
     use ffibox::define_ctype;
-    use ffibox::vtable::{CTable, CVtable};
+    use ffibox::vtable::{CTable, CVtable, Install};
 
     #[repr(C)]
     #[derive(Default)]
@@ -682,9 +687,14 @@ mod by_hand {
     }
 
     // SAFETY: `bump` reaches the state only through `CTable::enter` on the
-    // table C passes it, and `free` is `CTable::release`.
+    // table C passes it, and `free` is `CTable::release`; `base` has every
+    // slot NULL.
     unsafe impl CVtable<c_int> for Counter {
-        fn install(table: &mut counter) {
+        fn base() -> counter {
+            counter::default()
+        }
+
+        fn install(table: &mut counter, _: Install) {
             table.bump = Some(bump);
             table.free = Some(CTable::<Counter, c_int>::release);
         }
@@ -693,9 +703,7 @@ mod by_hand {
 
 #[test]
 fn a_table_written_by_hand() {
-    let p = CTable::<by_hand::Counter, c_int>::new(by_hand::counter::default(), 0)
-        .into_c()
-        .as_ptr();
+    let p = CTable::<by_hand::Counter, c_int>::new(0).into_c().as_ptr();
     // SAFETY: C's live table, released once.
     unsafe {
         assert_eq!(((*p).bump.unwrap())(p), 1);
@@ -714,8 +722,297 @@ fn the_owner_follows_the_states_threads() {
 
 #[test]
 fn a_surrendered_table_is_adopted_by_its_owner_type() {
-    let p: NonNull<ffi::store> = CTable::<Store, _>::new(base(), Map::default()).into_c();
+    let p: NonNull<ffi::store> = CTable::<Store, _>::new(Map::default()).into_c();
     // SAFETY: from `into_c`, unreleased and unused by C.
     let table = unsafe { CTable::<Store, Map>::from_c(p) };
     drop(table);
+}
+
+// ---------------------------------------------------------------------------
+// From the soundness review: each unsound path is a compile_fail doctest in
+// `src/vtable.rs`; these drive the configurations that stay allowed.
+// ---------------------------------------------------------------------------
+
+/// A table whose handles the binding made `Send` and `Sync`, whose `cmp`
+/// slot takes a second table of its type, and whose `count` slot no trampoline
+/// fills.
+mod review {
+    use core::ffi::c_int;
+
+    use ffibox::{CRefSeam, define_ctype, impl_cvtable};
+
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct ops {
+        pub get: Option<unsafe extern "C" fn(*mut ops) -> c_int>,
+        /// `cmp(self, other)`: the table first, another table second.
+        pub cmp: Option<unsafe extern "C" fn(*mut ops, *mut ops) -> c_int>,
+        /// Not implemented in Rust: left as `base` has it.
+        pub count: Option<unsafe extern "C" fn(*mut ops) -> c_int>,
+        pub free: Option<unsafe extern "C" fn(*mut ops)>,
+    }
+
+    define_ctype!(Ops, OpsRef, OpsMut, ops);
+
+    // SAFETY: the C library's `ops` are plain data and function pointers,
+    // read-only once built, and its slots are thread-safe.
+    unsafe impl Send for Ops {}
+    // SAFETY: as above.
+    unsafe impl Sync for Ops {}
+    // SAFETY: as above.
+    unsafe impl Send for OpsRef<'_> {}
+    // SAFETY: as above.
+    unsafe impl Sync for OpsRef<'_> {}
+
+    impl OpsRef<'_> {
+        /// The binding's safe method over the `get` slot.
+        pub fn get(self) -> c_int {
+            let p = self.as_ptr().cast_mut();
+            // SAFETY: the handle's live table, its slots its own.
+            let get = unsafe { (*p).get }.unwrap();
+            // SAFETY: as above.
+            unsafe { get(p) }
+        }
+
+        /// Whether the table's `count` slot is set.
+        pub fn has_count(self) -> bool {
+            let p = self.as_ptr().cast_mut();
+            // SAFETY: as above.
+            unsafe { (*p).count }.is_some()
+        }
+    }
+
+    pub trait Get {
+        fn get(&self) -> c_int;
+    }
+
+    impl_cvtable! {
+        // SAFETY: the stand-in library passes each slot its table first;
+        // `cmp`'s second argument is another table.
+        unsafe impl<G: Get> CVtable<G> for Ops {
+            fn get(@this) -> c_int {
+                on panic: -1,
+                on busy: -2,
+                |g: &G| g.get(),
+            }
+            fn cmp(@this, other: *mut ops) -> c_int {
+                on panic: -1,
+                on busy: -2,
+                |g: &G| c_int::from(core::ptr::eq(this, other)) * 100 + g.get(),
+            }
+            release free;
+        }
+    }
+}
+
+/// The state's `Drop` counts, on whichever thread it runs, and `get` waits
+/// for a release when asked.
+struct Shared {
+    value: c_int,
+    drops: std::sync::Arc<AtomicUsize>,
+    wait: std::sync::Arc<(std::sync::atomic::AtomicBool, std::sync::atomic::AtomicBool)>,
+}
+
+impl review::Get for Shared {
+    fn get(&self) -> c_int {
+        let (inside, freed) = &*self.wait;
+        inside.store(true, Ordering::SeqCst);
+        while !freed.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        self.value
+    }
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn shared(value: c_int, waits: bool) -> (Shared, std::sync::Arc<AtomicUsize>) {
+    let drops = std::sync::Arc::new(AtomicUsize::new(0));
+    let wait = std::sync::Arc::new((
+        std::sync::atomic::AtomicBool::new(false),
+        std::sync::atomic::AtomicBool::new(!waits),
+    ));
+    let state = Shared {
+        value,
+        drops: drops.clone(),
+        wait,
+    };
+    (state, drops)
+}
+
+/// F1: a `Send + Sync` state is reached through a `Send` handle on two
+/// threads; a `!Sync` one is not (`as_ref`'s compile_fail doctest).
+#[test]
+#[forbid(unsafe_code)]
+fn a_send_handle_reaches_a_send_sync_state_from_two_threads() {
+    let (state, drops) = shared(7, false);
+    let table = CTable::<review::Ops, _>::new(state);
+    let r = table.as_ref();
+    std::thread::scope(|s| {
+        let h = s.spawn(move || r.get());
+        assert_eq!(r.get(), 7);
+        assert_eq!(h.join().unwrap(), 7);
+    });
+    drop(table);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[derive(Clone, Copy)]
+struct CPtr(*mut review::ops);
+// SAFETY: the stand-in for C, handing its table to its worker.
+unsafe impl Send for CPtr {}
+
+/// F2: a deferred release drops the state on the thread of the last slot
+/// out, which `into_c`'s thread rule allows only for a `Send + Sync` state.
+#[test]
+fn a_deferred_release_drops_a_send_sync_state_on_the_last_slots_thread() {
+    let (state, drops) = shared(3, true);
+    let wait = state.wait.clone();
+    let p = CPtr(CTable::<review::Ops, _>::new(state).into_c().as_ptr());
+    let worker = std::thread::spawn(move || {
+        let p = p;
+        // SAFETY: a live table C holds; `Shared: Send + Sync`.
+        let get = unsafe { (*p.0).get }.unwrap();
+        // SAFETY: as above.
+        unsafe { get(p.0) }
+    });
+    while !wait.0.load(Ordering::SeqCst) {
+        std::thread::yield_now();
+    }
+    // SAFETY: C releases its table once, while the worker's slot runs.
+    unsafe { ((*p.0).free.unwrap())(p.0) };
+    assert_eq!(drops.load(Ordering::SeqCst), 0, "deferred to the slot");
+    wait.1.store(true, Ordering::SeqCst);
+    assert_eq!(worker.join().unwrap(), 3);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+/// F4: a slot passed another table of its type recovers the one marked `@`.
+#[test]
+fn a_slot_with_two_tables_of_its_type_takes_the_marked_one() {
+    let (state, _) = shared(5, false);
+    let table = CTable::<review::Ops, _>::new(state);
+    let p = table.as_c_ptr();
+    let mut theirs = review::ops::default();
+    // SAFETY: the owner's live table first, as `cmp`'s declaration states,
+    // and a C table of the library's second.
+    let rc = unsafe { ((*p).cmp.unwrap())(p, &raw mut theirs) };
+    assert_eq!(rc, 5, "the state reached is the marked table's");
+    // SAFETY: as above, the same table twice.
+    let rc = unsafe { ((*p).cmp.unwrap())(p, p) };
+    assert_eq!(rc, 105);
+}
+
+/// F5: a slot no trampoline fills is `base`'s, NULL by default, and safe code
+/// cannot choose it (`with_base`'s compile_fail doctest).
+#[test]
+#[forbid(unsafe_code)]
+fn a_slot_no_trampoline_fills_is_bases() {
+    let (state, _) = shared(1, false);
+    let table = CTable::<review::Ops, _>::new(state);
+    assert!(!table.as_ref().has_count());
+    assert_eq!(table.as_ref().get(), 1);
+}
+
+/// A state whose drop panics, under the owner: the panic reaches the owner's
+/// caller, and nothing leaks or drops twice (Miri checks both).
+#[test]
+#[cfg(feature = "std")]
+fn a_panicking_state_drop_under_the_owner() {
+    struct Bomb(#[allow(dead_code)] Vec<u8>);
+    impl Drop for Bomb {
+        fn drop(&mut self) {
+            panic!("drop panics");
+        }
+    }
+    impl Backend for Bomb {
+        fn get(&self, _: c_int) -> c_int {
+            0
+        }
+        fn set(&mut self, _: c_int, _: c_int) {}
+        fn count(&self) -> c_int {
+            0
+        }
+    }
+    let table = CTable::<Store, _>::new(Bomb(vec![1; 8]));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(table)));
+    assert!(r.is_err());
+}
+
+/// C releases a table it was only lent, then the owner surrenders it: C's
+/// next release drops it, once (it leaked before).
+#[test]
+fn a_lent_release_is_forgotten_when_the_table_is_surrendered() {
+    let (map, drops) = Map::counted();
+    let table = CTable::<Store, _>::new(map);
+    // SAFETY: the owner's live table, lent; its release is deferred.
+    unsafe { lib::free(table.as_c_ptr()) };
+    let p = table.into_c().as_ptr();
+    assert_eq!(drops.get(), 0);
+    // SAFETY: C's table now, live: slots run again.
+    assert_eq!(unsafe { lib::get(p, 1) }, -1);
+    // SAFETY: C's table, released once.
+    unsafe { lib::free(p) };
+    assert_eq!(drops.get(), 1);
+}
+
+/// A release while slots leave on other threads: the last one out frees.
+#[test]
+fn a_release_while_slots_leave_on_other_threads() {
+    struct Busy(Vec<u8>, std::sync::Arc<AtomicUsize>);
+    impl Backend for Busy {
+        fn get(&self, _: c_int) -> c_int {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            std::thread::yield_now();
+            c_int::try_from(self.0.len()).unwrap()
+        }
+        fn set(&mut self, _: c_int, _: c_int) {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            std::thread::yield_now();
+            self.0.push(1);
+        }
+        fn count(&self) -> c_int {
+            0
+        }
+    }
+    #[derive(Clone, Copy)]
+    struct StorePtr(*mut ffi::store);
+    // SAFETY: the stand-in for C; `Busy: Send + Sync`.
+    unsafe impl Send for StorePtr {}
+
+    for exclusive in [false, true] {
+        for _ in 0..if cfg!(miri) { 4 } else { 200 } {
+            let inside = std::sync::Arc::new(AtomicUsize::new(0));
+            let state = Busy(vec![1, 2], inside.clone());
+            let p = StorePtr(CTable::<Store, _>::new(state).into_c().as_ptr());
+            let n = if exclusive { 1 } else { 2 };
+            let threads: Vec<_> = (0..n)
+                .map(|_| {
+                    std::thread::spawn(move || {
+                        let p = p;
+                        // SAFETY: C's live table; its release waits for us.
+                        unsafe {
+                            if exclusive {
+                                lib::set(p.0, 0, 0)
+                            } else {
+                                lib::get(p.0, 0)
+                            }
+                        }
+                    })
+                })
+                .collect();
+            while inside.load(Ordering::SeqCst) < n {
+                std::thread::yield_now();
+            }
+            // SAFETY: released once, while the slots run.
+            unsafe { lib::free(p.0) };
+            for t in threads {
+                t.join().unwrap();
+            }
+        }
+    }
 }

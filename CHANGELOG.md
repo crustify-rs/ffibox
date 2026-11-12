@@ -18,7 +18,8 @@ Changes on `devel` since 0.1.1.
   exclusive, a refusal for re-entry that would alias), behind the panic
   barrier with its declared result, and released once through its `release`
   slot, whoever releases it and whenever. `impl_cvtable!` mints the slots and
-  the `CVtable<S>` impl that installs them. Tables were hand-written before:
+  the `CVtable<S>` impl that installs them, from an `unsafe impl` whose
+  `SAFETY` comment states where C passes each slot its table. Tables were hand-written before:
   nothing existing changes, and a hand-written one keeps working. Moving one
   to `CTable` replaces its `#[repr(C)]` struct, trampolines, `free` and
   re-entry state with one `impl_cvtable!` over the trait it already has; see
