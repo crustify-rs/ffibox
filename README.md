@@ -66,9 +66,9 @@ ffibox is `#![no_std]`. The `std` feature (on by default) selects
 `std::process::abort` for the unrecoverable-failure path (`Clone` or
 `make_mut` when the C copy or up_ref fails), where without it that path is a
 double-panic, and lets `CClosure` and `callback::barrier` catch a panic before
-it reaches C. The `alloc` feature, which `std` enables, adds `RustAlloc` and
-`CPayload`, which allocate through Rust's global allocator; nothing else
-allocates.
+it reaches C. The `alloc` feature, which `std` enables, adds `RustAlloc`,
+`CPayload` and `CCallbackBox`, which allocate through Rust's global
+allocator; nothing else allocates.
 
 ```toml
 [dependencies]
@@ -91,11 +91,11 @@ When it is Rust's memory that C holds, calls or reads →
 |-----|---------------|
 | [goals.md](docs/goals.md) | what the primitives aim for, in both directions, and how each aim is checked |
 | [examples.md](docs/examples.md) | seven self-contained wrappers, each compiled as a doctest |
-| [ownership.md](docs/ownership.md) | `CBox`, `CVal`, `CStrBox`, `CVec`, `CArc`; the lifecycle policies; picking an owner and a policy |
-| [borrows.md](docs/borrows.md) | `Foo`, `FooRef`, `FooMut`, `FooLocked`, `CGuard`, `CGuardedRef`, `CSlice`; where the accessors live; the seam traits |
+| [ownership.md](docs/ownership.md) | `CBox`, `CBoxState`, `CVal`, `CStrBox`, `CVec`, `CArc`; the lifecycle policies; picking an owner and a policy |
+| [borrows.md](docs/borrows.md) | `Foo`, `FooRef`, `FooMut`, `FooLocked`, `CGuard`, `CGuardedRef`, `CSlice`, `CSliceMut`, `CNullTerminated`; where the accessors live; the seam traits |
 | [outbound.md](docs/outbound.md) | Rust's side: `RustAlloc`, the callbacks (`CClosure`, `CPayload`, `CFn`, `CFnBox`, `CCallback`, `CCallbackBox`), out-parameters, the panic barrier, the `export_*!` macros |
 | [patterns.md](docs/patterns.md) | C's iteration, error and callback conventions as Rust's iterators, `Result` and closures |
-| [hand-written.md](docs/hand-written.md) | the wrappers `define_ctype!` cannot express |
+| [hand-written.md](docs/hand-written.md) | the wrappers `define_ctype!` cannot express, and the owners no policy expresses |
 
 ## Maintainers
 

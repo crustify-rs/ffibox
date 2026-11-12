@@ -31,9 +31,10 @@ contract — see [Under the hood](hand-written.md).
   `as_ref()`, so they are written once. Both project a raw pointer out of the
   handle and read or write through `addr_of!` / `addr_of_mut!`.
 - **Every holder reaches the handles the same way:** `as_ref()` / `as_mut()` on
-  `Foo`, `CBox`, `CVal` and `FooMut` itself (where `as_mut()` is the reborrow
-  `&mut` gets implicitly: `helper(m.as_mut())` keeps `m`); `as_ref()` alone on
-  `CArc`; `as_ref()` / `as_locked()` on a `CGuard` and on `FooLocked` (where
+  `Foo`, `CBox`, `CBoxState`, `CVal` and `FooMut` itself (where `as_mut()` is
+  the reborrow `&mut` gets implicitly: `helper(m.as_mut())` keeps `m`);
+  `as_ref()` on `CArc`, whose exclusive handle comes only from `get_mut()` /
+  `make_mut()`; `as_ref()` / `as_locked()` on a `CGuard` and on `FooLocked` (where
   `as_locked()` reborrows). `CSliceMut` reborrows the same
   way, and splits and sub-ranges like `&mut [T]`. Never `Deref`:
   `Deref::Target` cannot name a lifetime taken from `&self`, and since `FooRef`

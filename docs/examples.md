@@ -254,7 +254,8 @@ g.as_locked().set_count(n + 1);          // registry_unlock when `g` drops
 ## An opaque payload — no erased owner
 
 A `void *` crossing FFI is never a [`CBox`] or [`CArc`]: both own only
-`define_ctype!` layout types. What the payload really is decides the owner:
+`CCell` layout types, such as `define_ctype!` defines. What the payload
+really is decides the owner:
 
 - **bytes** (an arena block, an I/O buffer) → `CVec<u8, P>` (or
   `CVec<MaybeUninit<u8>, P>` before it is filled), released through `CLenDrop`;

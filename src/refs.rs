@@ -1,9 +1,9 @@
 //! The handle and owner types: borrowed handle storage ([`CBorrowedPtr`]),
 //! the sole owners ([`CBox`], [`CStrBox`], [`CVec`], [`CVal`]),
 //! and the run views ([`CSlice`] / [`CSliceMut`]). The shared owners are in
-//! [`shared`](crate::shared). The
-//! [README](https://github.com/crustify-rs/ffibox#1-the-types-you-get) says
-//! which to pick.
+//! [`shared`](crate::shared).
+//! [docs/ownership.md](https://github.com/crustify-rs/ffibox/blob/main/docs/ownership.md)
+//! says which to pick.
 //!
 //! ## Nothing ever references a wrapped C object
 //!
@@ -2241,20 +2241,23 @@ unsafe impl<T: CCell, D: CDispose<T>> CSliceElem for CVal<T, D> {}
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
-// CSlice<'a, T> — a borrowed run of wrapped C objects
+// CSlice<'a, T> — a borrowed run of elements
 // ---------------------------------------------------------------------------
 
-/// A borrowed run of `len` contiguous wrapped C objects, yielded as handles.
+/// A borrowed run of `len` contiguous elements: wrapped C objects, yielded as
+/// handles, or plain values, read out as copies.
 ///
 /// The slice analogue of a `Ref` handle, and for the same reason: `&[T]` over
-/// wrapped C objects would be a reference covering them, asserting `noalias` /
-/// `readonly` / validity over memory C may write. A `CSlice` is a pointer and a
-/// count, so it asserts nothing; [`get`](CSlice::get) and [`iter`](CSlice::iter)
-/// hand out per-element handles.
+/// memory C may write would be a reference covering it, asserting `noalias` /
+/// `readonly` / validity. A `CSlice` is a pointer and a count, so it asserts
+/// nothing; [`get`](CSlice::get) and [`iter`](CSlice::iter) hand out
+/// per-element handles, and [`elem`](CSlice::elem) and
+/// [`elems`](CSlice::elems) copies of [`CPlainElem`] values.
 ///
-/// Reached with [`CVec::as_handles`](crate::CVec::as_handles). A buffer of plain
-/// Rust values takes [`CVec::as_slice`](crate::CVec::as_slice) instead, which is
-/// a real `&[T]`.
+/// Reached with [`CVec::as_handles`](crate::CVec::as_handles), or built over a
+/// run C owns with [`from_raw_parts`](CSlice::from_raw_parts). A `CVec` of
+/// plain values or owners takes [`CVec::as_slice`](crate::CVec::as_slice)
+/// instead, which is a real `&[T]`, sound because the `CVec` owns its buffer.
 pub struct CSlice<'a, T> {
     ptr: NonNull<T>,
     len: usize,
@@ -2406,16 +2409,6 @@ impl<'a, T: CCell> CSlice<'a, T> {
     }
 }
 
-/// A run of plain values is read out element-wise, still without a `&[T]`.
-///
-/// [`CPlainElem`] is what licenses [`CVec::as_slice`](crate::CVec::as_slice) to hand
-/// out a real `&[T]`, and it is not enough here — it answers *is every bit
-/// pattern a valid `T`*, while a `&[T]` also asserts `noalias` and `readonly`
-/// over the whole run for the whole borrow. `CVec` earns those by owning its
-/// buffer exclusively. A run inside a C object does not: the library keeps the
-/// pointer and may write through it, and no Rust lifetime constrains that. So
-/// the element type is not what decides between `&[T]` and a `CSlice` — the
-/// owner is.
 /// A run of `Copy` elements — plain values or wrapped C objects whose bytes
 /// own nothing — copies into an owner of its own, as a `CVec` of them clones.
 impl<'a, T: Copy> CSlice<'a, T> {
@@ -2442,6 +2435,16 @@ impl<'a, T: Copy> CSlice<'a, T> {
     }
 }
 
+/// A run of plain values is read out element-wise, still without a `&[T]`.
+///
+/// [`CPlainElem`] is what licenses [`CVec::as_slice`](crate::CVec::as_slice) to hand
+/// out a real `&[T]`, and it is not enough here — it answers *is every bit
+/// pattern a valid `T`*, while a `&[T]` also asserts `noalias` and `readonly`
+/// over the whole run for the whole borrow. `CVec` earns those by owning its
+/// buffer exclusively. A run inside a C object does not: the library keeps the
+/// pointer and may write through it, and no Rust lifetime constrains that. So
+/// the element type is not what decides between `&[T]` and a `CSlice` — the
+/// owner is.
 impl<'a, T: CPlainElem> CSlice<'a, T> {
     /// Copy element `i` out; `None` if out of range.
     #[inline]

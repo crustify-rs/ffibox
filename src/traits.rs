@@ -13,7 +13,8 @@
 //! | [`CDupClone<T>`] | `c_dup` — a deep copy (`*_dup`, `strdup`) | their `Clone` |
 //! | [`CRefClone<T>`] | `c_up_ref` — a refcount increment; `c_is_sole_owner` | [`CArc`] |
 //! | [`CLenDrop`] | `c_drop_len(ptr, byte_len)` | [`CVec`] |
-//! | [`CLenClone`] | `c_clone_len` — a buffer memdup | its `Clone` |
+//! | [`CLenClone`] | `c_clone_len` — a buffer memdup | its `Clone`, `CVec::from_slice` |
+//! | [`CLenAlloc`] | `c_alloc_len` — uninitialised buffer storage (`malloc(n)`) | `CVec::from_fn`, `CVec::new_uninit` |
 //! | [`CDispose<T>`] | `c_dispose` — `*_uninit` / `*_clear` on a value | [`CVal`] |
 //! | [`CNew<T>`] | `c_new` — a zero-argument `*_alloc` / `*_new` | `CBox::new`, `CArc::new` |
 //! | [`CAlloc<T>`] | `c_alloc` — untyped storage (`malloc`) | `CBox::new_uninit` |

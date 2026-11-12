@@ -38,7 +38,12 @@ use crate::traits::{
 ///
 /// Allocation failure is a `None`, never an abort. Objects are allocated
 /// with their own layout; buffers and strings with an alignment of
-/// [`BUF_ALIGN`](Self::BUF_ALIGN) and 1, which the frees repeat.
+/// [`BUF_ALIGN`](Self::BUF_ALIGN) and 1, which the frees repeat. The frees
+/// know a buffer's size from its `byte_len` and a string's from its
+/// `strlen`, so what is adopted back with `from_raw_parts` or
+/// [`CStrBox::from_raw`](crate::CStrBox::from_raw) keeps the length it was
+/// allocated with: a string C shortened with an earlier NUL is freed with
+/// the wrong layout.
 ///
 /// ```
 /// use ffibox::{CBox, CVec, CZeroable, RustAlloc, define_ctype};

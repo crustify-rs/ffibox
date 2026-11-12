@@ -17,7 +17,7 @@ For the borrowed side — handles over objects C or a parent releases — see
 | | `CVal<Foo, P>` | ffibox | an owned value held inline, its resources disposed by `P` on drop |
 | | `CStrBox<P>` | ffibox | an owned NUL-terminated `char *`; read-only `CStr` / `str` / byte views |
 | | `CVec<T, P>` | ffibox | an owned `(ptr, len)` array, NULL when empty; drops its elements, then frees the buffer; `&[T]` for plain elements and owners, `CSlice` for wrapped C objects; `from_fn` / `new_uninit` build one in `P`'s allocator, `from_slice` copies a Rust slice into it |
-| shared owner | `CArc<Foo, P>` | ffibox | one counted reference to a refcounted object; `Clone` through the up_ref; the shared handle always, `get_mut` / `make_mut` when the count proves it sole or after a copy, and `lock()` → `CGuard` when `Foo` is `CGuarded` |
+| shared owner | `CArc<Foo, P>` | ffibox | one counted reference to a refcounted object; `Clone` through the up_ref; the shared handle always, `get_mut` / `make_mut` when the count proves it sole or after a copy, and `lock()` → `CGuard` when `Foo` is `CGuarded` over part of it |
 
 ## Conventions
 
@@ -26,8 +26,8 @@ For the borrowed side — handles over objects C or a parent releases — see
   pointer addresses; `into_raw*` / `into_c` and `as_ptr` / `as_c_ptr` are safe,
   since a raw pointer asserts nothing until someone dereferences it. The
   owners' `from_raw` / `into_raw` / `as_ptr` speak the Rust-side pointee;
-  `CBox`'s `from_c` / `into_c` / `as_c_ptr` speak the C type, so C interop is
-  cast-free. The handles have seams of their own — see
+  `from_c` / `into_c` / `as_c_ptr` on `CBox`, `CBoxState` and `CArc` speak
+  the C type, so C interop is cast-free. The handles have seams of their own — see
   [borrows.md](borrows.md#conventions).
 - **The owners behave like their std counterparts where ownership allows.**
   `CStrBox` derefs to `CStr` and compares and hashes by content, as `CString`
@@ -113,8 +113,9 @@ not, the answer is a borrow instead — see
     inline at all: behind a pointer, as below.
 - **One object behind a pointer** → `CBox<Foo, P>` if this is the only
   reference, `CArc<Foo, P>` if it is one of several counted ones. `CBox` owns
-  only `define_ctype!` layout types, as does `CArc`: a `void *` payload is
-  bytes (`CVec<u8, P>`) or a typed owner of its own.
+  only `CCell` layout types, from `define_ctype!` or written by hand, as does
+  `CArc`: a `void *` payload is bytes (`CVec<u8, P>`) or a typed owner of
+  its own.
 
 ## Policies — what teardown means
 

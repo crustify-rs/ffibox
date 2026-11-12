@@ -33,6 +33,8 @@
 //! | [`CVec<T, S>`] | an owned `(ptr, len)` buffer |
 //! | [`CVal<T, D>`] | a C struct held by value, disposed on drop |
 //! | [`CSlice<'a, T>`] / [`CSliceMut<'a, T>`] | a borrowed run of elements |
+//! | [`iter::CNullTerminated<'a, T>`] | a borrowed NULL-terminated array of pointers, as an `Iterator` |
+//! | [`status`] | a C routine's error convention as a `Result` |
 //! | `impl_*!` | bind a C routine to a policy |
 //! | `export_*!` | offer a policy to C as the routine it calls |
 //! | [`CClosure`] / [`CPayload`] | a Rust closure C calls, for one call or until C releases it |
@@ -136,7 +138,6 @@ pub mod shared;
 pub mod status;
 pub mod traits;
 
-// Re-export the primary items at the crate root for convenience.
 // Compiles every Rust block the docs carry, so no example can drift from the
 // API. The examples live in `docs/examples.md`; the README is included too, so
 // a snippet added there is compiled rather than silently untested. They are
@@ -146,6 +147,7 @@ pub mod traits;
 #[doc = include_str!("../docs/examples.md")]
 pub struct DocExamples;
 
+// Re-export the primary items at the crate root for convenience.
 pub use crate::callback::{CCallback, CClosure, CFn, CFnBox};
 #[cfg(feature = "alloc")]
 pub use crate::callback::{CCallbackBox, CPayload};

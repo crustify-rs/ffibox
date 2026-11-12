@@ -52,7 +52,7 @@
 ///
 /// The names are spelled out because `macro_rules!` cannot concatenate
 /// identifiers; the order is layout, shared, exclusive. What each type is for
-/// is in the [README](https://github.com/crustify-rs/ffibox#1-the-types-you-get).
+/// is in [docs/borrows.md](https://github.com/crustify-rs/ffibox/blob/main/docs/borrows.md).
 ///
 /// Getters go on `$rf<'a>` taking `&self`, setters on `$mt<'a>` taking
 /// `&mut self`, both through the raw seam: [`CRefSeam`](crate::CRefSeam) on
@@ -174,8 +174,8 @@
 /// # Safety
 ///
 /// The macro is safe to invoke but emits an `unsafe impl`. You assert that
-/// `$c_type` is the C type `$name` mirrors, and that all-zero is a valid
-/// `$c_type` (`zeroed` relies on it).
+/// `$c_type` is the C type `$name` mirrors. All-zero validity is a separate
+/// claim, made by an `unsafe impl` of [`CZeroable`](crate::CZeroable).
 #[macro_export]
 macro_rules! define_ctype {
     ($(#[$attr:meta])* $name:ident, $rf:ident, $mt:ident, $c_type:ty) => {
@@ -570,7 +570,8 @@ pub unsafe fn __handle_ref<'a, T: crate::CCell + 'a>(p: ::core::ptr::NonNull<T>)
 /// ```
 ///
 /// `FooLocked` is move-only and reaches the getters with `as_ref()`;
-/// `as_locked()` reborrows it, and a crate-private `as_mut_ptr()` gives the
+/// `as_locked()` reborrows it, and `as_mut_ptr()`, from the
+/// [`CLockedSeam`](crate::CLockedSeam) the macro implements on it, gives the
 /// pointer for C calls that require the lock held.
 ///
 /// With `all` in place of the handle name, the lock covers the whole object:
@@ -868,7 +869,8 @@ macro_rules! export_cdrop {
 /// copy's owner, both passed as a `foo *`, so it is safe to call, as
 /// [`export_cdrop!`](crate::export_cdrop) is. The handle must be
 /// [`CRefSeam`](crate::CRefSeam), as every
-/// [`define_ctype!`](crate::define_ctype) handle is.
+/// [`define_ctype!`](crate::define_ctype) handle is, and the policy
+/// `Default`, which builds the one the copy is released by.
 #[macro_export]
 macro_rules! export_cdupclone {
     ($(#[$attr:meta])* $vis:vis $name:ident, $t:ty, $policy:ty $(,)?) => {
@@ -899,6 +901,9 @@ macro_rules! export_cdupclone {
 /// // extern "C" fn foo_new() -> Option<CBox<Foo, RustAlloc>>,
 /// // which C declares as `foo *foo_new(void)`.
 /// ```
+///
+/// The routine is [`CBox::new`](crate::CBox::new), so the policy is also
+/// `Default`.
 #[macro_export]
 macro_rules! export_cnew {
     ($(#[$attr:meta])* $vis:vis $name:ident, $t:ty, $policy:ty $(,)?) => {
