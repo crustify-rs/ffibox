@@ -17,7 +17,7 @@ For the owning side — values whose drop releases the object — see
 | per C lock | `FooLocked<'a>` | `impl_cguarded!` | exclusive borrow under the C lock, move-only; getters and setters for the state the lock protects, the unlocked getters through `as_ref()` |
 | lock | `CGuard<'a, Foo>` | ffibox | a held C lock, unlocking on drop — `MutexGuard`; `as_locked()` → `FooLocked<'_>`, `as_ref()` → `FooRef<'_>` |
 | guarded borrow | `CGuardedRef<'a, Foo>` | ffibox | an object under one lock covering all of it (`CGuardedAll`), never released — typically a C global (`'static`); only `lock()`, whose `as_locked()` is `FooMut` — `&Mutex<_>` |
-| views | `CSlice<'a, T>` / `CSliceMut<'a, T>` | ffibox | any borrowed run of elements — a buffer's, a struct field's, a getter's — as handles or copies, never a `&[T]` |
+| views | `CSlice<'a, T>` / `CSliceMut<'a, T>` | ffibox | any borrowed run of elements — a buffer's, a struct field's, a getter's — as handles or copies, never a `&[T]`; only a run of plain values nothing writes while it is lent is a `&[T]` instead, as [Choosing a borrow](#choosing-a-borrow) describes |
 | | `CNullTerminated<'a, T>` | ffibox | a NULL-terminated array of pointers (`char **`, `foo **`), iterated as `&CStr`s or `FooRef`s |
 
 A wrapper that needs generic parameters (a lifetime-carrying layout type, or
@@ -42,7 +42,10 @@ contract — see [Under the hood](hand-written.md).
   a shared handle out while keeping the exclusive one.
 - **No reference covers C memory.** `&FooRef` covers one pointer of Rust stack,
   never the object. The one place a reference covers a C struct's bytes is
-  `Foo::as_ref` / `as_mut` on a value Rust holds inline.
+  `Foo::as_ref` / `as_mut` on a value Rust holds inline. A run of bytes an
+  object lends, a NUL string or a counted run, is lent as `&CStr` or `&[u8]`
+  only while nothing writes it, as [Choosing a borrow](#choosing-a-borrow)
+  describes; otherwise it is a `CSlice`.
 - **The handles' seams are traits the macros implement:** `CRefSeam` on
   `FooRef` (`from_ptr`, `as_ptr` and the `void *` pair), `CMutSeam` on `FooMut`
   (`from_ptr`, `as_mut_ptr` and the `void *` pair) and `CLockedSeam` on
@@ -66,6 +69,29 @@ does, the answer is an owner — see
   - one object → `FooRef<'a>` / `FooMut<'a>`, its lifetime tied to whatever
     keeps it alive (a parent's handle, the call);
   - a run of elements → `CSlice<'a, T>` / `CSliceMut<'a, T>`;
+  - a counted run of immutable bytes an object lends, `const uint8_t *data`
+    with its `size_t len` (from a getter pair, or two fields) → `&'a [u8]`
+    from `core::slice::from_raw_parts`, tied to the shared handle's `'a`, as a
+    NUL string is a `&CStr`. A run of other `CPlainElem` values is the same
+    `&'a [T]`. The SAFETY comment shows, from C's contract, that:
+    - nothing writes, moves or frees the bytes while the shared handle lives:
+      no routine reachable through a `FooRef` writes, grows or reallocates
+      them (not one on `FooRef`, not one on a `FooLocked` taken beside it, not
+      another thread's, if `Foo` is `Sync`); a write reachable only through
+      `FooMut` is excluded by the borrow;
+    - they live as long as the object does, freed with it or with a parent the
+      lifetime covers, not by the next call that refills a shared buffer; and
+    - `data` addresses `len` initialised bytes in one allocation. A NULL or
+      empty run returns `&[]` without the call, since `from_raw_parts` takes
+      no NULL even for a length of 0.
+
+    Where any of these fails, as for a cache, a buffer the library refills or
+    reallocates behind a `const` pointer, or state another thread writes, the
+    run is a `CSlice<'a, u8>` built with `CSlice::from_raw_parts`, which forms
+    no reference: `elems`, `copy_to_slice` and `to_cvec` copy the bytes out.
+    The element type does not decide between the two, since a `u8` is plain
+    either way: who may write the bytes does. A caller that keeps the bytes
+    past the object's borrow takes an owned copy;
   - a NULL-terminated array of pointers → `CNullTerminated<'a, T>`, an
     `Iterator` of the elements' borrows; a `count` + `get(i)` pair or a
     `->next` chain is `(0..n).map(get)` or `iter::successors` over the safe
@@ -73,7 +99,8 @@ does, the answer is an owner — see
   - an object every access reaches under one lock covering all of it —
     typically a C global and the C lock protecting it → `CGuardedRef<'a, Foo>`,
     `'static` for a global, with `impl_cguarded!(Foo, all, …)`;
-  - a NUL string → `&CStr` / `&str` / `&[u8]` tied to the owner's borrow;
+  - a NUL string → `&CStr` / `&str` / `&[u8]` tied to the owner's borrow,
+    on the terms of a counted byte run above;
   - an out-parameter slot → `&'a mut MaybeUninit<T>` from
     `ptr.cast::<MaybeUninit<T>>().as_mut()`; no ffibox type;
   - a `void *` → if it is really a `ffi::foo`, erase a `FooRef` with

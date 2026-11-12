@@ -2237,7 +2237,8 @@ unsafe impl<D: CDrop<c_char>> CSliceElem for Option<CStrBox<D>> {}
 unsafe impl<T: CCell, D: CDispose<T>> CSliceElem for CVal<T, D> {}
 
 // ===========================================================================
-// Run views — borrowed runs of contiguous elements, never a `&[T]`
+// Run views — borrowed runs of contiguous elements, never a `&[T]` over
+// memory C may write
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -2444,7 +2445,15 @@ impl<'a, T: Copy> CSlice<'a, T> {
 /// buffer exclusively. A run inside a C object does not: the library keeps the
 /// pointer and may write through it, and no Rust lifetime constrains that. So
 /// the element type is not what decides between `&[T]` and a `CSlice` — the
-/// owner is.
+/// owner is, and who may write the run.
+///
+/// A run whose C contract fixes it for the object's life (content read once,
+/// never written, freed with the object), which nothing reachable through the
+/// shared handle writes, is the exception: the wrapper lends it as a
+/// `&'a [T]` from `slice::from_raw_parts`, tied to that handle, as it lends a
+/// NUL string as a `&CStr`. The conditions are listed under *Choosing a borrow*
+/// in [docs/borrows.md](https://github.com/crustify-rs/ffibox/blob/main/docs/borrows.md#choosing-a-borrow).
+/// Any other run is a `CSlice`.
 impl<'a, T: CPlainElem> CSlice<'a, T> {
     /// Copy element `i` out; `None` if out of range.
     #[inline]
