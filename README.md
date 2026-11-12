@@ -51,8 +51,10 @@ allocator, so an object Rust allocates is held as one C allocated; `CClosure`
 and `CPayload` put a Rust closure behind a C function pointer and its
 context, for one call or until C releases it; `CFn` and `CFnBox` hold a C
 function and its context that Rust calls, and `CCallback` and `CCallbackBox`
-either half; the `export_*!` macros offer a policy to C as the routine it
-calls, with the owner and handle types in its signature.
+either half; `CTable` holds Rust state behind a C table of function
+pointers C calls into, its slots minted by `impl_cvtable!` from a trait the
+Rust side implements; the `export_*!` macros offer a policy to C as the
+routine it calls, with the owner and handle types in its signature.
 [docs/ownership.md](docs/ownership.md) lists the owners and the policies;
 [docs/borrows.md](docs/borrows.md) lists the handles. Each walks from a C
 declaration to the type it wants.
@@ -67,10 +69,10 @@ ffibox = "0.1"
 ffibox is `#![no_std]`. The `std` feature (on by default) selects
 `std::process::abort` for the unrecoverable-failure path (`Clone` or
 `make_mut` when the C copy or up_ref fails), where without it that path is a
-double-panic, and lets `CClosure` and `callback::barrier` catch a panic before
-it reaches C. The `alloc` feature, which `std` enables, adds `RustAlloc`,
-`CPayload` and `CCallbackBox`, which allocate through Rust's global
-allocator; nothing else allocates.
+double-panic, and lets `CClosure`, `CTable`'s slots and `callback::barrier`
+catch a panic before it reaches C. The `alloc` feature, which `std` enables,
+adds `RustAlloc`, `CPayload`, `CCallbackBox` and `CTable`, which allocate
+through Rust's global allocator; nothing else allocates.
 
 ```toml
 [dependencies]
@@ -95,7 +97,8 @@ When it is Rust's memory that C holds, calls or reads →
 | [examples.md](docs/examples.md) | eight self-contained wrappers, each compiled as a doctest |
 | [ownership.md](docs/ownership.md) | `CBox`, `CBoxState`, `CVal`, `CStrBox`, `CVec`, `CArc`; the lifecycle policies; picking an owner and a policy |
 | [borrows.md](docs/borrows.md) | `Foo`, `FooRef`, `FooMut`, `FooLocked`, `CGuard`, `CGuardedRef`, `CSlice`, `CSliceMut`, `CNullTerminated`; where the accessors live; the seam traits |
-| [outbound.md](docs/outbound.md) | Rust's side: `RustAlloc`, the callbacks (`CClosure`, `CPayload`, `CFn`, `CFnBox`, `CCallback`, `CCallbackBox`), out-parameters, the panic barrier, the `export_*!` macros |
+| [outbound.md](docs/outbound.md) | Rust's side: `RustAlloc`, the callbacks (`CClosure`, `CPayload`, `CFn`, `CFnBox`, `CCallback`, `CCallbackBox`), C tables (`CTable`), out-parameters, the panic barrier, the `export_*!` macros |
+| [vtables.md](docs/vtables.md) | C tables of function pointers implemented in Rust: `CTable`, `impl_cvtable!`, their receivers, re-entry, panics and release, and the design |
 | [patterns.md](docs/patterns.md) | C's iteration, error and callback conventions as Rust's iterators, `Result` and closures |
 | [hand-written.md](docs/hand-written.md) | the wrappers `define_ctype!` cannot express (a layout type generic over a type), and the owners no policy expresses |
 

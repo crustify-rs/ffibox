@@ -9,6 +9,21 @@ migration note here: nothing else reports it.
 
 Changes on `devel` since 0.1.1.
 
+### Added
+
+- **C tables implemented in Rust** (`vtable` module, `alloc` feature).
+  `CTable<T, S>` holds Rust state `S` behind a C table of function pointers
+  of the layout type `T`, which C calls into: the table first, each slot
+  recovering the state under the receiver it declares (`&S` shared, `&mut S`
+  exclusive, a refusal for re-entry that would alias), behind the panic
+  barrier with its declared result, and released once through its `release`
+  slot, whoever releases it and whenever. `impl_cvtable!` mints the slots and
+  the `CVtable<S>` impl that installs them. Tables were hand-written before:
+  nothing existing changes, and a hand-written one keeps working. Moving one
+  to `CTable` replaces its `#[repr(C)]` struct, trampolines, `free` and
+  re-entry state with one `impl_cvtable!` over the trait it already has; see
+  [docs/vtables.md](docs/vtables.md).
+
 ### Migration from 0.1.1
 
 - **`CVec` drops its elements** (`936204b`). A `CVec` now drops each element,

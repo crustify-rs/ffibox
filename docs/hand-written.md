@@ -10,6 +10,15 @@ as [examples.md](examples.md#a-layout-type-with-a-lifetime--define_ctype-with-ph
 shows. One already written by hand is the same layout, and moves to the macro
 when its module is next touched, or stays.
 
+A C table a library calls into and Rust implements (a backend, a stream:
+a struct of function pointers, each passed the table) is not hand-written
+either: `CTable` lays it out with its state, recovers the state in each slot,
+guards re-entry, puts each slot behind the panic barrier and releases it once,
+and `impl_cvtable!` mints the slots, as [vtables.md](vtables.md) describes.
+Only a slot the macro cannot express is written by hand, as an
+`unsafe extern "C" fn` whose body is `CTable::enter`, in a hand-written
+`unsafe impl CVtable<S>`.
+
 What is hand-written for such a wrapper is the layout type, its handles and
 their seams, against the items below. Its policies are not, unless no macro
 takes them:

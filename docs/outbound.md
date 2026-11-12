@@ -20,6 +20,7 @@ for one call and not kept is plain Rust: `&mut x as *mut _` for C that writes,
 | keeps a closure or value, and releases it later | `CPayload`: `into_raw()`, `release_fn()`, `trampoline()` | `Box<F>` |
 | hands Rust a function and its context to call | `CFn` for the call or borrow it came with, `CFnBox` with the routine that releases the context: `call()`, `parts()` / `into_raw()` | a closure |
 | holds a callback that is either a Rust closure or a C function | `CCallback` (for a call or borrow), `CCallbackBox` (kept until released): `call()` from Rust, `c_form()` / `into_c()` to C | `impl FnMut`, `Box<dyn Fn>` |
+| calls into a table of function pointers, each slot passed the table (a backend, a stream) | `CTable<T, S>`, its slots from `impl_cvtable!`: `as_c_ptr()` / `into_c()`, released through its `release` slot | `Box<dyn Trait>` |
 | returns an object through an out-parameter | `CBox::from_c_out`, `CStrBox::from_raw_out` | a return value |
 | calls a Rust routine that must not unwind into it | `callback::barrier` | `catch_unwind` |
 | frees, copies or constructs a ported type's objects | `export_cdrop!`, `export_cdupclone!`, `export_cnew!` | the C routines they replace |
@@ -61,6 +62,15 @@ for one call and not kept is plain Rust: `&mut x as *mut _` for C that writes,
   closure runs through its trampoline, with the same refusal and panic
   handling as when C calls it, and handed to C, a C function goes as its own
   pair.
+- **C calls into a table Rust implements** (`git_config_backend`, a
+  `git_writestream`: a struct of function pointers, each passed the table).
+  `CTable<T, S>`, the state `S` behind the table of the layout type `T`,
+  whose slots `impl_cvtable!` mints from the trait `S` implements: each slot
+  declares its receiver, `&S` or `&mut S`, which decides what re-entry it
+  allows, and its results for a panic and a refusal. C releases it through
+  the slot declared `release`. [vtables.md](vtables.md) walks through it. A
+  family of hooks C calls with no pointer back (`git_allocator`) is not a
+  table: trampolines generic over the implementing type, in `barrier`.
 - **C returns something through an out-parameter.** `from_c_out` /
   `from_raw_out`: the slot starts NULL and is adopted whatever the routine
   returns, so an object handed over on failure is still released.

@@ -18,6 +18,7 @@ implement it.
 | a callback the library keeps | a boxed closure | `CPayload` |
 | a callback the library hands Rust to call | a closure | `CFn`, or `CFnBox` with its context's release |
 | a callback that is a Rust closure or a C function, whichever supplied it | `impl FnMut`, `Box<dyn Fn>` | `CCallback`, `CCallbackBox` |
+| a struct of function pointers the library calls into, each passed the struct | a trait the Rust side implements, `Box<dyn Trait>` | `CTable`, `impl_cvtable!` |
 
 The `status` functions return the code itself as the error, so `?` converts
 it into the binding's error type through its `From` impl:
@@ -27,5 +28,4 @@ let n = status::nonneg(unsafe { sys::foo_read(f.as_mut_ptr(), buf, len) })?;
 ```
 
 Not yet covered: read and write callback pairs as `Read` / `Write` / `Seek`,
-option setters as builders, and structs of function pointers as traits the
-Rust side implements.
+and option setters as builders.
