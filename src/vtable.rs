@@ -6,7 +6,9 @@
 //! slot is the pointer to the allocation. It is `Box<dyn Trait>` handed to C,
 //! with the table of functions embedded rather than pointed to.
 //! [`impl_cvtable!`](crate::impl_cvtable) mints the slots, one `extern "C"`
-//! trampoline each, and the [`CVtable<S>`] impl that installs them:
+//! trampoline each, and the [`CSlots<S>`] impl that installs them, beside
+//! the binding's `unsafe impl` of [`CVtable<S>`], which states that they keep
+//! C's contract:
 //!
 //! ```
 //! use core::ffi::c_int;
@@ -34,23 +36,24 @@
 //! }
 //!
 //! ffibox::impl_cvtable! {
-//!     // SAFETY: the library passes each slot its counter, first.
-//!     unsafe impl<C: Count> CVtable<C> for Counter {
-//!         fn get(@counter) -> c_int {
-//!             on panic: -1,
-//!             on busy: -2,
-//!             |c: &C| c.get(),
-//!         }
-//!         fn add(@counter, n: c_int) -> c_int {
-//!             on panic: -1,
-//!             on busy: -2,
-//!             |c: &mut C| {
-//!                 c.add(n);
-//!                 0
-//!             },
-//!         }
-//!         release free;
+//!     // SAFETY: the library passes each slot its counter, first, and calls
+//!     // `get`, `add` and `free` on every counter.
+//!     unsafe impl<C: Count> CVtable<C> for Counter {}
+//!     base = ffi::counter::default();
+//!     fn get(@counter) -> c_int {
+//!         on panic: -1,
+//!         on busy: -2,
+//!         |c: &C| c.get(),
 //!     }
+//!     fn add(@counter, n: c_int) -> c_int {
+//!         on panic: -1,
+//!         on busy: -2,
+//!         |c: &mut C| {
+//!             c.add(n);
+//!             0
+//!         },
+//!     }
+//!     release free;
 //! }
 //!
 //! struct Total(c_int);
@@ -106,39 +109,53 @@ use alloc::boxed::Box;
 use crate::CCell;
 
 /// The layout type `Self` of a C table whose slots are implemented over the
-/// state `S`: the table a [`CTable<Self, S>`] starts from
-/// ([`base`](Self::base)) and the slots it sets in it
-/// ([`install`](Self::install)), once, when it is built.
+/// state `S`: the binding's word that the table [`CSlots`] builds keeps C's
+/// contract. Has no items: the `unsafe impl` is the statement.
 ///
-/// Implemented by [`impl_cvtable!`](crate::impl_cvtable), or by hand for a
-/// slot the macro cannot express, with trampolines whose bodies call
-/// [`CTable::enter`] and a release slot of [`CTable::release`].
+/// [`impl_cvtable!`](crate::impl_cvtable) takes it written out in its input,
+/// `unsafe impl<…> CVtable<S> for T {}`, and emits it with the binding's own
+/// `unsafe` and braces, so `#![forbid(unsafe_code)]` rejects the invocation
+/// and clippy's `undocumented_unsafe_blocks` asks for its `SAFETY` comment.
+/// A table written by hand implements [`CSlots`] and this trait.
 ///
 /// # Safety
 ///
+/// - C passes each slot [`CSlots::install`] sets its table in the argument
+///   the slot's trampoline recovers it from: types check that only where no
+///   other argument has the table's type (`cmp(ops *self, ops *other)` is one
+///   where they cannot).
 /// - Every slot `install` sets is a function that, called by C as C's
-///   declaration of the slot states, with a pointer to this table where C
-///   passes it, reaches the state only through
-///   [`CTable::<Self, S>::enter`](CTable::enter) on that pointer, releases
+///   declaration of the slot states, reaches the state only through
+///   [`CTable::<Self, S>::enter`](CTable::enter) on that argument, releases
 ///   the table only through [`CTable::<Self, S>::release`](CTable::release),
 ///   and otherwise keeps the contract C states for the slot. It is callable
 ///   on any CPU the crate builds for: no `#[target_feature]`.
-/// - Every slot `base` holds that `install` does not set is NULL, or a
-///   function C's contract lets every table of this type hold; every other
-///   field holds a value C accepts.
-pub unsafe trait CVtable<S>: CCell {
+/// - Every slot [`CSlots::base`] holds that `install` does not set is NULL
+///   only where C's contract lets that slot be NULL, and otherwise a function
+///   C's contract lets every table of this type hold; every other field holds
+///   a value C accepts. A slot C calls unconditionally is never left NULL.
+pub unsafe trait CVtable<S>: CSlots<S> {}
+
+/// The table a [`CTable<Self, S>`] starts from ([`base`](Self::base)) and
+/// the slots it sets in it ([`install`](Self::install)), once, when it is
+/// built. Its promises are [`CVtable`]'s, which a `CTable` also requires.
+pub trait CSlots<S>: CCell {
     /// The table before `install` sets its slots, built anew for each
     /// [`CTable`].
     fn base() -> Self::C;
 
     /// Set the slots in `table`, a table no one else reaches yet. Called by
-    /// [`CTable`] only: `Install` cannot be built outside ffibox.
-    fn install(table: &mut Self::C, _: Install);
+    /// [`CTable`] only: `Install` cannot be built outside ffibox, and is
+    /// branded with the table's borrow and the impl's types, so it neither
+    /// outlives the call nor serves another impl.
+    fn install<'a>(table: &'a mut Self::C, _: Install<'a, Self, S>);
 }
 
-/// Proof that [`CTable`] is building the table [`CVtable::install`] fills:
-/// no code outside ffibox can make one, so no other table gets ffibox's
-/// trampolines.
+/// Proof that [`CTable`] is building the table [`CSlots::install`] fills:
+/// no code outside ffibox can make one, its lifetime is that one borrow of
+/// the table (invariant, so it cannot be stretched to a longer one), and its
+/// types are the impl's, so no other table, and no other impl, gets ffibox's
+/// trampolines through it.
 ///
 /// ```compile_fail
 /// # use core::ffi::c_int;
@@ -151,16 +168,92 @@ pub unsafe trait CVtable<S>: CCell {
 /// # ffibox::define_ctype!(Ops, OpsRef, OpsMut, ffi::ops);
 /// # ffibox::impl_cvtable! {
 /// #     // SAFETY: C passes `get` its table.
-/// #     unsafe impl CVtable<u8> for Ops {
-/// #         fn get(@t) -> c_int { on panic: -1, on busy: -2, |_: &u8| 0 }
-/// #     }
+/// #     unsafe impl CVtable<u8> for Ops {}
+/// #     base = ffi::ops::default();
+/// #     fn get(@t) -> c_int { on panic: -1, on busy: -2, |_: &u8| 0 }
 /// # }
-/// use ffibox::vtable::{CVtable, Install};
+/// use ffibox::vtable::{CSlots, Install};
 /// let mut theirs = ffi::ops::default();
-/// <Ops as CVtable<u8>>::install(&mut theirs, Install(()));
+/// <Ops as CSlots<u8>>::install(&mut theirs, Install(Default::default()));
 /// ```
-#[derive(Debug)]
-pub struct Install(());
+///
+/// A hand-written `install` can neither keep its token nor hand it to
+/// another impl's:
+///
+/// ```compile_fail
+/// # use core::ffi::c_int;
+/// # mod ffi {
+/// #     use core::ffi::c_int;
+/// #     #[repr(C)]
+/// #     #[derive(Default)]
+/// #     pub struct ops { pub get: Option<unsafe extern "C" fn(*mut ops) -> c_int> }
+/// # }
+/// # ffibox::define_ctype!(Ops, OpsRef, OpsMut, ffi::ops);
+/// # ffibox::define_ctype!(Other, OtherRef, OtherMut, ffi::ops);
+/// # ffibox::impl_cvtable! {
+/// #     // SAFETY: C passes `get` its table.
+/// #     unsafe impl CVtable<u8> for Ops {}
+/// #     base = ffi::ops::default();
+/// #     fn get(@t) -> c_int { on panic: -1, on busy: -2, |_: &u8| 0 }
+/// # }
+/// use ffibox::vtable::{CSlots, Install};
+/// impl CSlots<()> for Other {
+///     fn base() -> ffi::ops {
+///         ffi::ops::default()
+///     }
+///     fn install<'a>(table: &'a mut ffi::ops, token: Install<'a, Self, ()>) {
+///         <Ops as CSlots<u8>>::install(table, token);
+///     }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// # use core::ffi::c_int;
+/// # mod ffi {
+/// #     use core::ffi::c_int;
+/// #     #[repr(C)]
+/// #     #[derive(Default)]
+/// #     pub struct ops { pub get: Option<unsafe extern "C" fn(*mut ops) -> c_int> }
+/// # }
+/// # ffibox::define_ctype!(Other, OtherRef, OtherMut, ffi::ops);
+/// use std::sync::Mutex;
+/// use ffibox::vtable::{CSlots, Install};
+/// static KEPT: Mutex<Option<Install<'static, Other, ()>>> = Mutex::new(None);
+/// impl CSlots<()> for Other {
+///     fn base() -> ffi::ops {
+///         ffi::ops::default()
+///     }
+///     fn install<'a>(_: &'a mut ffi::ops, token: Install<'a, Self, ()>) {
+///         *KEPT.lock().unwrap() = Some(token);
+///     }
+/// }
+/// ```
+pub struct Install<'a, T, S>(PhantomData<Brand<'a, T, S>>);
+
+/// `Install`'s brand: invariant in `'a`, naming `T` and `S`, and `Send + Sync`
+/// whatever they are.
+type Brand<'a, T, S> = (fn(&'a ()) -> &'a (), fn() -> (T, S));
+
+impl<T, S> fmt::Debug for Install<'_, T, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Install")
+    }
+}
+
+/// A layout type whose handles stay on their thread: `T::Ref` and `T::Mut`
+/// are neither `Send` nor `Sync`, as [`define_ctype!`](crate::define_ctype)
+/// makes them unless the binding opts in. It lets
+/// [`CTable::as_ref_local`] and [`CTable::as_mut_local`] lend them over a
+/// state of any thread-safety.
+///
+/// # Safety
+///
+/// `Self::Ref<'_>` and `Self::Mut<'_>` implement neither `Send` nor `Sync`:
+/// the binding writes no `unsafe impl Send` or `Sync` for them. A handle
+/// method that passes the table to a C call running slots on threads of
+/// C's own is use off the thread, and that C call keeps the thread rule
+/// [`CTable::into_c`] states.
+pub unsafe trait CLocalHandles: CCell {}
 
 /// What runs in a slot: a closure over `&S` ([`Shared`]) or `&mut S`
 /// ([`Exclusive`]), told apart by the type of its argument, so a slot takes
@@ -376,7 +469,7 @@ impl<T: CCell, S> Repr<T, S> {
 /// the allocation while Rust holds it.
 ///
 /// [`new`](Self::new) builds the table from a base value, with the slots
-/// [`CVtable::install`] sets, and the state. The owner lends the table's
+/// [`CSlots::install`] sets, and the state. The owner lends the table's
 /// handles ([`as_ref`](Self::as_ref) / [`as_mut`](Self::as_mut)), so a
 /// binding's methods on them call the slots as on a C table, and the state
 /// ([`state`](Self::state) / [`state_mut`](Self::state_mut) /
@@ -391,8 +484,11 @@ impl<T: CCell, S> Repr<T, S> {
 /// entered through a shared borrow on another thread reaches `&S`, or `&mut S`
 /// alone. The handles are `T`'s, whose `Send` and `Sync` the binding chose for
 /// the C type alone, so [`as_ref`](Self::as_ref) and [`as_mut`](Self::as_mut)
-/// ask `S: Send + Sync`, and the `_local` forms ask the caller to keep the
-/// handle on its thread.
+/// ask `S: Send + Sync`, and their `_local` forms ask the handles to stay on
+/// their thread ([`CLocalHandles`]). [`into_c`](Self::into_c) asks
+/// `S: Send + Sync` too, and [`into_c_local`](Self::into_c_local) states the
+/// threads C uses instead. [`as_c_ptr`](Self::as_c_ptr) asserts nothing, as a
+/// raw pointer does: the C call it is passed to keeps the same thread rule.
 pub struct CTable<T: CCell, S> {
     repr: NonNull<Repr<T, S>>,
     _owns: PhantomData<Box<Repr<T, S>>>,
@@ -408,7 +504,7 @@ unsafe impl<T: CCell + Send, S: Send> Send for CTable<T, S> {}
 unsafe impl<T: CCell + Sync, S: Send + Sync> Sync for CTable<T, S> {}
 
 impl<T: CVtable<S>, S> CTable<T, S> {
-    /// The table [`CVtable::base`], its slots set by [`CVtable::install`],
+    /// The table [`CSlots::base`], its slots set by [`CSlots::install`],
     /// over `state`.
     #[must_use]
     pub fn new(state: S) -> Self {
@@ -421,13 +517,13 @@ impl<T: CVtable<S>, S> CTable<T, S> {
     ///
     /// # Safety
     ///
-    /// As [`CVtable::base`]'s result: every slot of `base` that
-    /// [`CVtable::install`] does not set is NULL, or a function C's contract
+    /// As [`CSlots::base`]'s result: every slot of `base` that
+    /// [`CSlots::install`] does not set is NULL, or a function C's contract
     /// lets every table of this type hold, and every other field holds a
     /// value C accepts. A slot the binding's handles call is not left to the
     /// caller's choice by any safe path.
     ///
-    /// Safe code takes the table [`CVtable::base`] gives, and chooses no slot:
+    /// Safe code takes the table [`CSlots::base`] gives, and chooses no slot:
     ///
     /// ```compile_fail
     /// # use core::ffi::c_int;
@@ -443,9 +539,9 @@ impl<T: CVtable<S>, S> CTable<T, S> {
     /// # ffibox::define_ctype!(Store, StoreRef, StoreMut, ffi::store);
     /// # ffibox::impl_cvtable! {
     /// #     // SAFETY: C passes `get` its store.
-    /// #     unsafe impl CVtable<u8> for Store {
-    /// #         fn get(@t) -> c_int { on panic: -1, on busy: -2, |_: &u8| 0 }
-    /// #     }
+    /// #     unsafe impl CVtable<u8> for Store {}
+    /// #     base = ffi::store::default();
+    /// #     fn get(@t) -> c_int { on panic: -1, on busy: -2, |_: &u8| 0 }
     /// # }
     /// unsafe extern "C" fn someone_elses(_: *mut ffi::store) -> c_int { 0 }
     /// let base = ffi::store { count: Some(someone_elses), ..Default::default() };
@@ -458,7 +554,7 @@ impl<T: CVtable<S>, S> CTable<T, S> {
             entries: Entries(AtomicUsize::new(OWNED)),
             state,
         });
-        T::install(&mut repr.table, Install(()));
+        T::install(&mut repr.table, Install(PhantomData));
         Self {
             repr: NonNull::from(Box::leak(repr)),
             _owns: PhantomData,
@@ -580,7 +676,8 @@ impl<T: CVtable<S>, S> CTable<T, S> {
 
 impl<T: CCell, S> CTable<T, S> {
     /// The table, for a C call that uses it while `self` is borrowed and
-    /// keeps nothing.
+    /// keeps nothing. That call keeps [`into_c_local`](Self::into_c_local)'s
+    /// thread rule for the slots it runs.
     #[inline]
     #[must_use]
     pub fn as_c_ptr(&self) -> *mut T::C {
@@ -590,12 +687,13 @@ impl<T: CCell, S> CTable<T, S> {
     /// Surrender the table to C, which releases it through
     /// [`release`](Self::release).
     ///
-    /// C keeps it past any borrow, so `S` borrows nothing (`S: 'static`).
-    /// The C call taking it states the threads C uses it on: any other than
-    /// `S`'s own only if `S: Send + Sync` for shared slots, which share `&S`
-    /// and may drop `S` there as the last one out of a deferred release, and
-    /// `S: Send` for exclusive slots and the release. A release C made of the
-    /// table while it was only lent is forgotten: C now holds it.
+    /// C keeps it past any borrow, so `S` borrows nothing (`S: 'static`), and
+    /// may call it and release it on any thread, so `S: Send + Sync`, as
+    /// [`CPayload::into_raw`](crate::CPayload::into_raw) asks: a shared slot
+    /// shares `&S`, and may drop `S` there as the last one out of a deferred
+    /// release. For a C library that keeps to `S`'s threads,
+    /// [`into_c_local`](Self::into_c_local). A release C made of the table
+    /// while it was only lent is forgotten: C now holds it.
     ///
     /// A state that borrows stays with Rust:
     ///
@@ -608,19 +706,59 @@ impl<T: CCell, S> CTable<T, S> {
     /// #     pub struct counter { pub get: Option<unsafe extern "C" fn(*mut counter) -> c_int> }
     /// # }
     /// # ffibox::define_ctype!(Counter, CounterRef, CounterMut, ffi::counter);
-    /// // SAFETY: installs nothing.
-    /// unsafe impl<'a> ffibox::vtable::CVtable<&'a c_int> for Counter {
+    /// impl<'a> ffibox::vtable::CSlots<&'a c_int> for Counter {
     ///     fn base() -> ffi::counter {
     ///         ffi::counter::default()
     ///     }
-    ///     fn install(_: &mut ffi::counter, _: ffibox::vtable::Install) {}
+    ///     fn install<'t>(_: &'t mut ffi::counter, _: ffibox::vtable::Install<'t, Self, &'a c_int>) {}
     /// }
+    /// // SAFETY: installs nothing.
+    /// unsafe impl<'a> ffibox::vtable::CVtable<&'a c_int> for Counter {}
     /// fn surrender(n: &c_int) -> *mut ffi::counter {
     ///     ffibox::CTable::<Counter, _>::new(n).into_c().as_ptr()
     /// }
     /// ```
+    ///
+    /// Nor does one that is not `Send` and `Sync` go to C's threads:
+    ///
+    /// ```compile_fail
+    /// # use core::ffi::c_int;
+    /// # use std::rc::Rc;
+    /// # mod ffi {
+    /// #     use core::ffi::c_int;
+    /// #     #[repr(C)]
+    /// #     #[derive(Default)]
+    /// #     pub struct counter { pub get: Option<unsafe extern "C" fn(*mut counter) -> c_int> }
+    /// # }
+    /// # ffibox::define_ctype!(Counter, CounterRef, CounterMut, ffi::counter);
+    /// ffibox::impl_cvtable! {
+    ///     // SAFETY: C passes `get` its counter.
+    ///     unsafe impl CVtable<Rc<c_int>> for Counter {}
+    ///     base = ffi::counter::default();
+    ///     fn get(@t) -> c_int { on panic: -1, on busy: -2, |c: &Rc<c_int>| **c }
+    /// }
+    /// let p = ffibox::CTable::<Counter, _>::new(Rc::new(1)).into_c();
+    /// ```
     #[must_use = "the returned pointer owns the table and must be released"]
     pub fn into_c(self) -> NonNull<T::C>
+    where
+        S: Send + Sync + 'static,
+    {
+        // SAFETY: `S: Send + Sync` keeps every thread C may use within `S`'s
+        // terms.
+        unsafe { self.into_c_local() }
+    }
+
+    /// As [`into_c`](Self::into_c), for a state that need not be `Send` or
+    /// `Sync`.
+    ///
+    /// # Safety
+    ///
+    /// C calls the table's slots, and releases it, on threads `S` allows: on
+    /// any other than the one `S` belongs to only if `S: Send + Sync` for
+    /// shared slots, and `S: Send` for exclusive slots and the release.
+    #[must_use = "the returned pointer owns the table and must be released"]
+    pub unsafe fn into_c_local(self) -> NonNull<T::C>
     where
         S: 'static,
     {
@@ -635,8 +773,9 @@ impl<T: CCell, S> CTable<T, S> {
     ///
     /// The binding's methods on it may call any slot, and the handle may
     /// cross threads where the binding made `T::Ref` `Send` or `Sync`, so `S`
-    /// is `Send + Sync`, as for a `&RwLock<S>` shared between threads. For a
-    /// handle that stays on its thread, [`as_ref_local`](Self::as_ref_local).
+    /// is `Send + Sync`, as for a `&RwLock<S>` shared between threads. Where
+    /// the handles stay on their thread ([`CLocalHandles`]),
+    /// [`as_ref_local`](Self::as_ref_local) takes any `S`.
     ///
     /// A state that is not `Sync` is not reached through a handle the
     /// binding made `Send`:
@@ -655,9 +794,9 @@ impl<T: CCell, S> CTable<T, S> {
     /// unsafe impl Send for CounterRef<'_> {}
     /// ffibox::impl_cvtable! {
     ///     // SAFETY: C passes `get` its counter.
-    ///     unsafe impl CVtable<Cell<c_int>> for Counter {
-    ///         fn get(@t) -> c_int { on panic: -1, on busy: -2, |c: &Cell<c_int>| c.get() }
-    ///     }
+    ///     unsafe impl CVtable<Cell<c_int>> for Counter {}
+    ///     base = ffi::counter::default();
+    ///     fn get(@t) -> c_int { on panic: -1, on busy: -2, |c: &Cell<c_int>| c.get() }
     /// }
     /// let table = ffibox::CTable::<Counter, _>::new(Cell::new(0));
     /// let r = table.as_ref(); // `Cell<c_int>: !Sync`
@@ -668,26 +807,43 @@ impl<T: CCell, S> CTable<T, S> {
     where
         S: Send + Sync,
     {
-        // SAFETY: `S: Send + Sync` keeps every thread the handle reaches
-        // within `S`'s terms.
-        unsafe { self.as_ref_local() }
+        self.handle_ref()
     }
 
-    /// As [`as_ref`](Self::as_ref), for any `S`.
+    /// As [`as_ref`](Self::as_ref), for any `S`, where the handles stay on
+    /// their thread. A handle method passing the table to a C call that runs
+    /// slots on threads of C's own is use off the thread: that C call keeps
+    /// the thread rule [`into_c_local`](Self::into_c_local) states.
     ///
-    /// # Safety
+    /// A layout type that is not [`CLocalHandles`] has no local form:
     ///
-    /// The handle, and every copy of it, is used on the calling thread only:
-    /// `T::Ref` is neither `Send` nor `Sync`, as
-    /// [`define_ctype!`](crate::define_ctype) makes it unless the binding
-    /// opts in.
+    /// ```compile_fail
+    /// # use core::cell::Cell;
+    /// # use core::ffi::c_int;
+    /// # mod ffi {
+    /// #     use core::ffi::c_int;
+    /// #     #[repr(C)]
+    /// #     #[derive(Default)]
+    /// #     pub struct counter { pub get: Option<unsafe extern "C" fn(*mut counter) -> c_int> }
+    /// # }
+    /// ffibox::define_ctype!(Counter, CounterRef, CounterMut, ffi::counter);
+    /// // SAFETY: the C library's counters are thread-safe.
+    /// unsafe impl Send for CounterRef<'_> {}
+    /// ffibox::impl_cvtable! {
+    ///     // SAFETY: C passes `get` its counter.
+    ///     unsafe impl CVtable<Cell<c_int>> for Counter {}
+    ///     base = ffi::counter::default();
+    ///     fn get(@t) -> c_int { on panic: -1, on busy: -2, |c: &Cell<c_int>| c.get() }
+    /// }
+    /// let table = ffibox::CTable::<Counter, _>::new(Cell::new(0));
+    /// let r = table.as_ref_local();
+    /// ```
     #[must_use]
-    pub unsafe fn as_ref_local(&self) -> T::Ref<'_> {
-        // SAFETY: the live table this owner holds, initialised by `new`;
-        // Rust writes it only through `as_mut`, which `&self` excludes, and C
-        // only while lent it through a handle.
-        unsafe { T::ref_from_ptr(self.as_c_ptr()) }
-            .unwrap_or_else(|| unreachable!("a box is never NULL"))
+    pub fn as_ref_local(&self) -> T::Ref<'_>
+    where
+        T: CLocalHandles,
+    {
+        self.handle_ref()
     }
 
     /// The table's exclusive handle.
@@ -695,31 +851,42 @@ impl<T: CCell, S> CTable<T, S> {
     /// The binding's methods on it may call any slot, the handle may move to
     /// another thread where the binding made `T::Mut` `Send`, and the shared
     /// handles it lends spread over threads where `T::Ref` is `Send` or
-    /// `Sync`, so `S` is `Send + Sync`, as for [`as_ref`](Self::as_ref). For
-    /// a handle that stays on its thread, [`as_mut_local`](Self::as_mut_local).
+    /// `Sync`, so `S` is `Send + Sync`, as for [`as_ref`](Self::as_ref).
+    /// Where the handles stay on their thread ([`CLocalHandles`]),
+    /// [`as_mut_local`](Self::as_mut_local) takes any `S`.
     #[must_use]
     pub fn as_mut(&mut self) -> T::Mut<'_>
     where
         S: Send + Sync,
     {
-        // SAFETY: `S: Send + Sync` keeps every thread the handle, and the
-        // shared handles it lends, reach within `S`'s terms.
-        unsafe { self.as_mut_local() }
+        self.handle_mut()
     }
 
-    /// As [`as_mut`](Self::as_mut), for any `S`.
-    ///
-    /// # Safety
-    ///
-    /// The handle, and every handle derived from it, is used on the calling
-    /// thread only: `T::Mut` (and `T::Ref`, which it lends) is neither `Send`
-    /// nor `Sync`, as [`define_ctype!`](crate::define_ctype) makes them unless
-    /// the binding opts in.
+    /// As [`as_mut`](Self::as_mut), for any `S`, where the handles stay on
+    /// their thread; the C calls its methods make keep the thread rule,
+    /// as for [`as_ref_local`](Self::as_ref_local).
     #[must_use]
-    pub unsafe fn as_mut_local(&mut self) -> T::Mut<'_> {
+    pub fn as_mut_local(&mut self) -> T::Mut<'_>
+    where
+        T: CLocalHandles,
+    {
+        self.handle_mut()
+    }
+
+    // The handles, for `as_ref` / `as_mut` and their `_local` forms, whose
+    // bounds keep every thread a handle reaches within `S`'s terms.
+    fn handle_ref(&self) -> T::Ref<'_> {
+        // SAFETY: the live table this owner holds, initialised by `new`;
+        // Rust writes it only through `as_mut`, which `&self` excludes, and C
+        // only while lent it through a handle.
+        unsafe { T::ref_from_ptr(self.as_c_ptr()) }
+            .unwrap_or_else(|| unreachable!("a box is never NULL"))
+    }
+
+    fn handle_mut(&mut self) -> T::Mut<'_> {
         self.entries().unlend();
-        // SAFETY: as in `as_ref_local`, exclusive for `&mut self`; the
-        // pointer carries the allocation's write provenance.
+        // SAFETY: as in `handle_ref`, exclusive for `&mut self`; the pointer
+        // carries the allocation's write provenance.
         unsafe { T::mut_from_ptr(self.as_c_ptr()) }
             .unwrap_or_else(|| unreachable!("a box is never NULL"))
     }
@@ -790,33 +957,40 @@ impl<T: CCell, S> fmt::Debug for CTable<T, S> {
 // ---------------------------------------------------------------------------
 
 /// Implement a C table's slots in Rust: the [`CVtable<S>`](crate::vtable::CVtable)
-/// impl for its layout type `T`, which builds the table from its `base` and
-/// installs one `extern "C"` trampoline per slot and, if C frees the table,
+/// and [`CSlots<S>`](crate::vtable::CSlots) impls for its layout type `T`,
+/// which build the table from its `base` and install one `extern "C"`
+/// trampoline per slot and, if C frees the table,
 /// [`CTable::release`](crate::vtable::CTable::release).
 ///
 /// ```ignore
 /// ffibox::impl_cvtable! {
-///     // SAFETY: libgit2 passes a stream's members the stream itself, first.
-///     unsafe impl<W: StreamWriter> CVtable<W> for WriteStream {
-///         base = ffi::git_writestream::default();
-///         /// `git_writestream.write` over `StreamWriter::write`.
-///         fn write(@stream, buffer: *const c_char, len: usize) -> c_int {
-///             on panic: std::process::abort(),
-///             on busy: GIT_EUSER,
-///             |w: &mut W| returned(w.write(unsafe { bytes(buffer, len) })),
-///         }
-///         release free;
+///     // SAFETY: libgit2 passes a stream's members the stream, first, and
+///     // calls `write`, `close` and `free` on every stream.
+///     unsafe impl<W: StreamWriter> CVtable<W> for WriteStream {}
+///     base = ffi::git_writestream::default();
+///     /// `git_writestream.write` over `StreamWriter::write`.
+///     fn write(@stream, buffer: *const c_char, len: usize) -> c_int {
+///         on panic: std::process::abort(),
+///         on busy: GIT_EUSER,
+///         |w: &mut W| returned(w.write(unsafe { bytes(buffer, len) })),
 ///     }
+///     fn close(@stream) -> c_int { /* … */ }
+///     release free;
 /// }
 /// ```
 ///
-/// - `unsafe impl<…> CVtable<S> for T`: the state `S` and the layout type `T`
-///   ([`define_ctype!`](crate::define_ctype)'s, or any `CCell`); each generic
-///   takes one trait-path bound. The `unsafe`, with its `SAFETY` comment, is
-///   the binding's word that C passes the table in each slot's `@` argument.
-/// - `base = expr;`, optional: the table before the slots are set, as
-///   [`CVtable::base`](crate::vtable::CVtable::base) requires it; the
-///   default is `Default::default()`, all slots NULL for a bindgen struct.
+/// - `unsafe impl<…> CVtable<S> for T {}`: the state `S` and the layout type
+///   `T` ([`define_ctype!`](crate::define_ctype)'s, or any `CCell`, named by
+///   a path with type arguments, if any); each generic takes one trait-path
+///   bound. The line is the binding's `unsafe impl` of
+///   [`CVtable`](crate::vtable::CVtable), emitted with the binding's own
+///   `unsafe` and braces: `#![forbid(unsafe_code)]` rejects it, clippy's
+///   `undocumented_unsafe_blocks` asks for its `SAFETY` comment, and that
+///   comment states `CVtable`'s contract: where C passes each slot its
+///   table, and that no slot C calls is left NULL.
+/// - `base = expr;`: the table before the slots are set. Written out, never
+///   defaulted: `Default::default()`, all slots NULL for a bindgen struct, is
+///   right only when every slot C calls unconditionally is declared below.
 /// - `fn slot(…)`: the C field, then its C arguments in C's order, the one C
 ///   passes the table in marked `@name`, which names the table pointer in the
 ///   body. Only doc comments go before it: the trampoline takes no other
@@ -825,7 +999,7 @@ impl<T: CCell, S> fmt::Debug for CTable<T, S> {
 ///   tables, does one marking the wrong argument; but where another argument
 ///   has the table's type too (`cmp(ops *self, ops *other)`), the types
 ///   cannot tell them apart, and the `@` marks the one C's documentation
-///   names, as the `unsafe` states.
+///   names, as the `SAFETY` comment states.
 /// - `on panic:` and `on busy:`: what the slot returns when its body panics,
 ///   or when it is refused (see [`CTable::enter`](crate::vtable::CTable::enter));
 ///   expressions, evaluated only then.
@@ -833,7 +1007,7 @@ impl<T: CCell, S> fmt::Debug for CTable<T, S> {
 ///   `|s: &mut S|` for an exclusive one; the C arguments are captured by name.
 /// - `release field;`: the slot C frees the table with, if it does.
 ///
-/// The trampolines are local to the impl, and `install` takes a token only
+/// The trampolines are local to `install`, which takes a token only
 /// [`CTable`](crate::vtable::CTable) makes: no other code can name a
 /// trampoline or install one, so each reaches the state only through the
 /// table it was installed in.
@@ -847,18 +1021,22 @@ impl<T: CCell, S> fmt::Debug for CTable<T, S> {
 /// #     use core::ffi::c_int;
 /// #     #[repr(C)]
 /// #     #[derive(Default)]
-/// #     pub struct ops { pub get: Option<unsafe extern "C" fn(*mut ops) -> c_int> }
+/// #     pub struct ops {
+/// #         pub get: Option<unsafe extern "C" fn(*mut ops) -> c_int>,
+/// #         pub next: Option<unsafe extern "C" fn(*mut c_int, *mut ops) -> c_int>,
+/// #         pub cmp: Option<unsafe extern "C" fn(*mut ops, *mut ops) -> c_int>,
+/// #     }
 /// # }
 /// # ffibox::define_ctype!(Ops, OpsRef, OpsMut, ffi::ops);
 /// struct Other;
 /// ffibox::impl_cvtable! {
 ///     // SAFETY: C passes `get` its table.
-///     unsafe impl CVtable<u32> for Ops {
-///         fn get(@ops) -> c_int {
-///             on panic: -1,
-///             on busy: -2,
-///             |_: &Other| 0, // the state is `u32`
-///         }
+///     unsafe impl CVtable<u32> for Ops {}
+///     base = ffi::ops::default();
+///     fn get(@ops) -> c_int {
+///         on panic: -1,
+///         on busy: -2,
+///         |_: &Other| 0, // the state is `u32`
 ///     }
 /// }
 /// ```
@@ -873,19 +1051,21 @@ impl<T: CCell, S> fmt::Debug for CTable<T, S> {
 /// #     #[repr(C)]
 /// #     #[derive(Default)]
 /// #     pub struct ops {
+/// #         pub get: Option<unsafe extern "C" fn(*mut ops) -> c_int>,
 /// #         pub next: Option<unsafe extern "C" fn(*mut c_int, *mut ops) -> c_int>,
+/// #         pub cmp: Option<unsafe extern "C" fn(*mut ops, *mut ops) -> c_int>,
 /// #     }
 /// # }
 /// # ffibox::define_ctype!(Ops, OpsRef, OpsMut, ffi::ops);
 /// ffibox::impl_cvtable! {
 ///     // SAFETY: C passes `next` its table last.
-///     unsafe impl CVtable<u32> for Ops {
-///         // C passes the table last: `next(int *out, ops *table)`.
-///         fn next(@ops, out: *mut c_int) -> c_int {
-///             on panic: -1,
-///             on busy: -2,
-///             |_: &u32| 0,
-///         }
+///     unsafe impl CVtable<u32> for Ops {}
+///     base = ffi::ops::default();
+///     // C passes the table last: `next(int *out, ops *table)`.
+///     fn next(@ops, out: *mut c_int) -> c_int {
+///         on panic: -1,
+///         on busy: -2,
+///         |_: &u32| 0,
 ///     }
 /// }
 /// ```
@@ -899,18 +1079,74 @@ impl<T: CCell, S> fmt::Debug for CTable<T, S> {
 /// #     #[repr(C)]
 /// #     #[derive(Default)]
 /// #     pub struct ops {
+/// #         pub get: Option<unsafe extern "C" fn(*mut ops) -> c_int>,
+/// #         pub next: Option<unsafe extern "C" fn(*mut c_int, *mut ops) -> c_int>,
 /// #         pub cmp: Option<unsafe extern "C" fn(*mut ops, *mut ops) -> c_int>,
 /// #     }
 /// # }
 /// # ffibox::define_ctype!(Ops, OpsRef, OpsMut, ffi::ops);
 /// ffibox::impl_cvtable! {
-///     impl CVtable<u32> for Ops {
-///         fn cmp(_other: *mut ffi::ops, @this) -> c_int {
+///     impl CVtable<u32> for Ops {}
+///     base = ffi::ops::default();
+///     fn cmp(_other: *mut ffi::ops, @this) -> c_int {
+///         on panic: -1,
+///         on busy: -2,
+///         |_: &u32| 0,
+///     }
+/// }
+/// ```
+///
+/// and its `unsafe` is the binding's own, which `forbid(unsafe_code)` sees:
+///
+/// ```compile_fail
+/// # use core::ffi::c_int;
+/// # mod ffi {
+/// #     use core::ffi::c_int;
+/// #     #[repr(C)]
+/// #     #[derive(Default)]
+/// #     pub struct ops {
+/// #         pub get: Option<unsafe extern "C" fn(*mut ops) -> c_int>,
+/// #         pub next: Option<unsafe extern "C" fn(*mut c_int, *mut ops) -> c_int>,
+/// #         pub cmp: Option<unsafe extern "C" fn(*mut ops, *mut ops) -> c_int>,
+/// #     }
+/// # }
+/// #[forbid(unsafe_code)]
+/// mod binding {
+///     use core::ffi::c_int;
+///     use super::ffi;
+///     ffibox::define_ctype!(Ops, OpsRef, OpsMut, ffi::ops);
+///     ffibox::impl_cvtable! {
+///         // SAFETY: C passes `cmp` its table first.
+///         unsafe impl CVtable<u32> for Ops {}
+///         base = ffi::ops::default();
+///         fn cmp(@this, _other: *mut ffi::ops) -> c_int {
 ///             on panic: -1,
 ///             on busy: -2,
 ///             |_: &u32| 0,
 ///         }
 ///     }
+/// }
+/// ```
+///
+/// The `base` is written out:
+///
+/// ```compile_fail
+/// # use core::ffi::c_int;
+/// # mod ffi {
+/// #     use core::ffi::c_int;
+/// #     #[repr(C)]
+/// #     #[derive(Default)]
+/// #     pub struct ops {
+/// #         pub get: Option<unsafe extern "C" fn(*mut ops) -> c_int>,
+/// #         pub next: Option<unsafe extern "C" fn(*mut c_int, *mut ops) -> c_int>,
+/// #         pub cmp: Option<unsafe extern "C" fn(*mut ops, *mut ops) -> c_int>,
+/// #     }
+/// # }
+/// # ffibox::define_ctype!(Ops, OpsRef, OpsMut, ffi::ops);
+/// ffibox::impl_cvtable! {
+///     // SAFETY: C passes `get` its table, and calls no other slot.
+///     unsafe impl CVtable<u32> for Ops {}
+///     fn get(@t) -> c_int { on panic: -1, on busy: -2, |s: &u32| *s as c_int }
 /// }
 /// ```
 ///
@@ -923,18 +1159,22 @@ impl<T: CCell, S> fmt::Debug for CTable<T, S> {
 /// #     use core::ffi::c_int;
 /// #     #[repr(C)]
 /// #     #[derive(Default)]
-/// #     pub struct ops { pub get: Option<unsafe extern "C" fn(*mut ops) -> c_int> }
+/// #     pub struct ops {
+/// #         pub get: Option<unsafe extern "C" fn(*mut ops) -> c_int>,
+/// #         pub next: Option<unsafe extern "C" fn(*mut c_int, *mut ops) -> c_int>,
+/// #         pub cmp: Option<unsafe extern "C" fn(*mut ops, *mut ops) -> c_int>,
+/// #     }
 /// # }
 /// # ffibox::define_ctype!(Ops, OpsRef, OpsMut, ffi::ops);
 /// ffibox::impl_cvtable! {
 ///     // SAFETY: C passes `get` its table.
-///     unsafe impl CVtable<u64> for Ops {
-///         #[target_feature(enable = "avx2")]
-///         fn get(@t) -> c_int {
-///             on panic: -1,
-///             on busy: -2,
-///             |s: &u64| *s as c_int,
-///         }
+///     unsafe impl CVtable<u64> for Ops {}
+///     base = ffi::ops::default();
+///     #[target_feature(enable = "avx2")]
+///     fn get(@t) -> c_int {
+///         on panic: -1,
+///         on busy: -2,
+///         |s: &u64| *s as c_int,
 ///     }
 /// }
 /// ```
@@ -990,38 +1230,35 @@ macro_rules! impl_cvtable {
                 ::core::option::Option::Some($crate::vtable::CTable::<$t, $s>::release);
         )?
     };
+    // The impl's `unsafe` is the caller's token, or nothing compiles.
+    (@unsafe unsafe) => {};
     (
-        unsafe impl $(<$($g:ident $(: $b:path)?),+ $(,)?>)? CVtable<$s:ty> for $t:ty {
-            base = $base:expr;
-            $($items:tt)*
-        }
+        $u:tt impl $(<$($g:ident $(: $b:path)?),+ $(,)?>)?
+            CVtable<$s:ty> for $($tp:ident)::+ $(<$($ta:ty),+ $(,)?>)? $marker:tt
+        base = $base:expr;
+        $($items:tt)*
     ) => {
-        // SAFETY: the invocation's `unsafe`: C passes each slot its table in
-        // the argument marked `@`, and `base` leaves no slot to safe choice.
-        // Every slot `install` sets is a trampoline minted here, whose body is
-        // `CTable::<$t, $s>::enter` on that argument, or
-        // `CTable::<$t, $s>::release`.
-        unsafe impl $(<$($g $(: $b)?),+>)? $crate::vtable::CVtable<$s> for $t {
-            fn base() -> <$t as $crate::CCell>::C {
+        $crate::impl_cvtable!(@unsafe $u);
+
+        // The caller's own `unsafe` and braces, first and last, so the
+        // caller's lints see the impl as the caller's: `unsafe_code`, and
+        // clippy's `undocumented_unsafe_blocks` asking for its `SAFETY`.
+        $u impl $(<$($g $(: $b)?),+>)? $crate::vtable::CVtable<$s>
+            for $($tp)::+ $(<$($ta),+>)? $marker
+
+        impl $(<$($g $(: $b)?),+>)? $crate::vtable::CSlots<$s> for $($tp)::+ $(<$($ta),+>)? {
+            fn base() -> <Self as $crate::CCell>::C {
                 $base
             }
 
-            fn install(table: &mut <$t as $crate::CCell>::C, _: $crate::vtable::Install) {
-                $crate::impl_cvtable!(@slots table [$($($g $(: $b)?),+)?] $t, $s;
+            fn install<'table>(
+                table: &'table mut <Self as $crate::CCell>::C,
+                _: $crate::vtable::Install<'table, Self, $s>,
+            ) {
+                $crate::impl_cvtable!(@slots table [$($($g $(: $b)?),+)?]
+                    $($tp)::+ $(<$($ta),+>)?, $s;
                     $($items)*
                 );
-            }
-        }
-    };
-    (
-        unsafe impl $(<$($g:ident $(: $b:path)?),+ $(,)?>)? CVtable<$s:ty> for $t:ty {
-            $($items:tt)*
-        }
-    ) => {
-        $crate::impl_cvtable! {
-            unsafe impl $(<$($g $(: $b)?),+>)? CVtable<$s> for $t {
-                base = ::core::default::Default::default();
-                $($items)*
             }
         }
     };

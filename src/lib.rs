@@ -165,4 +165,4 @@ pub use crate::traits::{
     CZeroable, LockFields, LockScope, LockWhole,
 };
 #[cfg(feature = "alloc")]
-pub use crate::vtable::{CTable, CVtable};
+pub use crate::vtable::{CLocalHandles, CSlots, CTable, CVtable};

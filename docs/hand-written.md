@@ -17,7 +17,7 @@ guards re-entry, puts each slot behind the panic barrier and releases it once,
 and `impl_cvtable!` mints the slots, as [vtables.md](vtables.md) describes.
 Only a slot the macro cannot express is written by hand, as an
 `unsafe extern "C" fn` whose body is `CTable::enter`, in a hand-written
-`unsafe impl CVtable<S>`.
+`CSlots<S>` impl beside an `unsafe impl CVtable<S>`.
 
 What is hand-written for such a wrapper is the layout type, its handles and
 their seams, against the items below. Its policies are not, unless no macro

@@ -36,25 +36,33 @@ anywhere but at offset zero; a compile-time assertion keeps it there.
 What generics cannot express is the slots: an `extern "C" fn` of the C
 declaration's exact signature, with the table at whichever argument C passes
 it. `impl_cvtable!` mints those, and nothing else: one trampoline per slot,
-whose whole body is a call to `CTable::enter`, and the `CVtable<S>` impl that
-installs them. The trampolines are local to the impl, and `install` takes a
-token only `CTable` makes, so a slot cannot be named, let alone installed in
-another table or over another state type: each slot reaches `S` only through
-the table it was installed in. That removes the recovery `unsafe` from every
-slot. What types cannot check is left as one `unsafe impl` per table, written
-in the macro's input with its `SAFETY` comment: that C passes each slot its
-table in the argument marked `@`. Types check that where the table's is the
-only argument of its type, but not where C passes another table of that type
-too (`cmp(ops *self, ops *other)`). The rest of C's contract with the table is
-stated where the table is handed to C.
+whose whole body is a call to `CTable::enter`, and the `CSlots<S>` impl
+(`base` and `install`, a safe trait) that installs them. The
+trampolines are local to `install`, which takes a token only `CTable` makes,
+branded with that one borrow of the table and the impl's types, so a slot
+cannot be named, let alone installed in another table or over another state
+type: each slot reaches `S` only through the table it was installed in. That
+removes the recovery `unsafe` from every slot.
 
-The table starts from `CVtable::base`, which the impl gives (`base = …;`,
-by default `Default::default()`, every slot NULL), and `install` sets the
-slots it implements. Safe code therefore chooses no slot: a binding's safe
-handle method that calls a slot of the table never runs a function a consumer
-put there. A table whose fields are set per instance, or that a C routine
-initialises, is built with the `unsafe` `CTable::with_base`, whose caller
-states the same of its base.
+What types cannot check is one `unsafe impl CVtable<S> for T {}` per table,
+an item-less trait whose contract it is: that C passes each slot its table in
+the argument marked `@` (types check that where the table's is the only
+argument of its type, but not where C passes another table of that type too,
+`cmp(ops *self, ops *other)`), and that no slot C calls is left NULL. The
+binding writes that line out in the macro's input, and the macro emits it
+with the binding's own `unsafe` and braces, so the binding's lints see it:
+`#![forbid(unsafe_code)]` rejects the invocation, and clippy's
+`undocumented_unsafe_blocks` asks for its `SAFETY` comment. The rest of C's
+contract with the table is stated where the table is handed to C.
+
+The table starts from `CSlots::base`, which the binding writes out
+(`base = …;`, with no default: `Default::default()`, every slot NULL, is
+right only when every slot C calls unconditionally is declared), and
+`install` sets the slots it implements. Safe code therefore chooses no slot:
+a binding's safe handle method that calls a slot of the table never runs a
+function a consumer put there. A table whose fields are set per instance, or
+that a C routine initialises, is built with the `unsafe` `CTable::with_base`,
+whose caller states the same of its base.
 
 The alternative, a generic `CTable<T: Table>` with an `unsafe` trait per C
 table and hand-written trampolines, is also supported, since `enter` and
@@ -81,11 +89,14 @@ methods on them (a `write` that calls the slot) work on a Rust table as on a
 C one. Those handles are the binding's, `Send` or `Sync` as the binding
 decided for the C type, not for `S`; since their methods may call any slot,
 `as_ref` and `as_mut` ask `S: Send + Sync`, as a `&RwLock<S>` shared between
-threads does, and `as_ref_local` / `as_mut_local` lend them for any `S` to a
-caller that keeps them on its thread, as `define_ctype!`'s handles are unless
-the binding opts in. `into_c` surrenders the table to C, which releases it
-through the slot declared `release`; C keeps it past any borrow, so it takes
-`S: 'static`. Where the binding has one owner for every table of that
+threads does. Where the handles stay on their thread, as `define_ctype!`'s
+do unless the binding opts in, the binding says so once per type with
+`unsafe impl CLocalHandles for T {}`, and `as_ref_local` / `as_mut_local`
+lend them, safely, over any `S`. `into_c` surrenders the table to C, which
+releases it through the slot declared `release`. C keeps it past any borrow
+and may use it on any thread, so `into_c` asks `S: Send + Sync + 'static`,
+as `CPayload::into_raw` asks `Send + Sync`; the `unsafe` `into_c_local` asks
+only `'static`, its caller stating the threads C uses. Where the binding has one owner for every table of that
 type, C's and Rust's alike (`CBox<WriteStream, WriteStreamFree>`, whose
 policy calls the `free` slot), the surrendered pointer is adopted into it with
 `from_c`, `unsafe` as every adoption is: its obligation is that the policy
@@ -136,33 +147,33 @@ after any `barrier`.
 
 ```rust,ignore
 ffibox::impl_cvtable! {
-    // SAFETY: libgit2 passes a stream's members the stream, first.
-    unsafe impl<W: StreamWriter> CVtable<W> for WriteStream {
-        base = ffi::git_writestream::default();
-        /// `git_writestream.write` over `StreamWriter::write`.
-        fn write(@stream, buffer: *const c_char, len: usize) -> c_int {
-            on panic: std::process::abort(),
-            on busy: busy().raise(),
-            |w: &mut W| returned(w.write(unsafe { bytes(buffer, len) })),
-        }
-        fn close(@stream) -> c_int {
-            on panic: std::process::abort(),
-            on busy: busy().raise(),
-            |w: &mut W| returned(w.close()),
-        }
-        release free;
+    // SAFETY: libgit2 passes a stream's members the stream, first, and calls
+    // `write`, `close` and `free` on every stream.
+    unsafe impl<W: StreamWriter> CVtable<W> for WriteStream {}
+    base = ffi::git_writestream::default();
+    /// `git_writestream.write` over `StreamWriter::write`.
+    fn write(@stream, buffer: *const c_char, len: usize) -> c_int {
+        on panic: std::process::abort(),
+        on busy: busy().raise(),
+        |w: &mut W| returned(w.write(unsafe { bytes(buffer, len) })),
     }
+    fn close(@stream) -> c_int {
+        on panic: std::process::abort(),
+        on busy: busy().raise(),
+        |w: &mut W| returned(w.close()),
+    }
+    release free;
 }
 
 let table = CTable::<WriteStream, W>::new(writer);
 ```
 
-- `unsafe impl<…> CVtable<S> for T` names the layout type `T` (a `CCell`,
-  from `define_ctype!`) and the state `S`; each generic takes one trait-path
-  bound. Its `SAFETY` comment states which argument C passes each slot its
-  table in.
-- `base = expr;`, optional, is the table before the slots are set; the
-  default is `Default::default()`.
+- `unsafe impl<…> CVtable<S> for T {}` names the layout type `T` (a
+  `CCell`, from `define_ctype!`, by a path with type arguments, if any) and
+  the state `S`; each generic takes one trait-path bound. It is emitted as
+  written, so its `SAFETY` comment is the binding's: which argument C passes
+  each slot its table in, and that no slot C calls is left NULL.
+- `base = expr;` is the table before the slots are set, written out.
 - `fn slot(…)` names the C field, then its C arguments in order, the table's
   marked `@name`; `name` is the table pointer inside the body. Only doc
   comments go before it.
@@ -187,11 +198,11 @@ follow; there is no primitive to add.
 
 | Obligation | Where |
 |------------|-------|
-| C passes each slot its table in the argument marked `@` | the `unsafe impl` in `impl_cvtable!`'s input |
+| C passes each slot its table in the argument marked `@`; `base` leaves NULL only slots C lets be NULL | the `unsafe impl CVtable` in `impl_cvtable!`'s input |
 | C calls each slot only with the table it read it from, while the table is live, and calls `release` once | the `unsafe` C call that lends (`as_c_ptr`) or surrenders (`into_c`) the table |
-| C uses the table on a thread other than `S`'s only if `S` allows it: `S: Send + Sync` for shared slots, which share `&S` and may drop `S` there as the last slot out of a deferred release, and `S: Send` for exclusive slots and the release | the same call; `CTable` itself is `Send` / `Sync` on `RwLock<S>`'s terms, and `T`'s |
+| C uses the table on a thread other than `S`'s only if `S` allows it: `S: Send + Sync` for shared slots, which share `&S` and may drop `S` there as the last slot out of a deferred release, and `S: Send` for exclusive slots and the release | `into_c` asks `S: Send + Sync`; otherwise `into_c_local`, and the C call a table lent through `as_c_ptr` or a handle method is passed to; `CTable` itself is `Send` / `Sync` on `RwLock<S>`'s terms, and `T`'s |
 | a table built from a base of the caller's chooses no slot `install` leaves | `CTable::with_base` |
-| `T`'s handles stay on their thread | `as_ref_local` / `as_mut_local` |
+| `T`'s handles are neither `Send` nor `Sync` | `unsafe impl CLocalHandles for T`, for `as_ref_local` / `as_mut_local` |
 | the policy of the owner a surrendered table is adopted into releases it through its `release` slot | that `from_c` |
 | no safe setter of `T`'s handles replaces a slot ffibox installed | `T`'s handles |
 | converting C's arguments, writing its out-parameters | each slot's body |

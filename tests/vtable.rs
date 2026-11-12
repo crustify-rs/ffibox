@@ -10,7 +10,7 @@ use core::ptr::{self, NonNull};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
-use ffibox::vtable::CTable;
+use ffibox::vtable::{CLocalHandles, CTable};
 use ffibox::{CMutSeam, CRefSeam, define_ctype, impl_cvtable};
 
 mod ffi {
@@ -30,6 +30,16 @@ mod ffi {
 }
 
 define_ctype!(Store, StoreRef, StoreMut, ffi::store);
+
+// SAFETY: `StoreRef` and `StoreMut` opt into neither `Send` nor `Sync`.
+unsafe impl CLocalHandles for Store {}
+
+/// Hand a table to the stand-in library, which calls back and releases it on
+/// the calling thread only.
+fn surrender<S: Backend + 'static>(table: CTable<Store, S>) -> NonNull<ffi::store> {
+    // SAFETY: as above: every slot and the release run on this thread.
+    unsafe { table.into_c_local() }
+}
 
 /// Stands in for the C library: it calls a table's slots with the table.
 mod lib {
@@ -87,40 +97,40 @@ const PANICKED: c_int = -100;
 const BUSY: c_int = -200;
 
 impl_cvtable! {
-    // SAFETY: the stand-in library passes each slot its table, `scan` last.
-    unsafe impl<B: Backend> CVtable<B> for Store {
-        base = base();
-        /// `store.get` over `Backend::get`, shared.
-        fn get(@table, k: c_int) -> c_int {
-            on panic: PANICKED,
-            on busy: BUSY,
-            |b: &B| {
-                b.on_get(table);
-                b.get(k)
-            },
-        }
-        /// `store.set` over `Backend::set`, exclusive.
-        fn set(@table, k: c_int, v: c_int) -> c_int {
-            on panic: PANICKED,
-            on busy: BUSY,
-            |b: &mut B| {
-                b.on_set(table);
-                b.set(k, v);
-                0
-            },
-        }
-        /// `store.scan`, the table last, writing an out-parameter.
-        fn scan(out: *mut c_int, @table) -> c_int {
-            on panic: PANICKED,
-            on busy: BUSY,
-            |b: &B| {
-                // SAFETY: C passes a writable slot.
-                unsafe { out.write(b.count()) };
-                0
-            },
-        }
-        release free;
+    // SAFETY: the stand-in library passes each slot its table, `scan` last,
+    // and calls only the slots declared here.
+    unsafe impl<B: Backend> CVtable<B> for Store {}
+    base = base();
+    /// `store.get` over `Backend::get`, shared.
+    fn get(@table, k: c_int) -> c_int {
+        on panic: PANICKED,
+        on busy: BUSY,
+        |b: &B| {
+            b.on_get(table);
+            b.get(k)
+        },
     }
+    /// `store.set` over `Backend::set`, exclusive.
+    fn set(@table, k: c_int, v: c_int) -> c_int {
+        on panic: PANICKED,
+        on busy: BUSY,
+        |b: &mut B| {
+            b.on_set(table);
+            b.set(k, v);
+            0
+        },
+    }
+    /// `store.scan`, the table last, writing an out-parameter.
+    fn scan(out: *mut c_int, @table) -> c_int {
+        on panic: PANICKED,
+        on busy: BUSY,
+        |b: &B| {
+            // SAFETY: C passes a writable slot.
+            unsafe { out.write(b.count()) };
+            0
+        },
+    }
+    release free;
 }
 
 /// A map backend that counts its drops.
@@ -173,7 +183,7 @@ fn base() -> ffi::store {
 fn slots_reach_the_state_and_keep_the_base() {
     let (map, drops) = Map::counted();
     let table = CTable::<Store, _>::new(map);
-    let p = table.into_c().as_ptr();
+    let p = surrender(table).as_ptr();
     // SAFETY: `p` is a live table C holds until its release.
     unsafe {
         assert_eq!(
@@ -265,7 +275,7 @@ fn a_panicking_slot_returns_its_declared_result() {
 fn release_reclaims_exactly_once_whoever_releases() {
     // C releases a surrendered table.
     let (map, drops) = Map::counted();
-    let p = CTable::<Store, _>::new(map).into_c().as_ptr();
+    let p = surrender(CTable::<Store, _>::new(map)).as_ptr();
     // SAFETY: C's table, released once.
     unsafe { lib::free(p) };
     assert_eq!(drops.get(), 1);
@@ -302,7 +312,7 @@ fn into_inner_and_from_c_hand_the_allocation_over() {
     let table = CTable::<Store, _>::new(map);
     // SAFETY: the owner's live table, lent.
     unsafe { lib::set(table.as_c_ptr(), 4, 40) };
-    let p = table.into_c();
+    let p = surrender(table);
     // SAFETY: from `into_c`; C has not released it and will not use it.
     let table = unsafe { CTable::<Store, Map>::from_c(p) };
     let map = table.into_inner();
@@ -316,11 +326,9 @@ fn into_inner_and_from_c_hand_the_allocation_over() {
 fn handles_designate_the_table() {
     let mut table = CTable::<Store, _>::new(Map::default());
     let p = table.as_c_ptr();
-    // SAFETY: `StoreRef` and `StoreMut` are neither `Send` nor `Sync`.
-    assert_eq!(unsafe { table.as_ref_local() }.as_ptr(), p.cast_const());
-    // SAFETY: as above.
-    assert_eq!(unsafe { table.as_mut_local() }.as_mut_ptr(), p);
-    assert_eq!(table.into_c().as_ptr(), p);
+    assert_eq!(table.as_ref_local().as_ptr(), p.cast_const());
+    assert_eq!(table.as_mut_local().as_mut_ptr(), p);
+    assert_eq!(surrender(table).as_ptr(), p);
     // SAFETY: C's table, released once.
     unsafe { lib::free(p) };
 }
@@ -463,14 +471,14 @@ fn reentry_follows_each_slots_receiver() {
 fn a_release_inside_a_slot_waits_for_it() {
     // From an exclusive slot.
     let (table, drops) = reentrant(0, 3);
-    let p = table.into_c().as_ptr();
+    let p = surrender(table).as_ptr();
     // SAFETY: C's live table; the slot releases it and then exits.
     assert_eq!(unsafe { lib::set(p, 0, 0) }, 0);
     assert_eq!(drops.get(), 1, "dropped once, when the slot exited");
 
     // From a shared slot.
     let (table, drops) = reentrant(3, 0);
-    let p = table.into_c().as_ptr();
+    let p = surrender(table).as_ptr();
     // SAFETY: as above.
     assert_eq!(unsafe { lib::get(p, 0) }, 1);
     assert_eq!(drops.get(), 1);
@@ -503,7 +511,7 @@ fn a_slot_after_a_release_inside_a_slot_is_refused() {
     let backend = Releasing {
         after: after.clone(),
     };
-    let p = CTable::<Store, _>::new(backend).into_c().as_ptr();
+    let p = surrender(CTable::<Store, _>::new(backend)).as_ptr();
     // SAFETY: C's live table.
     assert_eq!(unsafe { lib::set(p, 0, 0) }, 0);
     assert_eq!(after.get(), BUSY);
@@ -519,8 +527,7 @@ fn the_owners_shared_state_refuses_exclusive_slots_until_borrowed_mutably() {
         assert_eq!(lib::set(p, 1, 1), BUSY, "the owner may still hold `&S`");
         assert_eq!(lib::get(p, 1), -1, "shared slots still run");
     }
-    // SAFETY: `StoreMut` is neither `Send` nor `Sync`.
-    let _ = unsafe { table.as_mut_local() };
+    let _ = table.as_mut_local();
     // SAFETY: as above.
     assert_eq!(unsafe { lib::set(p, 1, 1) }, 0);
     let _ = table.state();
@@ -660,7 +667,7 @@ mod by_hand {
     use core::ffi::c_int;
 
     use ffibox::define_ctype;
-    use ffibox::vtable::{CTable, CVtable, Install};
+    use ffibox::vtable::{CSlots, CTable, CVtable, Install};
 
     #[repr(C)]
     #[derive(Default)]
@@ -686,19 +693,21 @@ mod by_hand {
         }
     }
 
-    // SAFETY: `bump` reaches the state only through `CTable::enter` on the
-    // table C passes it, and `free` is `CTable::release`; `base` has every
-    // slot NULL.
-    unsafe impl CVtable<c_int> for Counter {
+    impl CSlots<c_int> for Counter {
         fn base() -> counter {
             counter::default()
         }
 
-        fn install(table: &mut counter, _: Install) {
+        fn install<'a>(table: &'a mut counter, _: Install<'a, Self, c_int>) {
             table.bump = Some(bump);
             table.free = Some(CTable::<Counter, c_int>::release);
         }
     }
+
+    // SAFETY: `bump` reaches the state only through `CTable::enter` on the
+    // table C passes it, its only argument, and `free` is `CTable::release`;
+    // the stand-in library calls only those two.
+    unsafe impl CVtable<c_int> for Counter {}
 }
 
 #[test]
@@ -722,7 +731,7 @@ fn the_owner_follows_the_states_threads() {
 
 #[test]
 fn a_surrendered_table_is_adopted_by_its_owner_type() {
-    let p: NonNull<ffi::store> = CTable::<Store, _>::new(Map::default()).into_c();
+    let p: NonNull<ffi::store> = surrender(CTable::<Store, _>::new(Map::default()));
     // SAFETY: from `into_c`, unreleased and unused by C.
     let table = unsafe { CTable::<Store, Map>::from_c(p) };
     drop(table);
@@ -788,20 +797,20 @@ mod review {
 
     impl_cvtable! {
         // SAFETY: the stand-in library passes each slot its table first;
-        // `cmp`'s second argument is another table.
-        unsafe impl<G: Get> CVtable<G> for Ops {
-            fn get(@this) -> c_int {
-                on panic: -1,
-                on busy: -2,
-                |g: &G| g.get(),
-            }
-            fn cmp(@this, other: *mut ops) -> c_int {
-                on panic: -1,
-                on busy: -2,
-                |g: &G| c_int::from(core::ptr::eq(this, other)) * 100 + g.get(),
-            }
-            release free;
+        // `cmp`'s second argument is another table. `count` may be NULL.
+        unsafe impl<G: Get> CVtable<G> for Ops {}
+        base = ops::default();
+        fn get(@this) -> c_int {
+            on panic: -1,
+            on busy: -2,
+            |g: &G| g.get(),
         }
+        fn cmp(@this, other: *mut ops) -> c_int {
+            on panic: -1,
+            on busy: -2,
+            |g: &G| c_int::from(core::ptr::eq(this, other)) * 100 + g.get(),
+        }
+        release free;
     }
 }
 
@@ -951,7 +960,7 @@ fn a_lent_release_is_forgotten_when_the_table_is_surrendered() {
     let table = CTable::<Store, _>::new(map);
     // SAFETY: the owner's live table, lent; its release is deferred.
     unsafe { lib::free(table.as_c_ptr()) };
-    let p = table.into_c().as_ptr();
+    let p = surrender(table).as_ptr();
     assert_eq!(drops.get(), 0);
     // SAFETY: C's table now, live: slots run again.
     assert_eq!(unsafe { lib::get(p, 1) }, -1);
