@@ -1368,6 +1368,15 @@ unsafe impl<D: CDrop<c_char> + Sync> Sync for CStrBox<D> {}
 /// routine does more than free each element and then the array, the array
 /// is wrapped by hand.
 ///
+/// **Do not drop the elements a second time.** A wrapper that holds a `CVec`
+/// leaves the elements to it: a `Drop` impl of its own that drops them
+/// (`ptr::drop_in_place(v.as_mut_slice())`), or a policy whose `c_drop_len`
+/// frees them, releases each one twice. Up to ffibox 0.1.1 a `CVec` freed the
+/// buffer alone, and code written for that needed such a `Drop`; it still
+/// compiles, so the
+/// [CHANGELOG](https://github.com/crustify-rs/ffibox/blob/main/CHANGELOG.md)
+/// says how to migrate it.
+///
 /// **NULL with length 0 is a valid, empty `CVec`**, which C commonly returns
 /// for an empty array: adopt it with
 /// [`from_raw_parts_or_empty`](Self::from_raw_parts_or_empty), or make one with

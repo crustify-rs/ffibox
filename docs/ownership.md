@@ -74,7 +74,10 @@ not, the answer is a borrow instead — see
   `from_raw_parts` treats every NULL as failure.
 
   Dropping a `CVec` drops its elements, as a `Vec` does, so the element type
-  says what each slot owns:
+  says what each slot owns. A wrapper around a `CVec` therefore never drops
+  the elements itself: a `Drop` that does frees each one twice. Up to
+  ffibox 0.1.1 a `CVec` freed the buffer alone, and code written for that is
+  migrated as the [CHANGELOG](../CHANGELOG.md) describes.
 
   | C array | element type |
   |---------|--------------|

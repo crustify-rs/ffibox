@@ -97,6 +97,9 @@ When it is Rust's memory that C holds, calls or reads →
 | [patterns.md](docs/patterns.md) | C's iteration, error and callback conventions as Rust's iterators, `Result` and closures |
 | [hand-written.md](docs/hand-written.md) | the wrappers `define_ctype!` cannot express, and the owners no policy expresses |
 
+Upgrading? [CHANGELOG.md](CHANGELOG.md) says what each release changes, and
+how to migrate code that still compiles but behaves differently.
+
 ## Maintainers
 
 - Marius Momeu <marius.momeu@berkeley.edu>
