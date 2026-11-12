@@ -149,7 +149,7 @@ carries `PhantomData<*const ()>` instead (see
 `Foo` in the Macro column is any `CCell` layout type, `define_ctype!`'s or
 hand-written; one that carries a lifetime is written `Foo<'_>`, as **A layout
 type with a lifetime** below describes, in every macro but `impl_cdupclone!`
-and `impl_cguarded!`.
+and `impl_cguarded!`, which name it in a leading list: `<'r> P, Foo<'r>`.
 
 **Because the policy is a type parameter, an owner cannot exist without a
 destructor, and one C type can have several.** `CBox<Foo, FooFree>` next to
@@ -212,12 +212,13 @@ the routine, which a hand-written impl holds too.
 Teardown is unconditional: a gate that suppresses it on some paths folds into
 the routine itself.
 
-**A layout type with a lifetime.** A hand-written layout type that carries a
-lifetime, `Blob<'r>` over an object that keeps its repository, still takes its
-policies from the macros: `impl_cdrop!`, `impl_crefclone!` and
-`impl_cdispose!` accept it with the lifetime spelled `'_`, which the impl
-header turns into a parameter, so one policy serves `Blob<'r>` for every
-`'r`. A named lifetime (`Blob<'r>`) is undeclared there and does not compile.
+**A layout type with a lifetime.** A layout type that carries a lifetime,
+`Blob<'r>` over an object that keeps its repository, whether `define_ctype!`
+declares it or it is written by hand, takes its policies from the macros:
+`impl_cdrop!`, `impl_crefclone!` and `impl_cdispose!` accept it with the
+lifetime spelled `'_`, which the impl header turns into a parameter, so one
+policy serves `Blob<'r>` for every `'r`. A named lifetime (`Blob<'r>`) is
+undeclared there and does not compile.
 
 ```rust,ignore
 impl_cdrop!(BlobFree, Blob<'_>, ffi::blob_free);
@@ -226,13 +227,20 @@ impl_crefclone!(BlobFree, Blob<'_>, blob_up_ref, ok = |r| r == 0);
 pub type BlobArc<'r> = CArc<Blob<'r>, BlobFree>;
 ```
 
-Two macros do not take it. `impl_cdupclone!`'s `c_dup` returns the type, and a
-`'_` there elides to `&self`'s lifetime rather than the parameter's, so a deep
-copy over such a type is a hand-written `unsafe impl<'r> CDupClone<Foo<'r>>`.
-`impl_cguarded!` names the type in a struct and an associated type, where `'_`
-is not allowed, so that `CGuarded` is hand-written too. A layout type generic
-over a type, rather than a lifetime, has no elided form: all its policies are
-hand-written. [examples.md](examples.md#a-layout-type-with-a-lifetime--hand-written-ccell-macro-policies)
+Two macros take the lifetime named instead, in a list ahead of their
+arguments. `impl_cdupclone!`'s `c_dup` returns the type, and a `'_` there
+elides to `&self`'s lifetime rather than the parameter's; `impl_cguarded!`
+names the type in a struct and an associated type, where `'_` is not allowed.
+
+```rust,ignore
+impl_cdupclone!(<'r> BlobFree, Blob<'r>, ffi::blob_copy);
+impl_cguarded!(<'r> Cache<'r>, CacheLocked, lock = ffi::cache_lock, unlock = ffi::cache_unlock);
+// CacheLocked<'a, 'r>, the handle a held lock grants
+```
+
+A layout type generic over a type, rather than a lifetime, has no elided
+form: all its policies are hand-written.
+[examples.md](examples.md#a-layout-type-with-a-lifetime--define_ctype-with-phantom)
 shows the whole wrapper.
 
 **Runtime-state policies.** When teardown needs a value chosen at the wrapping

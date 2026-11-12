@@ -9,10 +9,11 @@
 //!
 //! The layout type is any [`CCell`](crate::CCell) type, `define_ctype!`'s or
 //! hand-written. One that carries a lifetime is written with it elided,
-//! `Blob<'_>`, which binds one policy for every lifetime, in every policy macro
-//! but [`impl_cdupclone!`](crate::impl_cdupclone) and
-//! [`impl_cguarded!`](crate::impl_cguarded), as
-//! [`impl_cdrop!`](crate::impl_cdrop) shows.
+//! `Blob<'_>`, which binds one policy for every lifetime, as
+//! [`impl_cdrop!`](crate::impl_cdrop) shows, in every policy macro but
+//! [`impl_cdupclone!`](crate::impl_cdupclone) and
+//! [`impl_cguarded!`](crate::impl_cguarded), which name it in a leading list
+//! instead: `impl_cdupclone!(<'r> BlobFree, Blob<'r>, blob_dup)`.
 //!
 //! Each policy macro takes outer attributes ahead of its arguments, a doc
 //! comment and a `#[doc(alias)]` among them, and puts them on the trait method
@@ -57,6 +58,9 @@
 ///
 /// ```ignore
 /// define_ctype!(Widget, WidgetRef, WidgetMut, ffi::widget_st);
+///
+/// // A layout type with a lifetime, carried by the `phantom` marker:
+/// define_ctype!(Reference<'r>, ReferenceRef, ReferenceMut, ffi::git_reference, phantom = &'r ());
 /// ```
 ///
 /// The names are spelled out because `macro_rules!` cannot concatenate
@@ -77,6 +81,97 @@
 /// The inbound half is also on `$name`, through [`CCell`](crate::CCell)
 /// (`ref_from_ptr`, `mut_from_ptr` and their twins). Never write an accessor
 /// on `$name`: a `&$name` covers the C object's bytes.
+///
+/// The macro implements no `Debug`, since what a handle prints is the
+/// wrapper's: implement it on `$rf`, from its getters, and on `$mt` through
+/// `as_ref()`.
+///
+/// # A layout type with a lifetime
+///
+/// A C object that keeps a pointer it does not own, to its parent or to a
+/// string the caller lent, lives no longer than what it points at, so its
+/// layout type carries that borrow as a lifetime. Name the lifetimes after the
+/// layout type, and give the type that carries them as `phantom`:
+///
+/// ```
+/// # #[repr(C)] pub struct repo_st { _opaque: [u8; 0] }
+/// # #[repr(C)] pub struct reference_st { repo: *mut repo_st }
+/// # pub struct Repo;
+/// ffibox::define_ctype!(
+///     /// A reference, borrowing its repository for `'r`.
+///     Reference<'r>, ReferenceRef, ReferenceMut, reference_st,
+///     phantom = &'r Repo
+/// );
+/// // SAFETY: a null repository pointer is valid; nothing here follows it.
+/// unsafe impl ffibox::CZeroable for Reference<'_> {}
+///
+/// fn read<'a, 'r>(r: ReferenceRef<'a, 'r>) -> ReferenceRef<'a, 'r> { r }
+/// let mut value = <Reference<'static> as ffibox::CZeroable>::zeroed();
+/// let m: ReferenceMut<'_, 'static> = value.as_mut();
+/// read(m.as_ref());
+/// ```
+///
+/// The handles take the lifetimes after the borrow's own:
+/// `ReferenceRef<'a, 'r>` and `ReferenceMut<'a, 'r>`, with `'r: 'a`. The rest
+/// is the expansion above, generic over `'r`: `CCell` for every
+/// `Reference<'r>`, the seams, `as_ref` / `as_mut`. It is the triple a
+/// wrapper writes by hand against [`CCell`](crate::CCell), and has its layout.
+///
+/// `phantom` sits in the marker beside the `*const ()` every `$name` carries,
+/// `PhantomData<(*const (), &'r Repo)>`, so it decides how `$name` varies in
+/// its lifetimes, and cannot make it `Send` or `Sync`:
+///
+/// - `&'r Parent`, `&'r CStr`, `&'r ()`: covariant, for an object that only
+///   reads what it borrows. An owner or a shared handle over a
+///   `Reference<'static>` shrinks to one over a `Reference<'r>`, as a
+///   `Box<&'static T>` does.
+/// - `fn(&'r T) -> &'r T`: invariant, for one whose state can store a
+///   `&'r T`. [`CGuarded`](crate::CGuarded) requires it of a type with a lock.
+///
+/// `$mt` is invariant in `$name<'r>`, and so in `'r`, whatever the marker:
+///
+/// ```compile_fail
+/// # #[repr(C)] pub struct holder_st { parent: *const u32 }
+/// ffibox::define_ctype!(Holder<'p>, HolderRef, HolderMut, holder_st, phantom = &'p u32);
+///
+/// // Would let a setter store a `'s` borrow the `'static` owner later reads.
+/// fn shrink<'a, 's>(m: HolderMut<'a, 'static>) -> HolderMut<'a, 's> {
+///     m
+/// }
+/// ```
+///
+/// and, as any `$mt`, it does not outlive the borrow it was made from:
+///
+/// ```compile_fail
+/// # #[repr(C)] pub struct holder_st { parent: *const u32 }
+/// ffibox::define_ctype!(Holder<'p>, HolderRef, HolderMut, holder_st, phantom = &'p u32);
+/// // SAFETY: a null parent is valid; nothing here follows it.
+/// unsafe impl ffibox::CZeroable for Holder<'_> {}
+///
+/// let m: HolderMut<'_, 'static> = {
+///     let mut value = <Holder<'static> as ffibox::CZeroable>::zeroed();
+///     value.as_mut() // borrows `value`, which ends here
+/// };
+/// ```
+///
+/// The layout type stays `!Send` / `!Sync` whatever `phantom` is, even over a
+/// C type that is `Send` alone:
+///
+/// ```compile_fail
+/// # #[repr(C)] pub struct opaque_st { _opaque: [u8; 0] }
+/// ffibox::define_ctype!(Opaque<'p>, OpaqueRef, OpaqueMut, opaque_st, phantom = &'p ());
+/// fn send<T: Send>() {}
+/// send::<Opaque<'static>>();
+/// ```
+///
+/// The lifetimes are lifetimes only, at least one, and none named `'a`, which
+/// the handles take for the borrow. A layout type generic over a type is
+/// written by hand, as
+/// [docs/hand-written.md](https://github.com/crustify-rs/ffibox/blob/main/docs/hand-written.md)
+/// describes. The policy macros take the type as `Reference<'_>`, or, in
+/// [`impl_cdupclone!`](crate::impl_cdupclone) and
+/// [`impl_cguarded!`](crate::impl_cguarded), with the lifetime named in a
+/// leading list, `<'r> …, Reference<'r>`.
 ///
 /// # Values Rust owns
 ///
@@ -113,6 +208,9 @@
 /// unsafe impl Sync for FooRef<'_> {}
 /// unsafe impl Sync for FooMut<'_> {}
 /// ```
+///
+/// Over a layout type with a lifetime, the lines name it elided:
+/// `unsafe impl Send for Foo<'_> {}`, `unsafe impl Sync for FooRef<'_, '_> {}`.
 ///
 /// The owners and run views follow from `Foo` and their policy; the handles
 /// need their own lines because `where Foo: Sync` on a concrete type is a trivial bound,
@@ -183,47 +281,54 @@
 /// # Safety
 ///
 /// The macro is safe to invoke but emits an `unsafe impl`. You assert that
-/// `$c_type` is the C type `$name` mirrors. All-zero validity is a separate
-/// claim, made by an `unsafe impl` of [`CZeroable`](crate::CZeroable).
+/// `$c_type` is the C type `$name` mirrors, and, with lifetimes, that
+/// `phantom` carries each borrow the C object keeps, with the variance its
+/// state allows. All-zero validity is a separate claim, made by an
+/// `unsafe impl` of [`CZeroable`](crate::CZeroable).
 #[macro_export]
 macro_rules! define_ctype {
-    ($(#[$attr:meta])* $name:ident, $rf:ident, $mt:ident, $c_type:ty) => {
+    (
+        @impl [$(#[$attr:meta])*] $name:ident [$($lt:lifetime),*],
+        $rf:ident, $mt:ident, $c_type:ty, $marker:ty
+    ) => {
         $(#[$attr])*
         #[repr(transparent)]
-        pub struct $name($c_type, ::core::marker::PhantomData<*const ()>);
+        pub struct $name<$($lt),*>($c_type, ::core::marker::PhantomData<$marker>);
 
         #[doc = concat!("Shared borrow of a [`", stringify!($name), "`]. `Copy`, like `&T`; the getters live here.")]
         #[repr(transparent)]
         #[derive(Clone, Copy)]
-        pub struct $rf<'a>($crate::CBorrowedPtr<'a, $name>);
+        pub struct $rf<'a, $($lt),*>($crate::CBorrowedPtr<'a, $name<$($lt),*>>);
 
         #[doc = concat!("Exclusive borrow of a [`", stringify!($name), "`]. Reaches the getters with [`as_ref`](Self::as_ref); the setters live here.")]
         #[repr(transparent)]
-        pub struct $mt<'a>(
-            $rf<'a>,
+        pub struct $mt<'a, $($lt),*>(
+            $rf<'a, $($lt),*>,
             // Invariant in the pointee, as `&'a mut` is; see `CCell`'s contract.
-            ::core::marker::PhantomData<&'a mut $name>,
+            ::core::marker::PhantomData<&'a mut $name<$($lt),*>>,
         );
 
-        // SAFETY: `$name` is `#[repr(transparent)]` over `$c_type`; the
-        // handles are transparent over `CBorrowedPtr<'a, $name>` and expose no
-        // reference to `$name`; `$rf` has no write operation.
-        unsafe impl $crate::CCell for $name {
+        // SAFETY: `$name` is `#[repr(transparent)]` over `$c_type`, its marker
+        // zero-sized; the handles are transparent over `CBorrowedPtr<'a, $name>`
+        // (`$mt` through `$rf`) with zero-sized markers and no `Drop`, expose no
+        // reference to `$name`, and `$mt` is invariant in `$name` through its
+        // marker; `$rf` has no write operation.
+        unsafe impl<$($lt),*> $crate::CCell for $name<$($lt),*> {
             type C = $c_type;
-            type Ref<'a> = $rf<'a>;
-            type Mut<'a> = $mt<'a>;
+            type Ref<'a> = $rf<'a, $($lt),*> where Self: 'a;
+            type Mut<'a> = $mt<'a, $($lt),*> where Self: 'a;
         }
 
         // The handles' seams, public to every crate that names the handles.
-        impl<'a> $crate::CRefSeam<'a> for $rf<'a> {
-            type Cell = $name;
+        impl<'a, $($lt: 'a),*> $crate::CRefSeam<'a> for $rf<'a, $($lt),*> {
+            type Cell = $name<$($lt),*>;
         }
 
-        impl<'a> $crate::CMutSeam<'a> for $mt<'a> {
-            type Cell = $name;
+        impl<'a, $($lt: 'a),*> $crate::CMutSeam<'a> for $mt<'a, $($lt),*> {
+            type Cell = $name<$($lt),*>;
         }
 
-        impl $name {
+        impl<$($lt),*> $name<$($lt),*> {
             /// Shared handle to this value — the getters.
             ///
             /// Takes `&self`, a reference covering the C struct's bytes, which
@@ -233,7 +338,7 @@ macro_rules! define_ctype {
             /// [`define_ctype!`](crate::define_ctype) — "Values Rust owns".
             #[inline]
             #[must_use]
-            pub fn as_ref(&self) -> $rf<'_> {
+            pub fn as_ref(&self) -> $rf<'_, $($lt),*> {
                 // SAFETY: `self` is a live, initialised `$name` borrowed for
                 // the handle's lifetime.
                 $rf(unsafe { $crate::CBorrowedPtr::new(::core::ptr::NonNull::from(self)) })
@@ -243,7 +348,7 @@ macro_rules! define_ctype {
             /// for C calls that write it.
             #[inline]
             #[must_use]
-            pub fn as_mut(&mut self) -> $mt<'_> {
+            pub fn as_mut(&mut self) -> $mt<'_, $($lt),*> {
                 // SAFETY: as `as_ref`, from an exclusive borrow, so the
                 // pointer carries write provenance and no other handle exists.
                 $mt(
@@ -253,12 +358,12 @@ macro_rules! define_ctype {
             }
         }
 
-        impl<'a> $mt<'a> {
+        impl<'a, $($lt),*> $mt<'a, $($lt),*> {
             /// Reborrow shared, for passing where a getter-only handle is
             /// wanted.
             #[inline]
             #[must_use]
-            pub fn as_ref(&self) -> $rf<'_> {
+            pub fn as_ref(&self) -> $rf<'_, $($lt),*> {
                 self.0
             }
 
@@ -267,11 +372,21 @@ macro_rules! define_ctype {
             /// implicitly. This handle is frozen while the result lives.
             #[inline]
             #[must_use]
-            pub fn as_mut(&mut self) -> $mt<'_> {
+            pub fn as_mut(&mut self) -> $mt<'_, $($lt),*> {
                 $mt(self.0, ::core::marker::PhantomData)
             }
         }
-
+    };
+    ($(#[$attr:meta])* $name:ident, $rf:ident, $mt:ident, $c_type:ty) => {
+        $crate::define_ctype!(@impl [$(#[$attr])*] $name [], $rf, $mt, $c_type, *const ());
+    };
+    (
+        $(#[$attr:meta])* $name:ident<$($lt:lifetime),+>, $rf:ident, $mt:ident, $c_type:ty,
+        phantom = $phantom:ty $(,)?
+    ) => {
+        $crate::define_ctype!(
+            @impl [$(#[$attr])*] $name [$($lt),+], $rf, $mt, $c_type, (*const (), $phantom)
+        );
     };
 }
 
@@ -337,9 +452,10 @@ macro_rules! define_ctype {
 ///
 /// # A layout type with a lifetime
 ///
-/// A layout type written by hand against [`CCell`](crate::CCell) may carry a
-/// lifetime, as one over an object that keeps a pointer to its parent does.
-/// Spell it `'_`: the impl header makes it a parameter, so the one policy
+/// A layout type may carry a lifetime, as one over an object that keeps a
+/// pointer to its parent does, whether [`define_ctype!`](crate::define_ctype)
+/// declares it or it is written by hand against [`CCell`](crate::CCell), as
+/// here. Spell it `'_`: the impl header makes it a parameter, so the one policy
 /// releases `Holder<'p>` for every `'p`, and [`CBox`](crate::CBox) and
 /// [`CArc`](crate::CArc) over any of them take it.
 /// [`impl_crefclone!`](crate::impl_crefclone) and
@@ -396,7 +512,8 @@ macro_rules! define_ctype {
 /// ffibox::impl_cdrop!(HolderFree, Holder<'p>, holder_free); // `'_`, not `'p`
 /// ```
 ///
-/// A deep copy is the exception: see [`impl_cdupclone!`](crate::impl_cdupclone).
+/// A deep copy names the lifetime instead, `<'p> HolderFree, Holder<'p>`: see
+/// [`impl_cdupclone!`](crate::impl_cdupclone).
 ///
 /// # Safety
 ///
@@ -458,11 +575,32 @@ macro_rules! impl_cdrop_str {
 /// As in [`impl_cdrop!`](crate::impl_cdrop), the routine is called with a
 /// `*mut <T as CCell>::C` and must return the same pointer type.
 ///
-/// Unlike [`impl_cdrop!`](crate::impl_cdrop), it does not take a layout type
-/// with an elided lifetime: `c_dup` returns the type, and a `'_` in its return
-/// type elides to `&self`'s lifetime, not the impl's, so the method no longer
-/// matches the trait. Write that policy by hand, naming the lifetime:
-/// `unsafe impl<'p> CDupClone<Holder<'p>> for HolderFree`.
+/// # A layout type with a lifetime
+///
+/// Name the lifetime, in a list ahead of the policy, rather than eliding it
+/// as [`impl_cdrop!`](crate::impl_cdrop) does:
+///
+/// ```no_run
+/// # use ffibox::CBox;
+/// # #[repr(C)] pub struct holder_st { parent: *const u32 }
+/// # unsafe fn holder_free(_: *mut holder_st) {}
+/// # unsafe fn holder_dup(p: *mut holder_st) -> *mut holder_st { p }
+/// ffibox::define_ctype!(Holder<'p>, HolderRef, HolderMut, holder_st, phantom = &'p u32);
+///
+/// #[derive(Clone, Copy, Debug, Default)]
+/// pub struct HolderFree;
+/// ffibox::impl_cdrop!(HolderFree, Holder<'_>, holder_free);
+/// ffibox::impl_cdupclone!(<'p> HolderFree, Holder<'p>, holder_dup);
+/// // unsafe impl<'p> CDupClone<Holder<'p>> for HolderFree { … }
+///
+/// fn copy<'p>(b: &CBox<Holder<'p>, HolderFree>) -> CBox<Holder<'p>, HolderFree> {
+///     b.clone()
+/// }
+/// ```
+///
+/// The elided form does not compile here: `c_dup` returns the type, and a
+/// `'_` in its return type elides to `&self`'s lifetime, not the impl's, so
+/// the method no longer matches the trait.
 ///
 /// ```compile_fail
 /// # use core::marker::PhantomData;
@@ -483,7 +621,7 @@ macro_rules! impl_cdrop_str {
 /// # }
 /// pub struct HolderFree;
 /// ffibox::impl_cdrop!(HolderFree, Holder<'_>, holder_free);     // compiles
-/// ffibox::impl_cdupclone!(HolderFree, Holder<'_>, holder_dup);  // does not
+/// ffibox::impl_cdupclone!(HolderFree, Holder<'_>, holder_dup);  // does not: `<'p> …, Holder<'p>`
 /// ```
 ///
 /// # Safety
@@ -494,10 +632,10 @@ macro_rules! impl_cdrop_str {
 /// NULL on failure.
 #[macro_export]
 macro_rules! impl_cdupclone {
-    (@impl [$(#[$attr:meta])*] $policy:ty, $t:ty, $c:ty, $f:path) => {
+    (@impl [$(#[$attr:meta])*] [$($lt:lifetime),*] $policy:ty, $t:ty, $c:ty, $f:path) => {
         // SAFETY: the invoker asserts `$f` returns a fresh, independent copy
         // of a live `$c`, or NULL, that the policy's `c_drop` releases.
-        unsafe impl $crate::CDupClone<$t> for $policy {
+        unsafe impl<$($lt),*> $crate::CDupClone<$t> for $policy {
             $(#[$attr])*
             #[inline]
             #[allow(unused_unsafe)]
@@ -512,8 +650,13 @@ macro_rules! impl_cdupclone {
             }
         }
     };
+    ($(#[$attr:meta])* <$($lt:lifetime),+> $policy:ty, $t:ty, $f:path) => {
+        $crate::impl_cdupclone!(
+            @impl [$(#[$attr])*] [$($lt),+] $policy, $t, <$t as $crate::CCell>::C, $f
+        );
+    };
     ($(#[$attr:meta])* $policy:ty, $t:ty, $f:path) => {
-        $crate::impl_cdupclone!(@impl [$(#[$attr])*] $policy, $t, <$t as $crate::CCell>::C, $f);
+        $crate::impl_cdupclone!(@impl [$(#[$attr])*] [] $policy, $t, <$t as $crate::CCell>::C, $f);
     };
 }
 
@@ -527,7 +670,7 @@ macro_rules! impl_cdupclone {
 macro_rules! impl_cdupclone_str {
     ($(#[$attr:meta])* $policy:ty, $f:path) => {
         $crate::impl_cdupclone!(
-            @impl [$(#[$attr])*] $policy, ::core::ffi::c_char, ::core::ffi::c_char, $f
+            @impl [$(#[$attr])*] [] $policy, ::core::ffi::c_char, ::core::ffi::c_char, $f
         );
     };
 }
@@ -694,10 +837,18 @@ pub unsafe fn __handle_ref<'a, T: crate::CCell + 'a>(p: ::core::ptr::NonNull<T>)
 /// impl_cguarded!(Registry, all, lock = registry_lock, unlock = registry_unlock, ok = |r| r == 0);
 /// ```
 ///
-/// Neither form takes a layout type with a lifetime, `Foo<'_>`, as the
-/// policy macros do: the type is named in the generated handle and in
-/// `Locked`, where `'_` is not allowed. Its [`CGuarded`](crate::CGuarded) is
-/// written by hand.
+/// A layout type with a lifetime is named with it, in a list ahead of the
+/// type, rather than elided as the policy macros take it: the type is named
+/// in the generated handle and in `Locked`, where `'_` is not allowed. The
+/// handle takes the lifetimes after its borrow's, `FooLocked<'a, 'x>`, as
+/// [`define_ctype!`](crate::define_ctype)'s handles do. `CGuarded`'s contract
+/// makes such a type invariant in them, through an invariant `phantom`:
+///
+/// ```ignore
+/// define_ctype!(Cache<'x>, CacheRef, CacheMut, ffi::cache_st, phantom = fn(&'x T) -> &'x T);
+/// impl_cguarded!(<'x> Cache<'x>, CacheLocked, lock = ffi::cache_lock, unlock = ffi::cache_unlock);
+/// impl_cguarded!(<'x> Registry<'x>, all, lock = registry_lock, unlock = registry_unlock);
+/// ```
 ///
 /// Without `ok`, `lock` must return `()`. A status the macro discarded would
 /// be a failed lock reported as held — and a lock backed by
@@ -727,24 +878,18 @@ pub unsafe fn __handle_ref<'a, T: crate::CCell + 'a>(p: ::core::ptr::NonNull<T>)
 /// object's state without the lock.
 #[macro_export]
 macro_rules! impl_cguarded {
-    (
-        $t:ty, all, lock = $lock:path, unlock = $unlock:path
-        $(, ok = $ok:expr)? $(,)?
-    ) => {
+    (@all [$($lt:lifetime),*] $t:ty, $lock:path, $unlock:path, $check:tt) => {
         $crate::impl_cguarded!(
-            @impl $t, [<$t as $crate::CCell>::Mut<'a>], LockWhole, $lock, $unlock, [$($ok)?]
+            @impl [$($lt),*] $t, [<$t as $crate::CCell>::Mut<'a>], LockWhole, $lock, $unlock, $check
         );
         // SAFETY: the invoker asserts `CGuardedAll`'s contract; `Locked` is
         // `Mut` and `Scope` is `LockWhole` above.
-        unsafe impl $crate::CGuardedAll for $t {}
+        unsafe impl<$($lt),*> $crate::CGuardedAll for $t {}
     };
-    (
-        $t:ty, $lk:ident, lock = $lock:path, unlock = $unlock:path
-        $(, ok = $ok:expr)? $(,)?
-    ) => {
+    (@named [$($lt:lifetime),*] $t:ty, $lk:ident, $lock:path, $unlock:path, $check:tt) => {
         #[doc = concat!("Exclusive borrow of a [`", stringify!($t), "`] under its lock, from a held [`CGuard`](", stringify!($crate), "::CGuard). The state the lock protects is reached here.")]
         #[repr(transparent)]
-        pub struct $lk<'a>(
+        pub struct $lk<'a, $($lt),*>(
             $crate::CBorrowedPtr<'a, $t>,
             // Invariant in the pointee, as `&'a mut` is; see `CGuarded`'s contract.
             ::core::marker::PhantomData<&'a mut $t>,
@@ -752,11 +897,11 @@ macro_rules! impl_cguarded {
 
         // The locked handle's seam (`as_mut_ptr`), public to every crate
         // that names the handle.
-        impl<'a> $crate::CLockedSeam<'a> for $lk<'a> {
+        impl<'a, $($lt: 'a),*> $crate::CLockedSeam<'a> for $lk<'a, $($lt),*> {
             type Cell = $t;
         }
 
-        impl<'a> $lk<'a> {
+        impl<'a, $($lt),*> $lk<'a, $($lt),*> {
             /// Reborrow shared, for the getters that need no lock.
             #[inline]
             #[must_use]
@@ -771,20 +916,25 @@ macro_rules! impl_cguarded {
             /// while the result lives.
             #[inline]
             #[must_use]
-            pub fn as_locked(&mut self) -> $lk<'_> {
+            pub fn as_locked(&mut self) -> $lk<'_, $($lt),*> {
                 $lk(self.0, ::core::marker::PhantomData)
             }
         }
 
-        $crate::impl_cguarded!(@impl $t, [$lk<'a>], LockFields, $lock, $unlock, [$($ok)?]);
+        $crate::impl_cguarded!(
+            @impl [$($lt),*] $t, [$lk<'a, $($lt),*>], LockFields, $lock, $unlock, $check
+        );
     };
     // `$check` is one bracketed token tree, matched by the helper whatever
     // `ok` was given or omitted.
-    (@impl $t:ty, [$($locked:tt)*], $scope:ident, $lock:path, $unlock:path, $check:tt) => {
+    (
+        @impl [$($lt:lifetime),*] $t:ty, [$($locked:tt)*], $scope:ident,
+        $lock:path, $unlock:path, $check:tt
+    ) => {
         // SAFETY: the invoker asserts `CGuarded`'s contract for these
         // routines; the `Locked` handle is transparent over `CBorrowedPtr`
         // and invariant, as generated above or as the `Mut` handle is.
-        unsafe impl $crate::CGuarded for $t {
+        unsafe impl<$($lt),*> $crate::CGuarded for $t {
             type Locked<'a> = $($locked)* where Self: 'a;
             type Scope = $crate::$scope;
 
@@ -804,6 +954,31 @@ macro_rules! impl_cguarded {
                 let _ = unsafe { $unlock(raw) };
             }
         }
+    };
+    // A leading lifetime list declares the lifetimes `$t` names.
+    (
+        <$($lt:lifetime),+> $t:ty, all, lock = $lock:path, unlock = $unlock:path
+        $(, ok = $ok:expr)? $(,)?
+    ) => {
+        $crate::impl_cguarded!(@all [$($lt),+] $t, $lock, $unlock, [$($ok)?]);
+    };
+    (
+        <$($lt:lifetime),+> $t:ty, $lk:ident, lock = $lock:path, unlock = $unlock:path
+        $(, ok = $ok:expr)? $(,)?
+    ) => {
+        $crate::impl_cguarded!(@named [$($lt),+] $t, $lk, $lock, $unlock, [$($ok)?]);
+    };
+    (
+        $t:ty, all, lock = $lock:path, unlock = $unlock:path
+        $(, ok = $ok:expr)? $(,)?
+    ) => {
+        $crate::impl_cguarded!(@all [] $t, $lock, $unlock, [$($ok)?]);
+    };
+    (
+        $t:ty, $lk:ident, lock = $lock:path, unlock = $unlock:path
+        $(, ok = $ok:expr)? $(,)?
+    ) => {
+        $crate::impl_cguarded!(@named [] $t, $lk, $lock, $unlock, [$($ok)?]);
     };
 }
 

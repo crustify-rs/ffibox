@@ -4,9 +4,10 @@
     clippy::undocumented_unsafe_blocks,
     clippy::missing_safety_doc
 )]
-//! `define_ctype!` covers only the trivial base case; lifetime- and
-//! type-generic newtypes are written by hand against `CCell` (native Rust
-//! generics, no macro arm). These tests guard that hand-written path: the
+//! `define_ctype!` covers the base case and lifetime parameters; type-generic
+//! newtypes are written by hand against `CCell` (native Rust generics, no
+//! macro arm), and a lifetime-carrying one still may be. These tests guard
+//! that hand-written path: the
 //! wrapper supplies `type C` plus its own two handle types and the constructors
 //! that build them, and the layout stays `#[repr(transparent)]` throughout.
 //!

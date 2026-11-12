@@ -1,29 +1,29 @@
-//! The policy macros over a layout type that carries a lifetime.
+//! The policy macros over a hand-written layout type that carries a lifetime.
 //!
-//! `define_ctype!` mints no such type: it is written by hand against `CCell`,
-//! as `manual_wrappers.rs` does. Its policies need not be: `impl_cdrop!`,
-//! `impl_crefclone!` and `impl_cdispose!` take the type with its lifetime
-//! spelled `'_`, which the impl header turns into a parameter, so one policy
-//! serves `Holder<'r>` for every `'r`. These tests bind each of them so, and
-//! drive the owners over a holder borrowing a local, so a non-`'static`
-//! lifetime.
+//! `define_ctype!` declares such a type too (`tests/lifetime_ctypes.rs`); one
+//! written by hand against `CCell`, as `manual_wrappers.rs` does, takes the
+//! same policies. `impl_cdrop!`, `impl_crefclone!` and `impl_cdispose!` take
+//! the type with its lifetime spelled `'_`, which the impl header turns into a
+//! parameter, so one policy serves `Holder<'r>` for every `'r`. These tests
+//! bind each of them so, and drive the owners over a holder borrowing a local,
+//! so a non-`'static` lifetime.
 //!
-//! `impl_cdupclone!` is the exception: its `c_dup` returns the type, and a
-//! `'_` in return position elides to `&self`'s lifetime instead, so the
-//! signature no longer matches the trait. A deep copy over such a type is
-//! hand-written, as the last policy here is; `impl_cdupclone!`'s rustdoc
-//! carries the `compile_fail` that shows the macro's refusal.
+//! `impl_cdupclone!` names the lifetime instead, in a leading `<'p>` list: its
+//! `c_dup` returns the type, and a `'_` in return position elides to `&self`'s
+//! lifetime, so the signature would no longer match the trait.
+//! `impl_cdupclone!`'s rustdoc carries the `compile_fail` that shows the
+//! elided form's refusal.
 
 #![allow(non_camel_case_types, missing_docs)]
 
 use core::ffi::c_int;
 use core::marker::PhantomData;
-use core::ptr::{self, NonNull};
+use core::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use ffibox::{
-    CArc, CBorrowedPtr, CBox, CCell, CDupClone, CRefSeam, CVal, impl_cdispose, impl_cdrop,
+    CArc, CBorrowedPtr, CBox, CCell, CRefSeam, CVal, impl_cdispose, impl_cdrop, impl_cdupclone,
     impl_crefclone,
 };
 
@@ -210,23 +210,23 @@ impl_crefclone!(
 pub struct HolderDispose;
 impl_cdispose!(HolderDispose, Holder<'_>, holder_dispose);
 
-/// A deep copy over a lifetime-carrying type: hand-written, since
-/// `impl_cdupclone!` cannot take `Holder<'_>`. Named lifetime, both sides.
+/// A deep copy over a lifetime-carrying type, the lifetime named in the
+/// macro's leading list.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HolderCopy;
 impl_cdrop!(HolderCopy, Holder<'_>, holder_free);
+impl_cdupclone!(<'p> HolderCopy, Holder<'p>, holder_copy);
 
-// SAFETY: the copy is a fresh `Box` allocation with its own count of 1, which
-// `holder_free` releases; the original is only read.
-unsafe impl<'p> CDupClone<Holder<'p>> for HolderCopy {
-    unsafe fn c_dup(&self, ptr: NonNull<Holder<'p>>) -> Option<NonNull<Holder<'p>>> {
-        DUPS.fetch_add(1, Ordering::SeqCst);
-        let src: *mut holder_st = ptr.as_ptr().cast();
-        // SAFETY: per `c_dup`'s contract, `src` is a live holder.
-        let parent = unsafe { (*src).parent };
-        let copy = Box::into_raw(Box::new(holder_st { rc: 1, parent }));
-        NonNull::new(copy.cast())
-    }
+/// A fresh holder of the same parent, with its own count of 1.
+///
+/// # Safety
+///
+/// `src` is a live holder, which is only read.
+unsafe fn holder_copy(src: *mut holder_st) -> *mut holder_st {
+    DUPS.fetch_add(1, Ordering::SeqCst);
+    // SAFETY: the caller hands a live holder.
+    let parent = unsafe { (*src).parent };
+    Box::into_raw(Box::new(holder_st { rc: 1, parent }))
 }
 
 fn reset() {
@@ -291,7 +291,7 @@ fn impl_cdispose_disposes_an_inline_lifetime_carrying_value() {
 }
 
 #[test]
-fn a_hand_written_dupclone_clones_a_box_of_a_lifetime_carrying_type() {
+fn impl_cdupclone_clones_a_box_of_a_lifetime_carrying_type() {
     let _g = lock();
     reset();
     let parent = 5_u32;

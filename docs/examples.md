@@ -377,19 +377,18 @@ let s = unsafe { LibStr::from_raw(sys::lib_name()) }.unwrap();
 assert_eq!(s.to_str(), Ok("name"));
 ```
 
-## A layout type with a lifetime — hand-written `CCell`, macro policies
+## A layout type with a lifetime — `define_ctype!` with `phantom`
 
 A C object that keeps a pointer to its parent, as a blob keeps its
 repository, lives no longer than the parent: its layout type carries the
-parent's borrow. `define_ctype!` mints no such type, so the layout type, its
-handles and their seams are written against `CCell`; its policies still come
-from the macros, with the lifetime spelled `'_`.
+parent's borrow. `define_ctype!` takes the lifetime after the type's name and
+the marker that carries it as `phantom`; the handles are `BlobRef<'a, 'r>` and
+`BlobMut<'a, 'r>`. The policies come from the macros, with the lifetime
+spelled `'_`, or named in a leading list where the macro needs it.
 
 ```rust,no_run
-use core::{ffi::c_int, marker::PhantomData, ptr};
-use ffibox::{
-    define_ctype, impl_cdrop, impl_crefclone, CArc, CBorrowedPtr, CBox, CCell, CRefSeam,
-};
+use core::{ffi::c_int, ptr};
+use ffibox::{define_ctype, impl_cdrop, impl_crefclone, CArc, CBox, CRefSeam};
 
 mod sys {
     use core::ffi::c_int;
@@ -412,28 +411,9 @@ define_ctype!(Repo, RepoRef, RepoMut, sys::repo_st);
 pub struct RepoFree;
 impl_cdrop!(RepoFree, Repo, sys::repo_free);
 
-// The layout type and its handles, by hand: `'r` is the repository's borrow.
-#[repr(transparent)]
-pub struct Blob<'r>(sys::blob_st, PhantomData<(*const (), &'r Repo)>);
-#[repr(transparent)]
-pub struct BlobRef<'a, 'r>(CBorrowedPtr<'a, Blob<'r>>);
-impl Clone for BlobRef<'_, '_> {
-    fn clone(&self) -> Self { *self }
-}
-impl Copy for BlobRef<'_, '_> {}
-#[repr(transparent)]
-pub struct BlobMut<'a, 'r>(BlobRef<'a, 'r>, PhantomData<&'a mut Blob<'r>>);
-// SAFETY: `Blob` is transparent over `blob_st`; both handles are transparent
-// over `CBorrowedPtr<'a, Blob<'r>>`, have no `Drop` and lend no `&Blob`;
-// `BlobMut` is invariant through its marker, and `BlobRef` writes nothing.
-unsafe impl<'r> CCell for Blob<'r> {
-    type C = sys::blob_st;
-    type Ref<'a> = BlobRef<'a, 'r> where Self: 'a;
-    type Mut<'a> = BlobMut<'a, 'r> where Self: 'a;
-}
-impl<'a, 'r> CRefSeam<'a> for BlobRef<'a, 'r> {
-    type Cell = Blob<'r>;
-}
+// `'r` is the repository's borrow; the blob only reads through it, so the
+// marker is covariant, and `Blob` stays `!Send` / `!Sync` as every one does.
+define_ctype!(Blob<'r>, BlobRef, BlobMut, sys::blob_st, phantom = &'r Repo);
 
 // The policies, by the macros: `Blob<'_>` is one impl for every `'r`.
 // `blob_dup` answers through an out-parameter, so a private adapter gives it
@@ -486,6 +466,9 @@ let n = again.as_ref().content().len();
 // `drop(repo)` here would not compile: both blobs borrow it.
 ```
 
-`impl_cdupclone!` and `impl_cguarded!` do not take `Blob<'_>`: a deep copy
-over such a type is an `unsafe impl<'r> CDupClone<Blob<'r>> for P`, and a C
-lock an `unsafe impl<'r> CGuarded for Blob<'r>`, both written by hand.
+`impl_cdupclone!` and `impl_cguarded!` name the lifetime rather than elide
+it, in a list ahead of their arguments: a deep copy over such a type is
+`impl_cdupclone!(<'r> P, Blob<'r>, blob_copy)`, and a C lock
+`impl_cguarded!(<'r> Blob<'r>, BlobLocked, lock = …, unlock = …)`, whose
+handle is `BlobLocked<'a, 'r>`. A layout type generic over a type is still
+written by hand, as [hand-written.md](hand-written.md) describes.

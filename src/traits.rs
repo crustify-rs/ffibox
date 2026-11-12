@@ -99,9 +99,9 @@ pub unsafe trait CDrop<T> {
 /// owner of its object; a refcount bump is [`CRefClone`], which `CBox` never
 /// uses.
 ///
-/// [`impl_cdupclone!`](crate::impl_cdupclone) binds a C routine, but not over
-/// a layout type with a lifetime: that impl is written by hand, naming it,
-/// `unsafe impl<'r> CDupClone<Foo<'r>> for FooFree`.
+/// [`impl_cdupclone!`](crate::impl_cdupclone) binds a C routine, over a
+/// layout type with a lifetime naming it in a leading list,
+/// `impl_cdupclone!(<'r> FooFree, Foo<'r>, ffi::foo_dup)`.
 ///
 /// # Safety
 ///
@@ -224,8 +224,9 @@ pub unsafe trait CRefClone<T>: CDrop<T> {
 ///   a Rust type with a `Mutex` field is. A [`CArc`] is covariant like `Arc`,
 ///   so a clone of a `CArc<Foo<'static>>` could otherwise shrink to
 ///   `Foo<'short>` and store a `'short` borrow through its locked handle for
-///   the `'static` original to read. A type with no parameters, as
-///   [`define_ctype!`](crate::define_ctype) generates, meets this trivially.
+///   the `'static` original to read. A type with no parameters meets this
+///   trivially; a [`define_ctype!`](crate::define_ctype) type with lifetimes
+///   meets it through an invariant `phantom`, `fn(&'x T) -> &'x T`.
 /// - A [`CDupClone`] policy for `Self` takes this lock itself around the
 ///   protected state it copies: [`CArc::make_mut`] copies through a shared
 ///   reference while other clones may hold the lock.
@@ -746,10 +747,10 @@ pub unsafe trait CLenAlloc: CLenDrop {
 /// sound — `&FooRef` covers one pointer of Rust stack where `&Foo` would
 /// cover the C object.
 ///
-/// Implemented by [`define_ctype!`](crate::define_ctype) for the trivial base
-/// case, or by hand for lifetime- / type-generic newtypes. A newtype generic
-/// over a lifetime alone still takes most of its policies from the macros,
-/// written `Foo<'_>`, as [`impl_cdrop!`](crate::impl_cdrop) shows.
+/// Implemented by [`define_ctype!`](crate::define_ctype) for a newtype with no
+/// parameters or with lifetimes only, or by hand for a type-generic one. A
+/// newtype generic over a lifetime takes its policies from the macros, written
+/// `Foo<'_>`, as [`impl_cdrop!`](crate::impl_cdrop) shows.
 ///
 /// # Safety
 ///
@@ -767,7 +768,7 @@ pub unsafe trait CLenAlloc: CLenDrop {
 ///   [`CBorrowedPtr`](crate::CBorrowedPtr) alone is covariant, like `&'a T`, so
 ///   add a `PhantomData<&'a mut Self>` field. This matters only when `Self`
 ///   has lifetime or type parameters (what [`define_ctype!`](crate::define_ctype)
-///   emits has none, and carries the marker anyway): without it,
+///   emits carries the marker): without it,
 ///   `Mut<'a>` over `Holder<'static>` would coerce to one over
 ///   `Holder<'short>`, whose setter could store a `'short` borrow that the
 ///   `'static` owner later reads.
@@ -942,8 +943,8 @@ pub unsafe trait CCell: Sized {
 /// Every method is provided, from the layout [`CCell`]'s contract requires
 /// of `CCell::Ref`, and the bound `Cell: CCell<Ref<'a> = Self>` admits only
 /// the type that is some cell's shared handle, so an impl needs no `unsafe`.
-/// A hand-written `CCell` implementor (one `define_ctype!` cannot express)
-/// opts in the same way:
+/// A hand-written `CCell` implementor (one `define_ctype!` cannot express, or
+/// one written before it took lifetimes) opts in the same way:
 ///
 /// ```ignore
 /// impl<'a> ffibox::CRefSeam<'a> for FooRef<'a> {

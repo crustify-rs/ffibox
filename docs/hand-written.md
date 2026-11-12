@@ -1,24 +1,26 @@
 # Hand-written wrappers
 
-Only a wrapper `define_ctype!` cannot express — generic parameters, a
-lifetime-carrying layout type — needs this layer, and so does an owner no
-policy expresses: [an array freed by one routine](#an-array-freed-by-one-routine)
-that does more than free its elements and itself.
+Only a wrapper `define_ctype!` cannot express — a layout type generic over a
+type — needs this layer, and so does an owner no policy expresses:
+[an array freed by one routine](#an-array-freed-by-one-routine) that does
+more than free its elements and itself. A layout type that carries only
+lifetimes is not hand-written: `define_ctype!` declares it,
+`define_ctype!(Blob<'r>, BlobRef, BlobMut, ffi::blob, phantom = &'r Repo)`,
+as [examples.md](examples.md#a-layout-type-with-a-lifetime--define_ctype-with-phantom)
+shows. One already written by hand is the same layout, and moves to the macro
+when its module is next touched, or stays.
 
 What is hand-written for such a wrapper is the layout type, its handles and
 their seams, against the items below. Its policies are not, unless no macro
 takes them:
 
-- **A layout type with a lifetime** (`Blob<'r>`) takes `impl_cdrop!`,
-  `impl_crefclone!` and `impl_cdispose!` as a `define_ctype!` type does, with
-  the lifetime spelled `'_`: `impl_cdrop!(BlobFree, Blob<'_>, ffi::blob_free)`
-  implements `CDrop<Blob<'r>>` for every `'r`. Only its `CDupClone` and
-  `CGuarded` are hand-written, as
-  [ownership.md](ownership.md#policies--what-teardown-means) explains, and
-  [examples.md](examples.md#a-layout-type-with-a-lifetime--hand-written-ccell-macro-policies)
-  shows the whole wrapper.
 - **A layout type generic over a type** (`Stack<T, S>`) has no elided form,
   so each of its policies is an `unsafe impl<T, S>` by hand.
+- **A hand-written layout type with a lifetime** takes every policy macro, as
+  a `define_ctype!` one does: `impl_cdrop!(BlobFree, Blob<'_>, ffi::blob_free)`
+  implements `CDrop<Blob<'r>>` for every `'r`, and `impl_cdupclone!` and
+  `impl_cguarded!` name the lifetime, `<'r> BlobFree, Blob<'r>`, as
+  [ownership.md](ownership.md#policies--what-teardown-means) explains.
 - **A routine of another shape** (a slot, an out-parameter, extra arguments)
   is no reason to hand-write a policy: a private `unsafe fn` adapter passed to
   the macro gives it the shape the macro calls, as

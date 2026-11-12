@@ -31,9 +31,9 @@ policy; a type alias names the pair: `pub type FooBox = CBox<Foo, FooFree>;`.
 No reference to C-owned memory is formed while anything may write or free it:
 objects are reached through handles, and only a run of bytes nothing writes
 while it is lent is a `&CStr` or `&[u8]`. Each C type gets a layout type
-`Foo` (`#[repr(transparent)]` over `ffi::foo`) and two borrowed handles,
-`FooRef<'a>` / `FooMut<'a>`, each one pointer wide and carrying the getters and
-setters; field access projects a raw pointer out of the handle. Ownership
+`Foo` (`#[repr(transparent)]` over `ffi::foo`; `Foo<'r>` when the C object
+borrows its parent) and two borrowed handles, `FooRef<'a>` / `FooMut<'a>`,
+each one pointer wide and carrying the getters and setters; field access projects a raw pointer out of the handle. Ownership
 comes in three shapes: `CBox<Foo, P>` is the sole owner of an object behind a
 pointer and releases it through the policy `P`; `CArc<Foo, P>` is one of
 several counted references and hands out the shared handle, the exclusive one
@@ -97,7 +97,7 @@ When it is Rust's memory that C holds, calls or reads →
 | [borrows.md](docs/borrows.md) | `Foo`, `FooRef`, `FooMut`, `FooLocked`, `CGuard`, `CGuardedRef`, `CSlice`, `CSliceMut`, `CNullTerminated`; where the accessors live; the seam traits |
 | [outbound.md](docs/outbound.md) | Rust's side: `RustAlloc`, the callbacks (`CClosure`, `CPayload`, `CFn`, `CFnBox`, `CCallback`, `CCallbackBox`), out-parameters, the panic barrier, the `export_*!` macros |
 | [patterns.md](docs/patterns.md) | C's iteration, error and callback conventions as Rust's iterators, `Result` and closures |
-| [hand-written.md](docs/hand-written.md) | the wrappers `define_ctype!` cannot express, and the owners no policy expresses |
+| [hand-written.md](docs/hand-written.md) | the wrappers `define_ctype!` cannot express (a layout type generic over a type), and the owners no policy expresses |
 
 Upgrading? [CHANGELOG.md](CHANGELOG.md) says what each release changes, and
 how to migrate code that still compiles but behaves differently.

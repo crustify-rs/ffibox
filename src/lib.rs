@@ -23,7 +23,7 @@
 //!
 //! | Item | Role |
 //! |------|------|
-//! | [`define_ctype!`] | per C type: the layout type `Foo` and its handles `FooRef<'a>` / `FooMut<'a>` |
+//! | [`define_ctype!`] | per C type: the layout type `Foo` and its handles `FooRef<'a>` / `FooMut<'a>`; over a lifetime-carrying `Foo<'r>`, `FooRef<'a, 'r>` / `FooMut<'a, 'r>` |
 //! | [`CBox<T, D>`] | the sole owner of a C-allocated object of a [`CCell`] layout type |
 //! | [`CBoxState<T, D>`] | the same, under a policy with state; [`CBox`] and the other pointer owners take a stateless one |
 //! | [`CArc<T, D>`] | one counted reference to a refcounted object; [`lock`](CArc::lock) takes the C lock a [`CGuarded`] object carries |

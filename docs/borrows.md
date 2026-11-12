@@ -20,10 +20,14 @@ For the owning side — values whose drop releases the object — see
 | views | `CSlice<'a, T>` / `CSliceMut<'a, T>` | ffibox | any borrowed run of elements — a buffer's, a struct field's, a getter's — as handles or copies, never a `&[T]`; only a run of plain values nothing writes while it is lent is a `&[T]` instead, as [Choosing a borrow](#choosing-a-borrow) describes |
 | | `CNullTerminated<'a, T>` | ffibox | a NULL-terminated array of pointers (`char **`, `foo **`), iterated as `&CStr`s or `FooRef`s |
 
-A wrapper that needs generic parameters (a lifetime-carrying layout type, or
-derived sub-types over a generic field) is written by hand against the same
-contract — see [Under the hood](hand-written.md). Its policies still come from
-the macros where they take the type, as they do for one with a lifetime.
+A layout type that carries a lifetime, over a C object that keeps a pointer
+to its parent, is `define_ctype!`'s too: `define_ctype!(Blob<'r>, BlobRef,
+BlobMut, ffi::blob, phantom = &'r Repo)` gives `Blob<'r>`, `BlobRef<'a, 'r>`
+and `BlobMut<'a, 'r>`, the marker deciding how `Blob` varies in `'r`. A
+wrapper that needs type parameters (derived sub-types over a generic field) is
+written by hand against the same contract — see
+[Under the hood](hand-written.md). Its policies still come from the macros
+where they take the type.
 
 ## Conventions
 
