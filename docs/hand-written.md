@@ -1,7 +1,9 @@
 # Hand-written wrappers
 
 Only a wrapper `define_ctype!` cannot express — generic parameters, a
-lifetime-carrying layout type — needs this layer.
+lifetime-carrying layout type — needs this layer, and so does an owner no
+policy expresses: [an array freed by one routine](#an-array-freed-by-one-routine)
+that does more than free its elements and itself.
 
 | Item | Role | Source |
 |------|------|--------|
@@ -19,3 +21,22 @@ them; it is held by `CBoxState<Foo, P>`, `#[repr(C)]` over `{ptr, policy}`,
 which crosses as a raw pointer. `CVal<Foo, P>` is the size of `Foo`; a buffer
 is pointer + length, the pointer NULL when empty, as C's
 `{ T *ptr; size_t len; }`.
+
+## An array freed by one routine
+
+A `CVec` releases an array of owners element by element, then frees the
+buffer through `CLenDrop`, which frees the buffer only (see
+[ownership.md](ownership.md#choosing-an-owner-what-shape-is-the-owned-thing)).
+That covers a C routine whose body is only those frees. One that does more
+— takes a lock, updates a count, or releases an element other than by
+freeing it — is not a policy: the wrapper writes the owner itself, as `CVec`
+is written:
+
+- private fields, the pointer and the length, adopted by an `unsafe`
+  constructor whose contract is the routine's: the array is one the routine
+  frees, and its non-null elements are distinct allocations it owns;
+- a `Drop` that calls the routine once, with both;
+- the elements handed out as borrows tied to `&self` — `FooRef<'_>` through
+  `CRefSeam::from_ptr`, `&CStr`, a `CSlice` of the pointers, which copies
+  them out — never as `&mut` to a slot, through which safe code would store
+  a pointer, or NULL, that the routine then frees.

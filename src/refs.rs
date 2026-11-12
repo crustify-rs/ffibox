@@ -1359,8 +1359,14 @@ unsafe impl<D: CDrop<c_char> + Sync> Sync for CStrBox<D> {}
 /// frees the buffer. Which elements own something is their type's to say: a
 /// `CVec<Option<CBox<Foo, FooFree>>, S>` is a `foo **` whose every non-null
 /// slot `foo_free` releases, a `CVec<*mut ffi::foo, S>` one whose slots own
-/// nothing — the shape for an array whose own free routine releases the
-/// elements too, as `foo_array_free(arr, n)` does.
+/// nothing, borrowed from elsewhere. The policy frees the buffer alone (see
+/// [`CLenDrop`]), so an array C frees with its elements by one routine
+/// (`foo_array_free(arr, n)`) is a buffer of owners under the array
+/// allocator's policy, never bare pointers under that routine: bare pointers
+/// are [`CPlainElem`], which safe code may overwrite through the `&mut [T]`
+/// the `CVec` hands out, with a pointer the routine then frees. Where the
+/// routine does more than free each element and then the array, the array
+/// is wrapped by hand.
 ///
 /// **NULL with length 0 is a valid, empty `CVec`**, which C commonly returns
 /// for an empty array: adopt it with
@@ -1424,6 +1430,10 @@ impl<T, S: CLenDrop> CVec<T, S> {
     /// - `ptr` must be null or hold `len` contiguous, initialised, properly
     ///   aligned `T` from the allocator the policy frees, and the caller
     ///   transfers unique ownership.
+    /// - Elements that own what they point at (an owner such as
+    ///   `Option<CBox<Foo, P>>`) are adopted with the buffer: each non-null
+    ///   one must be an allocation of its own that its policy releases. A
+    ///   pointer repeated in two slots is freed twice.
     /// - [`byte_len`](Self::byte_len) — `len * size_of::<T>()`, what the
     ///   policy receives on drop — must meet
     ///   [`CLenDrop::c_drop_len`]'s contract: no larger than the allocation,

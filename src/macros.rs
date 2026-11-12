@@ -709,7 +709,9 @@ macro_rules! impl_cguarded {
 /// # Safety
 ///
 /// The macro is safe to invoke but emits an `unsafe impl`. You assert that the
-/// routine frees a `byte_len`-byte buffer from this allocator family.
+/// routine frees a `byte_len`-byte buffer from this allocator family, and
+/// nothing its elements point at: a routine that frees an array with its
+/// elements is not a [`CLenDrop`](crate::CLenDrop).
 #[macro_export]
 macro_rules! impl_clendrop {
     ($(#[$attr:meta])* $policy:ty, $f:path) => {

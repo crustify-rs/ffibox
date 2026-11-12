@@ -605,12 +605,25 @@ unsafe impl<T: CPlainElem> CSliceElem for T {}
 /// type, so one element type pairs with several policies — plain free, secure
 /// zero-then-free, zero-only — at zero runtime cost.
 ///
+/// **`c_drop_len` releases the buffer only, never its elements.** A [`CVec`]
+/// drops its elements first, each through its own type (an owner element
+/// releases what it points at), and then hands the buffer to this policy,
+/// which knows only a byte length and serves buffers of every element type.
+/// A C routine that frees an array together with its elements
+/// (`foo_array_free(arr, n)`) is therefore not a `CLenDrop`: it would free
+/// owner elements a second time, free whatever safe code stored in the
+/// slots of bare-pointer elements (which are [`CPlainElem`], so the `CVec`
+/// hands them out as `&mut [T]`), and read as pointers the buffer of any
+/// other element type the policy serves. Hold the elements as owners, and
+/// the array under the policy of the allocator it came from.
+///
 /// # Safety
 ///
 /// `c_drop_len` must release the buffer at `ptr` exactly once, under whatever
 /// allocator and cleanup policy `self` represents, touching at most `byte_len`
 /// bytes of it, and must be sound for every `byte_len` its method contract
-/// admits.
+/// admits. It must not release anything the elements point at: they have
+/// already been dropped.
 ///
 /// # Example
 ///
@@ -626,7 +639,8 @@ unsafe impl<T: CPlainElem> CSliceElem for T {}
 /// }
 /// ```
 pub unsafe trait CLenDrop {
-    /// Free the buffer at `ptr`, whose first `byte_len` bytes are in use.
+    /// Free the buffer at `ptr`, whose first `byte_len` bytes are in use. The
+    /// buffer alone: its elements have already been dropped.
     ///
     /// # Safety
     ///

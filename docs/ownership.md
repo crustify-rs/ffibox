@@ -81,8 +81,27 @@ not, the answer is a borrow instead — see
   | `foo **`, each entry owned, NULL allowed | `Option<CBox<Foo, FooFree>>` |
   | `char **`, each string owned | `Option<CStrBox<P>>` |
   | `foo *`, each inline value disposed | `CVal<Foo, FooUninit>` |
-  | freed with its elements by one routine (`foo_array_free(arr, n)`) | the bare pointer or `Foo`, with that routine as the `CLenDrop` |
+  | freed with its elements by one routine (`foo_array_free(arr, n)`) | an owner from the rows above, under the array allocator's policy, not that routine |
   | entries borrowed from elsewhere | the bare pointer |
+
+  The element type releases the elements, and the policy the array alone:
+  `CLenDrop::c_drop_len` frees the buffer after the `CVec` has dropped every
+  element. So a routine that frees both is never the `CLenDrop`. Over owner
+  elements it frees each a second time; over bare pointers, which are
+  `CPlainElem`, the `CVec` derefs to `&mut [*mut foo]`, through which safe
+  code stores any pointer, or NULL, in a slot the routine then frees; and
+  the policy, a public type, also frees the buffer of a `CVec` of any other
+  element type, whose bytes the routine would read as `foo *`s.
+
+  Where the routine's body is only those frees, as libgit2's
+  `git_strlist_free` is (`git__free` on each string, then on the array), a
+  `CVec<Option<CStrBox<GitFree>>, GitFree>` releases the same way on drop and
+  the routine is not called. Where it does more, the wrapper is hand-written
+  — see [hand-written.md](hand-written.md#an-array-freed-by-one-routine).
+
+  Adopting a buffer of owners (`from_raw_parts` and its siblings) asserts
+  that each non-null element is an allocation of its own: a pointer repeated
+  in two slots is freed twice.
 - **One object held inline** — a local, a field, an array element, with no
   pointer of its own:
   - owns no resources → the `Foo` itself (`Foo::zeroed()` when it is
@@ -113,7 +132,7 @@ carries `PhantomData<*const ()>` instead (see
 | `CDrop<T>` | `c_drop` — a `*_free`, or a refcount down-ref | `impl_cdrop!(P, Foo, f)`; `_str` for `c_char` | `CBox`, `CStrBox`, `CArc` |
 | `CDupClone<T>: CDrop<T>` | `c_dup` — a deep copy (a NEW pointer, NULL on failure) | `impl_cdupclone!(P, Foo, f)`; `_str` for `strdup` | `Clone` / `try_clone` |
 | `CRefClone<T>: CDrop<T>` | `c_up_ref` — a refcount increment on the SAME pointer; `c_is_sole_owner` (default `false`) | `impl_crefclone!(P, Foo, f)`; `…, ok = |r| r == 1`, `…, sole = g` | `CArc`'s `Clone`, `get_mut`, `make_mut` |
-| `CLenDrop` | `c_drop_len` — a buffer free, given the byte length | `impl_clendrop!(P, f)` | `CVec` |
+| `CLenDrop` | `c_drop_len` — a buffer free, given the byte length; the buffer only, never its elements | `impl_clendrop!(P, f)` | `CVec` |
 | `CLenClone: CLenDrop` | `c_clone_len` — a buffer memdup (`T: Copy` only) from any readable source; `ALIGN` (default 1) bounds the element types it can copy | `impl_clenclone!(P, f)`, `impl_clenclone!(P, f, align = 16)` | `CVec`'s `Clone`, `CVec::from_slice`, `CSlice::to_cvec` |
 | `CLenAlloc: CLenDrop` | `c_alloc_len` — uninitialised buffer storage (`malloc(n)`); `ALIGN` as above | by hand | `CVec::from_fn`, `CVec::new_uninit` |
 | `CDispose<T>` | `c_dispose` — `*_uninit` / `*_clear` on a value | `impl_cdispose!(P, Foo, f)` | `CVal` |
