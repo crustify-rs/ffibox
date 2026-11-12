@@ -91,8 +91,9 @@ decided for the C type, not for `S`; since their methods may call any slot,
 `as_ref` and `as_mut` ask `S: Send + Sync`, as a `&RwLock<S>` shared between
 threads does. Where the handles stay on their thread, as `define_ctype!`'s
 do unless the binding opts in, the binding says so once per type with
-`unsafe impl CLocalHandles for T {}`, and `as_ref_local` / `as_mut_local`
-lend them, safely, over any `S`. `into_c` surrenders the table to C, which
+`impl_clocal_handles!(T)`, which checks at compile time that neither handle
+is `Send` or `Sync` before it implements `CLocalHandles`, and
+`as_ref_local` / `as_mut_local` lend them, safely, over any `S`. `into_c` surrenders the table to C, which
 releases it through the slot declared `release`. C keeps it past any borrow
 and may use it on any thread, so `into_c` asks `S: Send + Sync + 'static`,
 as `CPayload::into_raw` asks `Send + Sync`; the `unsafe` `into_c_local` asks
@@ -202,7 +203,7 @@ follow; there is no primitive to add.
 | C calls each slot only with the table it read it from, while the table is live, and calls `release` once | the `unsafe` C call that lends (`as_c_ptr`) or surrenders (`into_c`) the table |
 | C uses the table on a thread other than `S`'s only if `S` allows it: `S: Send + Sync` for shared slots, which share `&S` and may drop `S` there as the last slot out of a deferred release, and `S: Send` for exclusive slots and the release | `into_c` asks `S: Send + Sync`; otherwise `into_c_local`, and the C call a table lent through `as_c_ptr` or a handle method is passed to; `CTable` itself is `Send` / `Sync` on `RwLock<S>`'s terms, and `T`'s |
 | a table built from a base of the caller's chooses no slot `install` leaves | `CTable::with_base` |
-| `T`'s handles are neither `Send` nor `Sync` | `unsafe impl CLocalHandles for T`, for `as_ref_local` / `as_mut_local` |
+| nothing derived from `T`'s handles that keeps the table pointer is `Send` or `Sync` (the handles themselves are checked by `impl_clocal_handles!`) | `impl_clocal_handles!(T)`, for `as_ref_local` / `as_mut_local` |
 | the policy of the owner a surrendered table is adopted into releases it through its `release` slot | that `from_c` |
 | no safe setter of `T`'s handles replaces a slot ffibox installed | `T`'s handles |
 | converting C's arguments, writing its out-parameters | each slot's body |

@@ -154,8 +154,11 @@ pub trait CSlots<S>: CCell {
 /// Proof that [`CTable`] is building the table [`CSlots::install`] fills:
 /// no code outside ffibox can make one, its lifetime is that one borrow of
 /// the table (invariant, so it cannot be stretched to a longer one), and its
-/// types are the impl's, so no other table, and no other impl, gets ffibox's
-/// trampolines through it.
+/// types are the impl's. So it serves no other impl, and outlives no `install`
+/// call: [`impl_cvtable!`](crate::impl_cvtable)'s slots are installed only
+/// under it, in the table it came with. A hand-written `install` holding it
+/// can still call itself on another table of its type; that is its
+/// `unsafe impl CVtable`'s to exclude, as the rest of what `install` does.
 ///
 /// ```compile_fail
 /// # use core::ffi::c_int;
@@ -246,13 +249,18 @@ impl<T, S> fmt::Debug for Install<'_, T, S> {
 /// [`CTable::as_ref_local`] and [`CTable::as_mut_local`] lend them over a
 /// state of any thread-safety.
 ///
+/// [`impl_clocal_handles!`](crate::impl_clocal_handles) implements it
+/// checked: it fails to compile where a handle is `Send` or `Sync`. Prefer
+/// it to an impl written by hand.
+///
 /// # Safety
 ///
-/// `Self::Ref<'_>` and `Self::Mut<'_>` implement neither `Send` nor `Sync`:
-/// the binding writes no `unsafe impl Send` or `Sync` for them. A handle
-/// method that passes the table to a C call running slots on threads of
-/// C's own is use off the thread, and that C call keeps the thread rule
-/// [`CTable::into_c`] states.
+/// `Self::Ref<'_>` and `Self::Mut<'_>` implement neither `Send` nor `Sync`,
+/// and nothing derived from them that reaches the table does either: no
+/// Rust object the binding builds from a handle, keeping its pointer, is
+/// `Send` or `Sync`. A handle method that passes the table to a C call
+/// running slots on threads of C's own is use off the thread, and that C
+/// call keeps the thread rule [`CTable::into_c_local`] states.
 pub unsafe trait CLocalHandles: CCell {}
 
 /// What runs in a slot: a closure over `&S` ([`Shared`]) or `&mut S`
@@ -1150,6 +1158,70 @@ impl<T: CCell, S> fmt::Debug for CTable<T, S> {
 /// }
 /// ```
 ///
+/// The macro's internal arms mint a trampoline only inside the `install`
+/// they expand in, under the `Install` token it was handed: called directly,
+/// without one, they do not compile,
+///
+/// ```compile_fail
+/// # use core::ffi::c_int;
+/// # mod ffi {
+/// #     use core::ffi::c_int;
+/// #     #[repr(C)]
+/// #     #[derive(Default)]
+/// #     pub struct ops { pub get: Option<unsafe extern "C" fn(*mut ops) -> c_int> }
+/// # }
+/// # ffibox::define_ctype!(Ops, OpsRef, OpsMut, ffi::ops);
+/// # ffibox::impl_cvtable! {
+/// #     // SAFETY: C passes `get` its table, its only argument.
+/// #     unsafe impl CVtable<u64> for Ops {}
+/// #     base = ffi::ops::default();
+/// #     fn get(@t) -> core::ffi::c_int { on panic: -1, on busy: -2, |s: &u64| *s as core::ffi::c_int }
+/// # }
+/// #[forbid(unsafe_code)]
+/// mod binding {
+///     use core::ffi::c_int;
+///     pub fn table() -> super::ffi::ops {
+///         let mut table = super::ffi::ops::default();
+///         ffibox::impl_cvtable!(@slot table [] super::Ops, u64;
+///             fn get(@t) -> c_int { on panic: -1, on busy: -2, |s: &u64| *s as c_int }
+///         );
+///         table
+///     }
+/// }
+/// ```
+///
+/// nor with anything else in the token's place:
+///
+/// ```compile_fail
+/// # use core::ffi::c_int;
+/// # mod ffi {
+/// #     use core::ffi::c_int;
+/// #     #[repr(C)]
+/// #     #[derive(Default)]
+/// #     pub struct ops { pub get: Option<unsafe extern "C" fn(*mut ops) -> c_int> }
+/// # }
+/// # ffibox::define_ctype!(Ops, OpsRef, OpsMut, ffi::ops);
+/// # ffibox::impl_cvtable! {
+/// #     // SAFETY: C passes `get` its table, its only argument.
+/// #     unsafe impl CVtable<u64> for Ops {}
+/// #     base = ffi::ops::default();
+/// #     fn get(@t) -> core::ffi::c_int { on panic: -1, on busy: -2, |s: &u64| *s as core::ffi::c_int }
+/// # }
+/// #[forbid(unsafe_code)]
+/// mod binding {
+///     use core::ffi::c_int;
+///     pub fn table() -> super::ffi::ops {
+///         let mut ops = super::ffi::ops::default();
+///         let table = &mut ops;
+///         let token = ();
+///         ffibox::impl_cvtable!(@slots table token [] super::Ops, u64;
+///             fn get(@t) -> c_int { on panic: -1, on busy: -2, |s: &u64| *s as c_int }
+///         );
+///         ops
+///     }
+/// }
+/// ```
+///
 /// A slot takes doc comments only: an attribute such as `#[target_feature]`
 /// would make calling the trampoline `unsafe` in a way C cannot see.
 ///
@@ -1180,8 +1252,10 @@ impl<T: CCell, S> fmt::Debug for CTable<T, S> {
 /// ```
 #[macro_export]
 macro_rules! impl_cvtable {
-    // One slot: its trampoline, installed in `$table`.
-    (@slot $table:ident [$($g:ident $(: $b:path)?),*] $t:ty, $s:ty;
+    // One slot: its trampoline, installed in `$table`. `$token` is the
+    // `Install` the `install` this expands in was handed, which only a
+    // `CTable` building a `$t` over `$s` makes: without one, nothing compiles.
+    (@slot $table:ident $token:ident [$($g:ident $(: $b:path)?),*] $t:ty, $s:ty;
         $(#[doc = $doc:literal])*
         fn $slot:ident (
             $($pre:ident : $pty:ty ,)*
@@ -1193,6 +1267,8 @@ macro_rules! impl_cvtable {
             $body:expr $(,)?
         }
     ) => {{
+        let _: &$crate::vtable::Install<'_, $t, $s> = &$token;
+        let _: &&mut <$t as $crate::CCell>::C = &$table;
         $(#[doc = $doc])*
         unsafe extern "C" fn __ffibox_slot<$($g $(: $b)?),*>(
             $($pre: $pty,)*
@@ -1212,16 +1288,18 @@ macro_rules! impl_cvtable {
         }
         $table.$slot = ::core::option::Option::Some(__ffibox_slot::<$($g),*>);
     }};
-    // The slots, each through `@slot`.
-    (@slots $table:ident $gen:tt $t:ty, $s:ty;
+    // The slots, each through `@slot`, under `@slot`'s token.
+    (@slots $table:ident $token:ident $gen:tt $t:ty, $s:ty;
         $(
             $(#[doc = $doc:literal])*
             fn $slot:ident $params:tt $(-> $ret:ty)? { $($body:tt)* }
         )*
         $(release $free:ident;)?
     ) => {
+        let _: &$crate::vtable::Install<'_, $t, $s> = &$token;
+        let _: &&mut <$t as $crate::CCell>::C = &$table;
         $(
-            $crate::impl_cvtable!(@slot $table $gen $t, $s;
+            $crate::impl_cvtable!(@slot $table $token $gen $t, $s;
                 $(#[doc = $doc])* fn $slot $params $(-> $ret)? { $($body)* }
             );
         )*
@@ -1253,13 +1331,65 @@ macro_rules! impl_cvtable {
 
             fn install<'table>(
                 table: &'table mut <Self as $crate::CCell>::C,
-                _: $crate::vtable::Install<'table, Self, $s>,
+                token: $crate::vtable::Install<'table, Self, $s>,
             ) {
-                $crate::impl_cvtable!(@slots table [$($($g $(: $b)?),+)?]
+                $crate::impl_cvtable!(@slots table token [$($($g $(: $b)?),+)?]
                     $($tp)::+ $(<$($ta),+>)?, $s;
                     $($items)*
                 );
             }
         }
+    };
+}
+
+/// Implement [`CLocalHandles`](crate::vtable::CLocalHandles) for a layout type
+/// whose handles are checked, at compile time, to be neither `Send` nor
+/// `Sync`: the invocation fails to compile (a type annotation error naming
+/// the handle) where the binding opted one of them in.
+///
+/// ```ignore
+/// ffibox::define_ctype!(WriteStream, WriteStreamRef, WriteStreamMut, ffi::git_writestream);
+/// ffibox::impl_clocal_handles!(WriteStream);
+/// ```
+///
+/// The check covers `T::Ref` and `T::Mut`. Objects the binding derives from
+/// a handle that keep its pointer are its own to keep `!Send` and `!Sync`,
+/// as [`CLocalHandles`](crate::vtable::CLocalHandles)' contract states. The
+/// type is a concrete one, with no generic parameters.
+///
+/// ```compile_fail
+/// # mod ffi {
+/// #     #[repr(C)]
+/// #     #[derive(Default)]
+/// #     pub struct ops { pub get: Option<unsafe extern "C" fn(*mut ops) -> core::ffi::c_int> }
+/// # }
+/// ffibox::define_ctype!(Ops, OpsRef, OpsMut, ffi::ops);
+/// // SAFETY: the C library's tables are thread-safe.
+/// unsafe impl Send for OpsRef<'_> {}
+/// ffibox::impl_clocal_handles!(Ops); // `OpsRef` is `Send`
+/// ```
+#[macro_export]
+macro_rules! impl_clocal_handles {
+    ($t:ty $(,)?) => {
+        // Ambiguous, so an error, exactly where the handle is `Send` (or
+        // `Sync`): the second impl then applies beside the first.
+        const _: fn() = || {
+            trait AmbiguousIfSend<A> {
+                fn check() {}
+            }
+            impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+            impl<T: ?Sized + ::core::marker::Send> AmbiguousIfSend<u8> for T {}
+            trait AmbiguousIfSync<A> {
+                fn check() {}
+            }
+            impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+            impl<T: ?Sized + ::core::marker::Sync> AmbiguousIfSync<u8> for T {}
+            let _ = <<$t as $crate::CCell>::Ref<'static> as AmbiguousIfSend<_>>::check;
+            let _ = <<$t as $crate::CCell>::Ref<'static> as AmbiguousIfSync<_>>::check;
+            let _ = <<$t as $crate::CCell>::Mut<'static> as AmbiguousIfSend<_>>::check;
+            let _ = <<$t as $crate::CCell>::Mut<'static> as AmbiguousIfSync<_>>::check;
+        };
+        // SAFETY: the check above: neither handle is `Send` or `Sync`.
+        unsafe impl $crate::vtable::CLocalHandles for $t {}
     };
 }

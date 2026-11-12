@@ -20,7 +20,9 @@ Changes on `devel` since 0.1.1.
   slot, whoever releases it and whenever. `impl_cvtable!` mints the slots and
   the `CSlots<S>` impl that installs them, beside the binding's own
   `unsafe impl CVtable<S> for T {}`, whose `SAFETY` comment states where C
-  passes each slot its table and that no slot C calls is left NULL. Tables were hand-written before:
+  passes each slot its table and that no slot C calls is left NULL.
+  `impl_clocal_handles!` marks a layout type whose handles are checked to
+  be neither `Send` nor `Sync`, so its handles are lent over any state. Tables were hand-written before:
   nothing existing changes, and a hand-written one keeps working. Moving one
   to `CTable` replaces its `#[repr(C)]` struct, trampolines, `free` and
   re-entry state with one `impl_cvtable!` over the trait it already has; see

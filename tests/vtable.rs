@@ -10,7 +10,7 @@ use core::ptr::{self, NonNull};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
-use ffibox::vtable::{CLocalHandles, CTable};
+use ffibox::vtable::CTable;
 use ffibox::{CMutSeam, CRefSeam, define_ctype, impl_cvtable};
 
 mod ffi {
@@ -31,8 +31,8 @@ mod ffi {
 
 define_ctype!(Store, StoreRef, StoreMut, ffi::store);
 
-// SAFETY: `StoreRef` and `StoreMut` opt into neither `Send` nor `Sync`.
-unsafe impl CLocalHandles for Store {}
+// `StoreRef` and `StoreMut` opt into neither `Send` nor `Sync`.
+ffibox::impl_clocal_handles!(Store);
 
 /// Hand a table to the stand-in library, which calls back and releases it on
 /// the calling thread only.

@@ -40,7 +40,7 @@
 //! | [`CClosure`] / [`CPayload`] | a Rust closure C calls, for one call or until C releases it |
 //! | [`CFn`] / [`CFnBox`] | a C function and its context that Rust calls, borrowed or owned |
 //! | [`CCallback`] / [`CCallbackBox`] | either: a callback called from Rust and handed to C alike |
-//! | [`CTable<T, S>`] / [`impl_cvtable!`] | Rust state behind a C table of function pointers C calls into, its slots minted from the trait the state implements |
+//! | [`CTable<T, S>`] / [`impl_cvtable!`] | Rust state behind a C table of function pointers C calls into, its slots minted from the trait the state implements; [`impl_clocal_handles!`] lends its handles over any state where they stay on their thread |
 //! | [`RustAlloc`] | the policy over Rust's global allocator, for what Rust allocates and C frees |
 //!
 //! Like `Box`, the owners adopt a raw pointer with an `unsafe` `from_raw` and
