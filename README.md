@@ -90,7 +90,7 @@ When it is Rust's memory that C holds, calls or reads →
 | doc | what is in it |
 |-----|---------------|
 | [goals.md](docs/goals.md) | what the primitives aim for, in both directions, and how each aim is checked |
-| [examples.md](docs/examples.md) | seven self-contained wrappers, each compiled as a doctest |
+| [examples.md](docs/examples.md) | eight self-contained wrappers, each compiled as a doctest |
 | [ownership.md](docs/ownership.md) | `CBox`, `CBoxState`, `CVal`, `CStrBox`, `CVec`, `CArc`; the lifecycle policies; picking an owner and a policy |
 | [borrows.md](docs/borrows.md) | `Foo`, `FooRef`, `FooMut`, `FooLocked`, `CGuard`, `CGuardedRef`, `CSlice`, `CSliceMut`, `CNullTerminated`; where the accessors live; the seam traits |
 | [outbound.md](docs/outbound.md) | Rust's side: `RustAlloc`, the callbacks (`CClosure`, `CPayload`, `CFn`, `CFnBox`, `CCallback`, `CCallbackBox`), out-parameters, the panic barrier, the `export_*!` macros |

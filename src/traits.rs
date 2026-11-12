@@ -58,8 +58,10 @@ use crate::shared::{CArc, CGuard, CGuardedRef};
 ///
 /// Implemented on the policy `Self`, not on `T`, so one `T` may have several,
 /// and the owner's type says which runs.
-/// [`impl_cdrop!`](crate::impl_cdrop) binds a C routine; write the impl by
-/// hand when teardown needs runtime state, and hold the object in a
+/// [`impl_cdrop!`](crate::impl_cdrop) binds a C routine, through a private
+/// `unsafe fn` adapter when the routine has another shape, and over a layout
+/// type with a lifetime written `Foo<'_>`; write the impl by hand when
+/// teardown needs runtime state, and hold the object in a
 /// [`CBoxState`](crate::CBoxState). A destructor that must be
 /// suppressed on some paths folds the gate into `c_drop`.
 ///
@@ -96,6 +98,10 @@ pub unsafe trait CDrop<T> {
 /// by its `*_free`. A deep copy is what keeps a cloned [`CBox`] the **sole**
 /// owner of its object; a refcount bump is [`CRefClone`], which `CBox` never
 /// uses.
+///
+/// [`impl_cdupclone!`](crate::impl_cdupclone) binds a C routine, but not over
+/// a layout type with a lifetime: that impl is written by hand, naming it,
+/// `unsafe impl<'r> CDupClone<Foo<'r>> for FooFree`.
 ///
 /// # Safety
 ///
@@ -741,7 +747,9 @@ pub unsafe trait CLenAlloc: CLenDrop {
 /// cover the C object.
 ///
 /// Implemented by [`define_ctype!`](crate::define_ctype) for the trivial base
-/// case, or by hand for lifetime- / type-generic newtypes.
+/// case, or by hand for lifetime- / type-generic newtypes. A newtype generic
+/// over a lifetime alone still takes most of its policies from the macros,
+/// written `Foo<'_>`, as [`impl_cdrop!`](crate::impl_cdrop) shows.
 ///
 /// # Safety
 ///

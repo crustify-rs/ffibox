@@ -2,8 +2,17 @@
 //! types per C type, and the policy macros, which implement a lifecycle trait
 //! on a policy type you declare by binding a C routine to it. The routine is a
 //! plain path, called with a pointer of the exact C type, so one for the wrong
-//! type does not compile; any other shape goes behind an `unsafe fn` adapter
-//! or into a hand-written policy.
+//! type does not compile. A routine of any other shape goes behind a private
+//! `unsafe fn` adapter passed by path, which is preferred to a hand-written
+//! policy; a policy is hand-written for runtime state, or where no macro takes
+//! the type.
+//!
+//! The layout type is any [`CCell`](crate::CCell) type, `define_ctype!`'s or
+//! hand-written. One that carries a lifetime is written with it elided,
+//! `Blob<'_>`, which binds one policy for every lifetime, in every policy macro
+//! but [`impl_cdupclone!`](crate::impl_cdupclone) and
+//! [`impl_cguarded!`](crate::impl_cguarded), as
+//! [`impl_cdrop!`](crate::impl_cdrop) shows.
 //!
 //! Each policy macro takes outer attributes ahead of its arguments, a doc
 //! comment and a `#[doc(alias)]` among them, and puts them on the trait method
@@ -272,9 +281,10 @@ macro_rules! define_ctype {
 //
 // Every policy macro takes the routine as a plain path and calls it with a
 // pointer of the exact C type, so a routine for the wrong type is a compile
-// error rather than a silent cast. A destructor of any other shape — taking a
-// pointer to the slot, a `void *`, extra arguments — goes behind a small
-// `unsafe fn` adapter passed by path, or into a hand-written policy.
+// error rather than a silent cast. A routine of any other shape — taking a
+// pointer to the slot, answering through an out-parameter, a `void *`, extra
+// arguments — goes behind a small private `unsafe fn` adapter passed by path,
+// rather than into a hand-written policy.
 
 /// Implement [`CDrop<T>`](crate::CDrop) on a policy type, binding the C
 /// destructor that settles one owned `*mut T` — a `*_free` or a down-ref.
@@ -313,10 +323,80 @@ macro_rules! define_ctype {
 /// impl_cdrop!(DictFree, Dict, dict_free);
 /// ```
 ///
+/// The adapter is private and sits beside the policy, where the crate keeps
+/// its unsafe code. Prefer it to a hand-written `unsafe impl CDrop`: the macro
+/// keeps the impl's shape and its type check, and the adapter adds no public
+/// unsafe surface. The other policy macros take adapters the same way, such as
+/// an up_ref that answers through an out-parameter for
+/// [`impl_crefclone!`](crate::impl_crefclone).
+///
 /// The routine's return value, if any, is discarded. The policy is yours to
 /// declare — usually a unit struct deriving `Clone, Copy, Debug, Default`, so
 /// its owner gets `from_raw(ptr)`. A policy carrying
 /// runtime state implements [`CDrop`](crate::CDrop) by hand.
+///
+/// # A layout type with a lifetime
+///
+/// A layout type written by hand against [`CCell`](crate::CCell) may carry a
+/// lifetime, as one over an object that keeps a pointer to its parent does.
+/// Spell it `'_`: the impl header makes it a parameter, so the one policy
+/// releases `Holder<'p>` for every `'p`, and [`CBox`](crate::CBox) and
+/// [`CArc`](crate::CArc) over any of them take it.
+/// [`impl_crefclone!`](crate::impl_crefclone) and
+/// [`impl_cdispose!`](crate::impl_cdispose) take the type the same way.
+///
+/// ```no_run
+/// # use core::marker::PhantomData;
+/// # use ffibox::{CBorrowedPtr, CBox, CCell};
+/// # #[repr(C)] pub struct holder_st { parent: *const u32 }
+/// # unsafe fn holder_free(_: *mut holder_st) {}
+/// /// Keeps a pointer to a `u32` that must outlive it.
+/// #[repr(transparent)]
+/// pub struct Holder<'p>(holder_st, PhantomData<(*const (), &'p u32)>);
+/// # #[repr(transparent)] #[derive(Clone, Copy)]
+/// # pub struct HolderRef<'a, 'p>(CBorrowedPtr<'a, Holder<'p>>);
+/// # #[repr(transparent)]
+/// # pub struct HolderMut<'a, 'p>(HolderRef<'a, 'p>, PhantomData<&'a mut Holder<'p>>);
+/// // SAFETY: transparent layout and handles, as `CCell` requires.
+/// unsafe impl<'p> CCell for Holder<'p> {
+///     type C = holder_st;
+///     type Ref<'a> = HolderRef<'a, 'p> where Self: 'a;
+///     type Mut<'a> = HolderMut<'a, 'p> where Self: 'a;
+/// }
+///
+/// #[derive(Clone, Copy, Debug, Default)]
+/// pub struct HolderFree;
+/// ffibox::impl_cdrop!(HolderFree, Holder<'_>, holder_free);
+///
+/// fn adopt<'p>(raw: *mut holder_st) -> Option<CBox<Holder<'p>, HolderFree>> {
+///     // SAFETY: `raw` is an owned holder whose parent outlives `'p`.
+///     unsafe { CBox::from_c(raw) }
+/// }
+/// ```
+///
+/// A named lifetime is not declared in the impl the macro writes:
+///
+/// ```compile_fail,E0261
+/// # use core::marker::PhantomData;
+/// # use ffibox::{CBorrowedPtr, CCell};
+/// # #[repr(C)] pub struct holder_st { parent: *const u32 }
+/// # unsafe fn holder_free(_: *mut holder_st) {}
+/// # #[repr(transparent)]
+/// # pub struct Holder<'p>(holder_st, PhantomData<(*const (), &'p u32)>);
+/// # #[repr(transparent)] #[derive(Clone, Copy)]
+/// # pub struct HolderRef<'a, 'p>(CBorrowedPtr<'a, Holder<'p>>);
+/// # #[repr(transparent)]
+/// # pub struct HolderMut<'a, 'p>(HolderRef<'a, 'p>, PhantomData<&'a mut Holder<'p>>);
+/// # unsafe impl<'p> CCell for Holder<'p> {
+/// #     type C = holder_st;
+/// #     type Ref<'a> = HolderRef<'a, 'p> where Self: 'a;
+/// #     type Mut<'a> = HolderMut<'a, 'p> where Self: 'a;
+/// # }
+/// pub struct HolderFree;
+/// ffibox::impl_cdrop!(HolderFree, Holder<'p>, holder_free); // `'_`, not `'p`
+/// ```
+///
+/// A deep copy is the exception: see [`impl_cdupclone!`](crate::impl_cdupclone).
 ///
 /// # Safety
 ///
@@ -377,6 +457,34 @@ macro_rules! impl_cdrop_str {
 ///
 /// As in [`impl_cdrop!`](crate::impl_cdrop), the routine is called with a
 /// `*mut <T as CCell>::C` and must return the same pointer type.
+///
+/// Unlike [`impl_cdrop!`](crate::impl_cdrop), it does not take a layout type
+/// with an elided lifetime: `c_dup` returns the type, and a `'_` in its return
+/// type elides to `&self`'s lifetime, not the impl's, so the method no longer
+/// matches the trait. Write that policy by hand, naming the lifetime:
+/// `unsafe impl<'p> CDupClone<Holder<'p>> for HolderFree`.
+///
+/// ```compile_fail
+/// # use core::marker::PhantomData;
+/// # use ffibox::{CBorrowedPtr, CCell};
+/// # #[repr(C)] pub struct holder_st { parent: *const u32 }
+/// # unsafe fn holder_free(_: *mut holder_st) {}
+/// # unsafe fn holder_dup(p: *mut holder_st) -> *mut holder_st { p }
+/// # #[repr(transparent)]
+/// # pub struct Holder<'p>(holder_st, PhantomData<(*const (), &'p u32)>);
+/// # #[repr(transparent)] #[derive(Clone, Copy)]
+/// # pub struct HolderRef<'a, 'p>(CBorrowedPtr<'a, Holder<'p>>);
+/// # #[repr(transparent)]
+/// # pub struct HolderMut<'a, 'p>(HolderRef<'a, 'p>, PhantomData<&'a mut Holder<'p>>);
+/// # unsafe impl<'p> CCell for Holder<'p> {
+/// #     type C = holder_st;
+/// #     type Ref<'a> = HolderRef<'a, 'p> where Self: 'a;
+/// #     type Mut<'a> = HolderMut<'a, 'p> where Self: 'a;
+/// # }
+/// pub struct HolderFree;
+/// ffibox::impl_cdrop!(HolderFree, Holder<'_>, holder_free);     // compiles
+/// ffibox::impl_cdupclone!(HolderFree, Holder<'_>, holder_dup);  // does not
+/// ```
 ///
 /// # Safety
 ///
@@ -443,7 +551,10 @@ macro_rules! impl_cdupclone_str {
 /// Without `ok`, the up_ref must return `()`: a status the macro would
 /// otherwise discard does not compile. Without `sole`,
 /// [`c_is_sole_owner`](crate::CRefClone::c_is_sole_owner) keeps its
-/// always-`false` default.
+/// always-`false` default. An up_ref of another shape, such as one that
+/// answers through an out-parameter (`foo_dup(&mut out, p)`), goes behind a
+/// private `unsafe fn` adapter, as [`impl_cdrop!`](crate::impl_cdrop)
+/// describes; a layout type with a lifetime is written `Foo<'_>`, as there.
 ///
 /// ```compile_fail,E0277
 /// # #[repr(C)] pub struct foo_st { x: u8 }
@@ -582,6 +693,11 @@ pub unsafe fn __handle_ref<'a, T: crate::CCell + 'a>(p: ::core::ptr::NonNull<T>)
 /// ```ignore
 /// impl_cguarded!(Registry, all, lock = registry_lock, unlock = registry_unlock, ok = |r| r == 0);
 /// ```
+///
+/// Neither form takes a layout type with a lifetime, `Foo<'_>`, as the
+/// policy macros do: the type is named in the generated handle and in
+/// `Locked`, where `'_` is not allowed. Its [`CGuarded`](crate::CGuarded) is
+/// written by hand.
 ///
 /// Without `ok`, `lock` must return `()`. A status the macro discarded would
 /// be a failed lock reported as held — and a lock backed by
@@ -791,6 +907,9 @@ macro_rules! impl_clenclone {
 /// pub struct ParamsUninit;
 /// impl_cdispose!(ParamsUninit, Params, ffi::params_uninit);
 /// ```
+///
+/// A layout type with a lifetime is written `Params<'_>`, as in
+/// [`impl_cdrop!`](crate::impl_cdrop).
 ///
 /// # Safety
 ///

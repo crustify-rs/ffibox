@@ -22,7 +22,8 @@ For the owning side — values whose drop releases the object — see
 
 A wrapper that needs generic parameters (a lifetime-carrying layout type, or
 derived sub-types over a generic field) is written by hand against the same
-contract — see [Under the hood](hand-written.md).
+contract — see [Under the hood](hand-written.md). Its policies still come from
+the macros where they take the type, as they do for one with a lifetime.
 
 ## Conventions
 

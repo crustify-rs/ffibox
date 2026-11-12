@@ -143,6 +143,11 @@ carries `PhantomData<*const ()>` instead (see
 | `CZeroable`, on `Foo` | all-zero is valid for every accessor, safe wrapper and paired teardown; provides `Foo::zeroed()` | `unsafe impl CZeroable for Foo {}` | `new_zeroed`, `Foo::zeroed()` |
 | `CGuarded`, on `Foo` | `c_lock` / `c_unlock`; the `Locked` handle; the `Scope` it covers | `impl_cguarded!(Foo, FooLocked, lock = f, unlock = g)`; `…, ok = |r| r == 1`; `impl_cguarded!(Foo, all, …)` for `CGuardedAll` | `CArc::lock`, `CGuardedRef::lock` |
 
+`Foo` in the Macro column is any `CCell` layout type, `define_ctype!`'s or
+hand-written; one that carries a lifetime is written `Foo<'_>`, as **A layout
+type with a lifetime** below describes, in every macro but `impl_cdupclone!`
+and `impl_cguarded!`.
+
 **Because the policy is a type parameter, an owner cannot exist without a
 destructor, and one C type can have several.** `CBox<Foo, FooFree>` next to
 `CBox<Foo, FooUnref>`: exactly one ever runs per box, chosen by its type. And
@@ -190,10 +195,42 @@ Where a call can fail — an up_ref, a lock — the routine either returns `()` 
 is bound with `ok = |r| r == 1` (whatever its success value is); a status code
 is never silently discarded, so `pthread_mutex_lock`'s `EDEADLK` becomes a
 panic rather than a second locked handle. A
-destructor of any other shape — one taking the slot (`ffi::foo_free(&mut p)`),
-a `void *` allocator free, extra arguments — goes behind a small `unsafe fn`
-adapter passed by path. Teardown is unconditional: a gate that suppresses it on
-some paths folds into the routine itself.
+routine of any other shape — a destructor taking the slot
+(`ffi::foo_free(&mut p)`), an up_ref or a copy that answers through an
+out-parameter (`ffi::foo_dup(&mut out, p)`), a `void *` allocator free, extra
+arguments — goes behind a small `unsafe fn` adapter passed to the macro by
+path. The adapter is private, with a `# Safety` section of its own, and sits
+beside the policy it serves, where the crate keeps its unsafe code (its unsafe
+region, if it has one), as a hand-written impl would. Prefer it to a
+hand-written `unsafe impl CDrop` (or `CRefClone`, `CDupClone`): the macro keeps
+the impl's shape and its type check of the C pointer, and the adapter adds no
+public unsafe surface, only a private `unsafe fn` and the unsafe block calling
+the routine, which a hand-written impl holds too.
+Teardown is unconditional: a gate that suppresses it on some paths folds into
+the routine itself.
+
+**A layout type with a lifetime.** A hand-written layout type that carries a
+lifetime, `Blob<'r>` over an object that keeps its repository, still takes its
+policies from the macros: `impl_cdrop!`, `impl_crefclone!` and
+`impl_cdispose!` accept it with the lifetime spelled `'_`, which the impl
+header turns into a parameter, so one policy serves `Blob<'r>` for every
+`'r`. A named lifetime (`Blob<'r>`) is undeclared there and does not compile.
+
+```rust,ignore
+impl_cdrop!(BlobFree, Blob<'_>, ffi::blob_free);
+// `blob_dup` answers through an out-parameter: an adapter gives it the shape.
+impl_crefclone!(BlobFree, Blob<'_>, blob_up_ref, ok = |r| r == 0);
+pub type BlobArc<'r> = CArc<Blob<'r>, BlobFree>;
+```
+
+Two macros do not take it. `impl_cdupclone!`'s `c_dup` returns the type, and a
+`'_` there elides to `&self`'s lifetime rather than the parameter's, so a deep
+copy over such a type is a hand-written `unsafe impl<'r> CDupClone<Foo<'r>>`.
+`impl_cguarded!` names the type in a struct and an associated type, where `'_`
+is not allowed, so that `CGuarded` is hand-written too. A layout type generic
+over a type, rather than a lifetime, has no elided form: all its policies are
+hand-written. [examples.md](examples.md#a-layout-type-with-a-lifetime--hand-written-ccell-macro-policies)
+shows the whole wrapper.
 
 **Runtime-state policies.** When teardown needs a value chosen at the wrapping
 site (`list_pop_free(list, elem_free_fn)`, `pool_free(pool, p)`), write the
@@ -246,7 +283,8 @@ For boxes, strings and buffers.
 | a counted reference with no up_ref | `impl_cdrop!` alone → `CArc` without `Clone` |
 | teardown needs runtime state | a hand-written policy; adopt with `from_raw_with` |
 | built in place, not by a C constructor | `CAlloc` → `new_uninit` → `assume_init`, then `with_policy` if a fuller destructor takes over |
-| destructor of another shape | an `unsafe fn` adapter, passed by path |
+| a routine of another shape: a slot, an out-parameter, extra arguments | the macro, over a private `unsafe fn` adapter passed by path, not a hand-written impl |
+| any of the above, over a layout type with a lifetime (`Blob<'r>`) | the same macros with `Blob<'_>`, but a hand-written `CDupClone` and `CGuarded` |
 | Rust allocates it (`alloc` feature) | `RustAlloc`: objects, buffers and strings from Rust's global allocator |
 
 An owned pointer crosses the FFI boundary on the owner's raw seam: `into_raw`

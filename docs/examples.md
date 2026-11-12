@@ -357,7 +357,8 @@ mod sys {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OidsFree;
-// Freeing needs the element count back: an adapter, passed by path.
+// Freeing needs the element count back: a private adapter beside the policy,
+// passed to the macro by path, rather than a hand-written `CLenDrop`.
 unsafe fn oids_free(ptr: *mut u8, byte_len: usize) {
     unsafe { sys::oids_free(ptr.cast(), byte_len / core::mem::size_of::<u32>()) }
 }
@@ -375,3 +376,116 @@ assert_eq!(v.as_slice().len(), 3);
 let s = unsafe { LibStr::from_raw(sys::lib_name()) }.unwrap();
 assert_eq!(s.to_str(), Ok("name"));
 ```
+
+## A layout type with a lifetime — hand-written `CCell`, macro policies
+
+A C object that keeps a pointer to its parent, as a blob keeps its
+repository, lives no longer than the parent: its layout type carries the
+parent's borrow. `define_ctype!` mints no such type, so the layout type, its
+handles and their seams are written against `CCell`; its policies still come
+from the macros, with the lifetime spelled `'_`.
+
+```rust,no_run
+use core::{ffi::c_int, marker::PhantomData, ptr};
+use ffibox::{
+    define_ctype, impl_cdrop, impl_crefclone, CArc, CBorrowedPtr, CBox, CCell, CRefSeam,
+};
+
+mod sys {
+    use core::ffi::c_int;
+    #[repr(C)] pub struct repo_st { _opaque: [u8; 0] }
+    #[repr(C)] pub struct blob_st { _opaque: [u8; 0] }
+    unsafe extern "C" {
+        pub fn repo_open() -> *mut repo_st;
+        pub fn repo_free(r: *mut repo_st);
+        // The blob keeps `repo`, uncounted: it must not outlive it.
+        pub fn blob_lookup(out: *mut *mut blob_st, repo: *mut repo_st, id: u32) -> c_int;
+        pub fn blob_dup(out: *mut *mut blob_st, b: *mut blob_st) -> c_int; // an up_ref
+        pub fn blob_free(b: *mut blob_st);                                  // a down-ref
+        pub fn blob_rawcontent(b: *const blob_st) -> *const u8;
+        pub fn blob_rawsize(b: *const blob_st) -> usize;
+    }
+}
+
+define_ctype!(Repo, RepoRef, RepoMut, sys::repo_st);
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RepoFree;
+impl_cdrop!(RepoFree, Repo, sys::repo_free);
+
+// The layout type and its handles, by hand: `'r` is the repository's borrow.
+#[repr(transparent)]
+pub struct Blob<'r>(sys::blob_st, PhantomData<(*const (), &'r Repo)>);
+#[repr(transparent)]
+pub struct BlobRef<'a, 'r>(CBorrowedPtr<'a, Blob<'r>>);
+impl Clone for BlobRef<'_, '_> {
+    fn clone(&self) -> Self { *self }
+}
+impl Copy for BlobRef<'_, '_> {}
+#[repr(transparent)]
+pub struct BlobMut<'a, 'r>(BlobRef<'a, 'r>, PhantomData<&'a mut Blob<'r>>);
+// SAFETY: `Blob` is transparent over `blob_st`; both handles are transparent
+// over `CBorrowedPtr<'a, Blob<'r>>`, have no `Drop` and lend no `&Blob`;
+// `BlobMut` is invariant through its marker, and `BlobRef` writes nothing.
+unsafe impl<'r> CCell for Blob<'r> {
+    type C = sys::blob_st;
+    type Ref<'a> = BlobRef<'a, 'r> where Self: 'a;
+    type Mut<'a> = BlobMut<'a, 'r> where Self: 'a;
+}
+impl<'a, 'r> CRefSeam<'a> for BlobRef<'a, 'r> {
+    type Cell = Blob<'r>;
+}
+
+// The policies, by the macros: `Blob<'_>` is one impl for every `'r`.
+// `blob_dup` answers through an out-parameter, so a private adapter gives it
+// the shape `impl_crefclone!` calls; no `unsafe impl` is written by hand.
+/// # Safety
+///
+/// `b` is a live blob whose reference the caller holds.
+unsafe fn blob_up_ref(b: *mut sys::blob_st) -> c_int {
+    let mut out = ptr::null_mut();
+    // SAFETY: `out` is a local slot; the caller's contract covers `b`.
+    unsafe { sys::blob_dup(&raw mut out, b) }
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BlobFree;
+impl_cdrop!(BlobFree, Blob<'_>, sys::blob_free);
+impl_crefclone!(BlobFree, Blob<'_>, blob_up_ref, ok = |r| r == 0);
+pub type BlobArc<'r> = CArc<Blob<'r>, BlobFree>;
+
+impl<'r> Blob<'r> {
+    pub fn lookup(repo: RepoRef<'r>, id: u32) -> Option<BlobArc<'r>> {
+        let mut out = ptr::null_mut();
+        // SAFETY: `out` is a writable slot; `repo` is live for `'r`.
+        let rc = unsafe { sys::blob_lookup(&raw mut out, repo.as_ptr().cast_mut(), id) };
+        // SAFETY: on success, one reference the arc takes over.
+        if rc == 0 { unsafe { BlobArc::from_c(out) } } else { None }
+    }
+}
+
+impl<'a> BlobRef<'a, '_> {
+    /// The content: an immutable counted byte run the blob lends, as
+    /// borrows.md's "a counted run of immutable bytes" describes.
+    pub fn content(&self) -> &'a [u8] {
+        // SAFETY: the handle keeps the blob live for `'a`; both calls only read it.
+        let (data, len) = unsafe {
+            (sys::blob_rawcontent(self.as_ptr()), sys::blob_rawsize(self.as_ptr()))
+        };
+        if data.is_null() || len == 0 {
+            return &[];
+        }
+        // SAFETY: `len` initialised bytes the blob owns, fixed when it was read
+        // and never written, freed only with the blob, which outlives `'a`.
+        unsafe { core::slice::from_raw_parts(data, len) }
+    }
+}
+
+let repo = unsafe { CBox::<Repo, RepoFree>::from_c(sys::repo_open()) }.unwrap();
+let blob = Blob::lookup(repo.as_ref(), 7).unwrap();
+let again = blob.clone();                        // blob_up_ref → blob_dup
+let n = again.as_ref().content().len();
+// `drop(repo)` here would not compile: both blobs borrow it.
+```
+
+`impl_cdupclone!` and `impl_cguarded!` do not take `Blob<'_>`: a deep copy
+over such a type is an `unsafe impl<'r> CDupClone<Blob<'r>> for P`, and a C
+lock an `unsafe impl<'r> CGuarded for Blob<'r>`, both written by hand.
