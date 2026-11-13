@@ -25,6 +25,10 @@ use core::ffi::{CStr, c_char};
 use core::mem::MaybeUninit;
 use core::ptr::NonNull;
 
+#[cfg(feature = "alloc")]
+use crate::refs::{CBox, CVec};
+#[cfg(feature = "alloc")]
+use crate::traits::CSliceElem;
 use crate::traits::{
     CAlloc, CAllocZeroed, CCell, CDrop, CDupClone, CLenAlloc, CLenClone, CLenDrop, CNew, CZeroable,
 };
@@ -480,5 +484,215 @@ unsafe impl<P: CLenAlloc + CLenClone> CLenClone for CAllocator<P> {
     unsafe fn c_clone_len(&self, ptr: *mut u8, byte_len: usize) -> Option<NonNull<u8>> {
         // SAFETY: the caller upholds `c_clone_len`'s contract.
         unsafe { self.0.c_clone_len(ptr, byte_len) }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The standard owners: Box and Vec, to and from CBox and CVec
+// ---------------------------------------------------------------------------
+
+/// `Box<T, CAllocator<P>>` as the [`CBox`] it is: the same pointer, the same
+/// allocator, nothing copied — `Box` → `CBox`, where C keeps or frees the
+/// object from now on (`into_c` hands it the pointer). Dropping either
+/// drops the `T` in place and frees its bytes through the family.
+///
+/// A box of a zero-sized `T` holds a dangling pointer that was never
+/// allocated, which C would free; a `T` aligned beyond the family's `ALIGN`
+/// has no buffer of the family. Both are refused at compile time:
+///
+/// ```compile_fail,E0080
+/// # use ffibox::{define_ctype, CAllocator, CBox, CZeroable, RustAlloc};
+/// #[repr(C)]
+/// pub struct empty_st {}
+/// define_ctype!(Empty, EmptyRef, EmptyMut, empty_st);
+/// # // SAFETY: no bytes.
+/// # unsafe impl CZeroable for Empty {}
+/// let b = Box::new_in(Empty::zeroed(), CAllocator::new(RustAlloc));
+/// let _ = CBox::from(b);
+/// ```
+///
+/// ```compile_fail,E0080
+/// # use ffibox::{define_ctype, CAllocator, CBox, CZeroable, RustAlloc};
+/// #[repr(C, align(32))]
+/// pub struct wide_st { x: u8 }
+/// define_ctype!(Wide, WideRef, WideMut, wide_st);
+/// # // SAFETY: any byte.
+/// # unsafe impl CZeroable for Wide {}
+/// # let b = Box::new(Wide::zeroed());
+/// # let b = unsafe { Box::from_raw_in(Box::into_raw(b), CAllocator::new(RustAlloc)) };
+/// let _ = CBox::from(b); // `RustAlloc`'s buffers are 16-aligned
+/// ```
+///
+/// The policy is stateless, as every [`CBox`]'s is.
+#[cfg(feature = "alloc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+impl<T: CCell, P: CLenAlloc> From<alloc::boxed::Box<T, CAllocator<P>>> for CBox<T, CAllocator<P>> {
+    #[inline]
+    fn from(b: alloc::boxed::Box<T, CAllocator<P>>) -> Self {
+        let _ = CAllocator::<P>::object_layout::<T>();
+        let (ptr, a) = alloc::boxed::Box::into_non_null_with_allocator(b);
+        // SAFETY: the box owned a live `T` in a non-empty block of the family
+        // (`T` is not zero-sized), which `CBox`'s `CDrop<T>` frees as the box
+        // did; nothing else uses it.
+        unsafe { CBox::from_non_null_with(ptr, a) }
+    }
+}
+
+#[cfg(feature = "alloc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+impl<T: CCell, P: CLenAlloc> CBox<T, CAllocator<P>> {
+    /// The object as a `Box<T, CAllocator<P>>`: the same pointer and
+    /// allocator, nothing copied — `CBox` → `Box`, once C no longer keeps
+    /// the object. The box drops it in place and frees it through the
+    /// family, as this `CBox` would have.
+    ///
+    /// Zero-sized and over-aligned `T` are refused at compile time, as by
+    /// [`CBox::from`].
+    ///
+    /// # Safety
+    ///
+    /// A `Box` lends `&T` and `&mut T`, through which safe code moves the
+    /// object's bytes (`mem::swap`, `mem::replace`) and reads them under a
+    /// shared reference. So:
+    ///
+    /// - the object must not be address-sensitive: neither C nor the object
+    ///   itself may hold a pointer into it (C registered it, or it points
+    ///   into itself), as for a value [`define_ctype!`](crate::define_ctype)'s
+    ///   layout type holds by value;
+    /// - nothing but the box may reach it from here on, C included, as for
+    ///   any `Box`.
+    ///
+    /// No type says either, so the caller does; a [`CZeroable`] `T` meets
+    /// the first by its contract.
+    #[inline]
+    pub unsafe fn into_box(self) -> alloc::boxed::Box<T, CAllocator<P>> {
+        let _ = CAllocator::<P>::object_layout::<T>();
+        let (ptr, a) = self.into_raw_with();
+        // SAFETY: a live `T` in a `size_of::<T>()`-byte block of the family,
+        // aligned for it, which the box frees with `T`'s layout, as this
+        // policy's `CDrop<T>` did; the caller vouches for the rest.
+        unsafe { alloc::boxed::Box::from_raw_in(ptr, a) }
+    }
+}
+
+/// `CVec<T, CAllocator<P>>` as the `Vec` it is: the same buffer and
+/// allocator, capacity = length, nothing copied — `CVec` → `Vec`, once C no
+/// longer keeps the buffer. The `Vec` grows it through the family's
+/// `realloc` and frees it with its `free`, which accept its length as
+/// [`CAllocator`]'s fit rule says.
+///
+/// An empty `CVec` becomes an empty `Vec`, which holds no allocation: a NULL
+/// buffer allocates nothing, and a non-NULL buffer of length 0 (C's
+/// `malloc(0)`) is freed first, since a `Vec` of capacity 0 never frees
+/// one.
+///
+/// For elements a `CVec` hands out as a slice ([`CSliceElem`]); a buffer of
+/// C objects stays behind handles. Zero-sized elements, and elements aligned
+/// beyond the family's `ALIGN`, are refused at compile time:
+///
+/// ```compile_fail,E0080
+/// # use ffibox::{CAllocator, CVec, RustAlloc};
+/// let v = CVec::<(), CAllocator<RustAlloc>>::empty();
+/// let _ = Vec::from(v);
+/// ```
+///
+/// ```compile_fail,E0080
+/// # use ffibox::{CAllocator, CVec, RustAlloc};
+/// #[derive(Clone, Copy)]
+/// #[repr(align(32))]
+/// struct Wide(u8);
+/// let v = CVec::<Wide, CAllocator<RustAlloc>>::empty();
+/// let _ = Vec::from(v);
+/// ```
+#[cfg(feature = "alloc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+impl<T: CSliceElem, P: CLenAlloc> From<CVec<T, CAllocator<P>>>
+    for alloc::vec::Vec<T, CAllocator<P>>
+{
+    #[inline]
+    fn from(v: CVec<T, CAllocator<P>>) -> Self {
+        let _ = CAllocator::<P>::object_layout::<T>();
+        let (ptr, len, a) = v.into_raw_parts_with();
+        let Some(ptr) = NonNull::new(ptr) else {
+            return Self::new_in(a);
+        };
+        if len == 0 {
+            // SAFETY: a live buffer of the family the `CVec` owned, freed with
+            // the length it would have freed it with.
+            no_unwind(|| unsafe { a.0.c_drop_len(ptr.as_ptr().cast(), 0) });
+            return Self::new_in(a);
+        }
+        // SAFETY: `len` initialised `T` in a buffer of the family, aligned for
+        // `T`, its `len * size_of::<T>()` bytes a length `c_drop_len` accepts
+        // (`CVec::from_raw_parts`' contract), which is a layout that fits it
+        // under `CAllocator`'s rule; nothing else owns it.
+        unsafe { Self::from_raw_parts_in(ptr.as_ptr(), len, len, a) }
+    }
+}
+
+/// A `Vec<T, CAllocator<P>>` as a [`CVec`], to hand C a buffer it frees with
+/// the family's `free`: the same buffer and allocator, nothing copied —
+/// `Vec` → `CVec`. A `CVec` records its length alone, so the buffer is first
+/// made exactly that long: spare capacity is given back through the family's
+/// `realloc` (a free that takes a size is then given the right one), and if
+/// that fails the `Vec` comes back unchanged as the error.
+///
+/// An empty `Vec` holds a dangling pointer, which C must never free: it
+/// becomes the NULL `CVec`, its allocation, if it had capacity, freed.
+/// Zero-sized elements, which a `Vec` never allocates, and elements aligned
+/// beyond the family's `ALIGN` are refused at compile time:
+///
+/// ```compile_fail,E0080
+/// # use ffibox::{CAllocator, CVec, RustAlloc};
+/// let v: Vec<(), _> = Vec::new_in(CAllocator::new(RustAlloc));
+/// let _ = CVec::try_from(v);
+/// ```
+#[cfg(feature = "alloc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+impl<T, P: CLenAlloc> TryFrom<alloc::vec::Vec<T, CAllocator<P>>> for CVec<T, CAllocator<P>> {
+    /// The `Vec`, unchanged, when its spare capacity could not be given back.
+    type Error = alloc::vec::Vec<T, CAllocator<P>>;
+
+    fn try_from(v: alloc::vec::Vec<T, CAllocator<P>>) -> Result<Self, Self::Error> {
+        let elem = CAllocator::<P>::object_layout::<T>();
+        let (ptr, len, cap, a) = v.into_raw_parts_with_allocator();
+        if cap == 0 {
+            // No allocation: the dangling pointer stays in Rust.
+            return Ok(Self::empty_with(a));
+        }
+        // SAFETY: a `Vec` with capacity holds a non-null block of
+        // `cap * size_of::<T>() <= isize::MAX` bytes from `a`, aligned for `T`.
+        let (base, held) = unsafe {
+            (
+                NonNull::new_unchecked(ptr),
+                Layout::from_size_align_unchecked(cap * elem.size(), elem.align()),
+            )
+        };
+        if len == 0 {
+            // SAFETY: the block the `Vec` held, with its layout; freed once.
+            unsafe { a.deallocate(base.cast(), held) };
+            return Ok(Self::empty_with(a));
+        }
+        let base = if len == cap {
+            base
+        } else {
+            // SAFETY: `len < cap`, so the size is in range.
+            let used =
+                unsafe { Layout::from_size_align_unchecked(len * elem.size(), elem.align()) };
+            // SAFETY: the block the `Vec` held, which `held` fits; on failure
+            // it is untouched.
+            match unsafe { a.shrink(base.cast(), held, used) } {
+                Ok(block) => block.cast::<T>(),
+                Err(AllocError) => {
+                    // SAFETY: the parts the `Vec` gave up, unchanged.
+                    let v = unsafe { Self::Error::from_raw_parts_in(ptr, len, cap, a) };
+                    return Err(v);
+                }
+            }
+        };
+        // SAFETY: `len` initialised `T` in a block of the family exactly
+        // `len * size_of::<T>()` bytes long, aligned for `T`, which the
+        // `CVec`'s policy frees with that length; nothing else owns it.
+        Ok(unsafe { Self::from_non_null_parts_with(base, len, a) })
     }
 }

@@ -414,6 +414,20 @@ impl<T: CCell, D: CDrop<T>> CBox<T, D> {
         })
     }
 
+    /// [`from_raw_with`](Self::from_raw_with) of a pointer known non-null.
+    ///
+    /// # Safety
+    ///
+    /// As [`from_raw`](Self::from_raw).
+    #[cfg(feature = "alloc")]
+    #[inline]
+    pub(crate) unsafe fn from_non_null_with(ptr: NonNull<T>, policy: D) -> Self {
+        Self {
+            ptr,
+            policy: ZstPolicy::new(policy),
+        }
+    }
+
     /// Raw pointer for passing to C. Ownership is retained.
     #[inline]
     #[must_use]
@@ -1473,6 +1487,22 @@ impl<T, S: CLenDrop> CVec<T, S> {
             len,
             policy,
         })
+    }
+
+    /// [`from_raw_parts_with`](Self::from_raw_parts_with) of a pointer known
+    /// non-null.
+    ///
+    /// # Safety
+    ///
+    /// As [`from_raw_parts`](Self::from_raw_parts).
+    #[cfg(feature = "alloc")]
+    #[inline]
+    pub(crate) unsafe fn from_non_null_parts_with(ptr: NonNull<T>, len: usize, policy: S) -> Self {
+        Self {
+            ptr: Some(ptr),
+            len,
+            policy,
+        }
     }
 
     /// As [`from_raw_parts`](Self::from_raw_parts), but NULL with `len == 0`

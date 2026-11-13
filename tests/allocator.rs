@@ -651,3 +651,165 @@ fn the_policy_forwards_the_family_s_buffer_routines() {
     assert_eq!(<A as CLenAlloc>::ALIGN, 16);
     assert_eq!(<CAllocator<Narrow> as CLenAlloc>::ALIGN, 8);
 }
+
+// ---------------------------------------------------------------------------
+// To and from CBox and CVec
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_box_becomes_a_cbox_and_back_without_copying() {
+    let _f = fresh();
+    let b = Box::new_in(Point::zeroed(), ALLOC);
+    let at = core::ptr::from_ref(&*b).addr();
+    let c: CBox<Point, A> = CBox::from(b);
+    assert_eq!(c.as_ptr().addr(), at);
+    assert_eq!(c.as_ref().x(), 0);
+    // SAFETY: `Point` is `CZeroable`, so not address-sensitive, and nothing
+    // but the box reaches it.
+    let b = unsafe { c.into_box() };
+    assert_eq!(core::ptr::from_ref(&*b).addr(), at);
+    drop(b);
+    let n = counts();
+    assert_eq!((n.mallocs, n.frees), (1, 1));
+}
+
+#[test]
+fn a_box_handed_to_c_is_freed_by_c_s_free() {
+    let _f = fresh();
+    let c: CBox<Point, A> = CBox::from(Box::new_in(Point::zeroed(), ALLOC));
+    let raw = c.into_c();
+    // SAFETY: C frees what the family allocated.
+    unsafe { heap_free(raw.cast()) };
+    let n = counts();
+    assert_eq!((n.mallocs, n.frees), (1, 1));
+}
+
+#[test]
+fn a_cbox_built_by_the_policy_becomes_a_box() {
+    let _f = fresh();
+    let c: CBox<Point, CAllocator<SizedHeap>> = CBox::new_zeroed().unwrap();
+    // SAFETY: as above.
+    let b = unsafe { c.into_box() };
+    drop(b); // the sized free is given `size_of::<Point>()`
+}
+
+#[test]
+fn a_cvec_becomes_a_vec_that_grows_in_place() {
+    let _f = fresh();
+    let v: CVec<u32, A> = CVec::from_fn(3, |i| i as u32 + 1).unwrap();
+    let at = v.as_ptr().addr();
+    let mut w: Vec<u32, A> = Vec::from(v);
+    assert_eq!(w.as_ptr().addr(), at);
+    assert_eq!((w.len(), w.capacity()), (3, 3));
+    w.push(4); // `realloc`
+    assert_eq!(w, [1, 2, 3, 4]);
+    drop(w);
+    let n = counts();
+    assert_eq!((n.mallocs, n.reallocs, n.frees), (1, 1, 1));
+}
+
+#[test]
+fn an_empty_cvec_becomes_a_vec_that_holds_nothing() {
+    let _f = fresh();
+    let w: Vec<u32, A> = Vec::from(CVec::<u32, A>::empty());
+    assert_eq!(w.capacity(), 0);
+    drop(w);
+
+    // A non-NULL buffer of length 0, as `malloc(0)` may return, is freed
+    // rather than leaked by a `Vec` of capacity 0.
+    // SAFETY: a one-byte buffer of the family, adopted with no elements.
+    let empty = unsafe {
+        let p = heap_malloc(1).cast::<u32>();
+        CVec::<u32, A>::from_raw_parts(p, 0).unwrap()
+    };
+    let w: Vec<u32, A> = Vec::from(empty);
+    assert_eq!(w.capacity(), 0);
+    assert_eq!(counts().live, 0);
+    drop(w);
+    let n = counts();
+    assert_eq!((n.mallocs, n.frees), (1, 1));
+}
+
+#[test]
+fn an_empty_vec_hands_c_null_never_its_dangling_pointer() {
+    let _f = fresh();
+    // Never allocated: capacity 0, a dangling pointer.
+    let v: Vec<u64, A> = Vec::new_in(ALLOC);
+    assert_eq!(v.capacity(), 0);
+    let c = CVec::try_from(v).unwrap();
+    let (ptr, len) = c.into_raw_parts();
+    assert!(ptr.is_null());
+    assert_eq!(len, 0);
+    // SAFETY: C frees what the `CVec` gave it; `free(NULL)` does nothing.
+    unsafe { heap_free(ptr.cast()) };
+
+    // Allocated, then emptied: the buffer is freed and C gets NULL.
+    let mut v: Vec<u64, A> = Vec::with_capacity_in(8, ALLOC);
+    v.push(1);
+    v.clear();
+    let c = CVec::try_from(v).unwrap();
+    assert!(c.as_ptr().is_null());
+    assert_eq!(counts().live, 0);
+    let (ptr, _) = c.into_raw_parts();
+    // SAFETY: as above.
+    unsafe { heap_free(ptr.cast()) };
+    let n = counts();
+    assert_eq!((n.mallocs, n.frees), (1, 1));
+}
+
+#[test]
+fn a_vec_with_spare_capacity_is_shrunk_to_its_length() {
+    let _f = fresh();
+    let a = CAllocator::new(SizedHeap);
+    let mut v: Vec<u32, CAllocator<SizedHeap>> = Vec::with_capacity_in(16, a);
+    v.extend([5, 6, 7]);
+    let c = CVec::try_from(v).unwrap();
+    assert_eq!(c.as_slice(), [5, 6, 7]);
+    assert_eq!(counts().reallocs, 1);
+    // The sized free is given the buffer's exact size, 3 elements' worth.
+    drop(c);
+
+    // Handed to C, its `free` takes the buffer.
+    let mut v: Vec<u32, A> = Vec::with_capacity_in(16, ALLOC);
+    v.extend([1, 2]);
+    let (ptr, len) = CVec::try_from(v).unwrap().into_raw_parts();
+    assert_eq!(len, 2);
+    // SAFETY: C frees what the family allocated.
+    unsafe { heap_free(ptr.cast()) };
+}
+
+#[test]
+fn a_vec_whose_shrink_fails_comes_back_unchanged() {
+    let _f = fresh();
+    let mut v: Vec<u32, A> = Vec::with_capacity_in(16, ALLOC);
+    v.extend([1, 2, 3]);
+    let at = v.as_ptr().addr();
+    fail_realloc(true);
+    let v = CVec::try_from(v).unwrap_err();
+    fail_realloc(false);
+    assert_eq!(v, [1, 2, 3]);
+    assert_eq!((v.capacity(), v.as_ptr().addr()), (16, at));
+    // A Vec already its length's size needs no shrink.
+    let mut w: Vec<u32, A> = Vec::with_capacity_in(3, ALLOC);
+    w.extend([1, 2, 3]);
+    fail_realloc(true);
+    let c = CVec::try_from(w).unwrap();
+    fail_realloc(false);
+    assert_eq!(c.as_slice(), [1, 2, 3]);
+}
+
+#[test]
+fn owner_elements_cross_without_being_dropped_twice() {
+    let _f = fresh();
+    let strings: CVec<Option<CStrBox<A>>, A> =
+        CVec::from_fn(3, |i| CStrBox::from_c_str([c"a", c"b", c"c"][i])).unwrap();
+    let mut w: Vec<Option<CStrBox<A>>, A> = Vec::from(strings);
+    w.push(None);
+    w.push(CStrBox::from_c_str(c"d"));
+    let back = CVec::try_from(w).unwrap();
+    assert_eq!(back.len(), 5);
+    assert_eq!(back.as_slice()[4].as_deref(), Some(c"d"));
+    drop(back);
+    let n = counts();
+    assert_eq!(n.mallocs, n.frees);
+}
