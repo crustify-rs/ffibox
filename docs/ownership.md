@@ -18,6 +18,7 @@ For the borrowed side — handles over objects C or a parent releases — see
 | | `CStrBox<P>` | ffibox | an owned NUL-terminated `char *`; read-only `CStr` / `str` / byte views |
 | | `CVec<T, P>` | ffibox | an owned `(ptr, len)` array, NULL when empty; drops its elements, then frees the buffer; `&[T]` for plain elements and owners, `CSlice` for wrapped C objects; `from_fn` / `new_uninit` build one in `P`'s allocator, `from_slice` copies a Rust slice into it |
 | shared owner | `CArc<Foo, P>` | ffibox | one counted reference to a refcounted object; `Clone` through the up_ref; the shared handle always, `get_mut` / `make_mut` when the count proves it sole or after a copy, and `lock()` → `CGuard` when `Foo` is `CGuarded` over part of it |
+| standard owners over a C allocator | `Box<T, CAllocator<P>>`, `Vec<T, CAllocator<P>>` | std, over ffibox's `CAllocator` | a value or buffer Rust owns natively in storage C allocates or frees with the family `P` (`malloc` / `realloc` / `free`); to and from `CBox` / `CVec` over the same `CAllocator<P>` without copying — see [`Box` and `Vec` over a C allocator](#box-and-vec-over-a-c-allocator) |
 
 ## Conventions
 
@@ -138,7 +139,7 @@ carries `PhantomData<*const ()>` instead (see
 | `CRefClone<T>: CDrop<T>` | `c_up_ref` — a refcount increment on the SAME pointer; `c_is_sole_owner` (default `false`) | `impl_crefclone!(P, Foo, f)`; `…, ok = |r| r == 1`, `…, sole = g` | `CArc`'s `Clone`, `get_mut`, `make_mut` |
 | `CLenDrop` | `c_drop_len` — a buffer free, given the byte length; the buffer only, never its elements | `impl_clendrop!(P, f)` | `CVec` |
 | `CLenClone: CLenDrop` | `c_clone_len` — a buffer memdup (`T: Copy` only) from any readable source; `ALIGN` (default 1) bounds the element types it can copy | `impl_clenclone!(P, f)`, `impl_clenclone!(P, f, align = 16)` | `CVec`'s `Clone`, `CVec::from_slice`, `CSlice::to_cvec` |
-| `CLenAlloc: CLenDrop` | `c_alloc_len` — uninitialised buffer storage (`malloc(n)`); `ALIGN` as above | by hand | `CVec::from_fn`, `CVec::new_uninit` |
+| `CLenAlloc: CLenDrop` | `c_alloc_len` — uninitialised buffer storage (`malloc(n)`); `ALIGN` as above; `c_realloc_len` — `realloc`, provided as `malloc`, copy and `free` | `impl_clenalloc!(P, f)`, `…, align = 16`, `…, realloc = g` | `CVec::from_fn`, `CVec::new_uninit`, `CAllocator<P>` |
 | `CDispose<T>` | `c_dispose` — `*_uninit` / `*_clear` on a value | `impl_cdispose!(P, Foo, f)` | `CVal` |
 | `CNew<T>: CDrop<T>` | `c_new` — a zero-argument `*_alloc` / `*_new` | by hand | `CBox::new`, `CArc::new` |
 | `CAlloc<T>: CDrop<T> + CDrop<MaybeUninit<T>>` | `c_alloc` — uninitialised storage (`malloc`); the free must not read it | by hand | `CBox::new_uninit` |
@@ -284,7 +285,8 @@ For boxes, strings and buffers.
 |------------|--------|
 | `foo_free` | `impl_cdrop!` |
 | `foo_alloc()` + `foo_free` | `impl_cdrop!` + a hand-written `CNew` → `CBox::new()` |
-| `malloc` / `calloc` + `free`, for any type | a generic hand-written `CDrop<T>` + `CAlloc<T>` / `CAllocZeroed<T>` |
+| `malloc` / `realloc` + `free`, an allocation family | `impl_clendrop!` + `impl_clenalloc!` on one policy `P`; `CAllocator<P>` is then the storage-only policy of every owner (`CBox`, `CStrBox`, `CVec`) and the `Allocator` of `Box` / `Vec` |
+| `malloc` / `calloc` + `free`, for any type, without a family | a generic hand-written `CDrop<T>` + `CAlloc<T>` / `CAllocZeroed<T>` |
 | `foo_free` + `foo_dup` | `impl_cdrop!` + `impl_cdupclone!` |
 | `foo_unref`, held as the only reference | `impl_cdrop!` with the down-ref; no `Clone` |
 | `foo_unref` + `foo_up_ref`, shared, read-only | `impl_cdrop!` + `impl_crefclone!` → `CArc` |
@@ -307,3 +309,75 @@ Rust allocates is held by the same owners and handles as one C allocated, and
 when a type's allocation moves from C to Rust during a port, only its owner's
 alias changes: `CBox<Foo, FooFree>` becomes `CBox<Foo, RustAlloc>`. What it
 allocates only it frees; [outbound.md](outbound.md) covers offering it to C.
+
+## `Box` and `Vec` over a C allocator
+
+A C allocation family, `malloc` / `realloc` / `free` and the alignment they
+vouch for, is a `CLenAlloc` policy, declared once:
+
+```rust,ignore
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LibAlloc;
+impl_clendrop!(LibAlloc, lib_buf_free); // adapter over `lib_free(void *)`
+impl_clenalloc!(LibAlloc, ffi::lib_malloc, align = 16, realloc = ffi::lib_realloc);
+
+pub type LibAllocator = CAllocator<LibAlloc>;
+pub type LibBox<T> = Box<T, LibAllocator>;
+pub type LibVec<T> = Vec<T, LibAllocator>;
+pub type FooBox = CBox<Foo, LibAllocator>; // storage-only: `lib_free` releases it
+```
+
+A policy that already implements `CLenAlloc` by hand needs nothing more:
+`CAllocator<P>` over it is the standard `core::alloc::Allocator` (what
+`System` and `Global` are for Rust's heap), and a storage-only policy for
+`CBox`, `CStrBox` and `CVec`, as `RustAlloc` is over Rust's heap.
+
+**Which owner.** Both hold memory of the family; what decides is what C does
+with the value beyond its storage.
+
+| the value | owner |
+|-----------|-------|
+| a Rust value (a native-layout struct, a run of plain data or owners) whose storage C allocates or frees, and nothing more: C keeps no pointer into it while Rust holds it | `Box<T, CAllocator<P>>`, `Vec<T, CAllocator<P>>` |
+| a buffer Rust grows (`push`, `extend`, `try_reserve`) before handing it to C, or one C allocated that Rust grows | `Vec<T, CAllocator<P>>`, into a `CVec` to hand over |
+| a C object reached through handles (a `CCell` layout type), or one C keeps a pointer to, or one address-sensitive | `CBox<Foo, P>` |
+| released by a C lifecycle routine, not only `free` (`foo_free` disposing fields, a down-ref) | `CBox<Foo, FooFree>`, `CArc`: no `Allocator` releases it |
+| a counted object, a string | `CArc`, `CStrBox`: std's `Arc::new_in` and `String` with an allocator are not stable yet |
+| pinned, its address recorded by C | `CBox`: `Pin<Box<T, A>>` needs `StaticAllocator`, not stable yet |
+
+**Crossing.** The conversions keep the pointer and the allocator and copy
+nothing, where the owner's policy is `CAllocator<P>`:
+
+- `CBox::from(Box<T, CAllocator<P>>)`, and back with `unsafe into_box`,
+  whose caller vouches that the object is not address-sensitive and that
+  nothing else reaches it, since a `Box` lends `&mut T`, through which safe
+  code moves its bytes;
+- `Vec::from(CVec<T, CAllocator<P>>)` for the elements a `CVec` hands out
+  as a slice, and `CVec::try_from(Vec<T, CAllocator<P>>)`, which gives the
+  `Vec` back unchanged if the shrink below fails.
+
+C is never handed a pointer that was not allocated, and Rust is never handed
+a C NULL:
+
+- zero-sized types are refused at compile time on every path (a `Box` of
+  one, and every empty `Vec`, holds a dangling pointer);
+- an empty `Vec` becomes the NULL `CVec`, its capacity, if any, freed;
+- an empty non-NULL `CVec` (C's `malloc(0)`) is freed on the way to a
+  `Vec`, which would otherwise leak it at capacity 0;
+- a `Vec`'s spare capacity is given back through the family's `realloc`
+  before it becomes a `CVec`, which records only its length, so a free that
+  takes a size is given the buffer's.
+
+Hand C a buffer through the `CVec`'s `into_raw_parts`, not a `Vec`'s
+`as_mut_ptr`, which is dangling when the `Vec` is empty.
+
+**The allocator's rules.** Zero-sized requests never reach C; alignment
+beyond the family's is an `AllocError` (and a compile-time refusal in
+`try_box`, the policy impls and the conversions); `grow` and `shrink` go
+through `realloc`, the old block untouched on failure; no method unwinds.
+A buffer C allocated with the family counts as allocated by
+`CAllocator<P>`, and a layout fits it when its alignment is the family's or
+less and its size is one the family's free accepts: so
+`Vec::from_raw_parts_in(ptr, len, len, a)` adopts a buffer whose capacity C
+never recorded where the free ignores the size, as `free` does. `Box::new_in`
+and `Vec::push` abort when the family fails, as std's do; `CAllocator::try_box`
+(std's unstable `Box::try_new_in`) and `Vec::try_reserve` return the failure.

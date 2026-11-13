@@ -47,7 +47,9 @@ Strings, buffers and borrowed runs get their own types; a buffer drops its
 elements, so a `foo **` of owned objects releases each one.
 
 The other direction uses the same terms. `RustAlloc` is the policy over Rust's
-allocator, so an object Rust allocates is held as one C allocated; `CClosure`
+allocator, so an object Rust allocates is held as one C allocated, and
+`CAllocator` is a C allocation family as the standard `Allocator`, so a
+`Box` or `Vec` holds memory C frees; `CClosure`
 and `CPayload` put a Rust closure behind a C function pointer and its
 context, for one call or until C releases it; `CFn` and `CFnBox` hold a C
 function and its context that Rust calls, and `CCallback` and `CCallbackBox`
@@ -67,7 +69,8 @@ ffibox = "0.1"
 ```
 
 ffibox needs Rust 1.100 or later (`rust-version` in `Cargo.toml`), the first
-release with the standard `Allocator` interface.
+release with the standard `Allocator` interface, which `CAllocator` implements
+over a C allocation family.
 
 ffibox is `#![no_std]`. The `std` feature (on by default) selects
 `std::process::abort` for the unrecoverable-failure path (`Clone` or
@@ -75,7 +78,9 @@ ffibox is `#![no_std]`. The `std` feature (on by default) selects
 double-panic, and lets `CClosure`, `CTable`'s slots and `callback::barrier`
 catch a panic before it reaches C. The `alloc` feature, which `std` enables,
 adds `RustAlloc`, `CPayload`, `CCallbackBox` and `CTable`, which allocate
-through Rust's global allocator; nothing else allocates.
+through Rust's global allocator, and the conversions between ffibox's owners
+and `Box` / `Vec`; nothing else allocates but through a policy the consumer
+chose, as `CAllocator` allocates through its family.
 
 ```toml
 [dependencies]
@@ -98,7 +103,7 @@ When it is Rust's memory that C holds, calls or reads →
 |-----|---------------|
 | [goals.md](docs/goals.md) | what the primitives aim for, in both directions, and how each aim is checked |
 | [examples.md](docs/examples.md) | eight self-contained wrappers, each compiled as a doctest |
-| [ownership.md](docs/ownership.md) | `CBox`, `CBoxState`, `CVal`, `CStrBox`, `CVec`, `CArc`; the lifecycle policies; picking an owner and a policy |
+| [ownership.md](docs/ownership.md) | `CBox`, `CBoxState`, `CVal`, `CStrBox`, `CVec`, `CArc`; the lifecycle policies; picking an owner and a policy; `Box` and `Vec` over a C allocator (`CAllocator`) |
 | [borrows.md](docs/borrows.md) | `Foo`, `FooRef`, `FooMut`, `FooLocked`, `CGuard`, `CGuardedRef`, `CSlice`, `CSliceMut`, `CNullTerminated`; where the accessors live; the seam traits |
 | [outbound.md](docs/outbound.md) | Rust's side: `RustAlloc`, the callbacks (`CClosure`, `CPayload`, `CFn`, `CFnBox`, `CCallback`, `CCallbackBox`), C tables (`CTable`), out-parameters, the panic barrier, the `export_*!` macros |
 | [vtables.md](docs/vtables.md) | C tables of function pointers implemented in Rust: `CTable`, `impl_cvtable!`, their receivers, re-entry, panics and release, and the design |

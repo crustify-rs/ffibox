@@ -16,6 +16,7 @@ for one call and not kept is plain Rust: `&mut x as *mut _` for C that writes,
 |--------|-----------|------------------|
 | frees an object or buffer Rust allocated | an owner under `RustAlloc`, surrendered with `into_raw` / `into_c` | `Box::into_raw` |
 | frees a string or buffer with its own allocator | `CStrBox::from_c_str`, `CVec::from_slice`, `CVec::from_fn`, `CVec::new_uninit` under that allocator's policy | `CString`, `Vec` |
+| frees a value or buffer Rust built, and grew, in C's allocator | `Box<T, CAllocator<P>>` / `Vec<T, CAllocator<P>>`, into a `CBox` / `CVec` and surrendered with `into_c` / `into_raw_parts` | `Box::new_in`, `Vec::new_in` |
 | calls a closure during one call | `CClosure`: `ctx()` and `trampoline()` | `&mut F` |
 | keeps a closure or value, and releases it later | `CPayload`: `into_raw()`, `release_fn()`, `trampoline()` | `Box<F>` |
 | hands Rust a function and its context to call | `CFn` for the call or borrow it came with, `CFnBox` with the routine that releases the context: `call()`, `parts()` / `into_raw()` | a closure |
@@ -30,7 +31,9 @@ for one call and not kept is plain Rust: `&mut x as *mut _` for C that writes,
 - **C frees it.** The memory comes from the allocator C frees with. If that
   is C's own (`free`, `lib_free`), build it through that allocator's policy:
   `CVec::from_fn` and `CVec::new_uninit` with a `CLenAlloc` policy,
-  `CVec::from_slice` and `CStrBox::from_c_str` with a copying one. If C frees
+  `CVec::from_slice` and `CStrBox::from_c_str` with a copying one, or a
+  `Box` / `Vec` over `CAllocator<P>` when Rust builds or grows it natively,
+  converted into a `CBox` / `CVec` to hand over. If C frees
   it through a Rust routine, allocate with `RustAlloc` and offer the release
   with `export_cdrop!`. Then surrender it with `into_raw`.
 - **C calls back during the call** (`foreach`, `qsort_r`). `CClosure::new`

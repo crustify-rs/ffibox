@@ -27,6 +27,25 @@ Changes on `devel` since 0.1.1.
   to `CTable` replaces its `#[repr(C)]` struct, trampolines, `free` and
   re-entry state with one `impl_cvtable!` over the trait it already has; see
   [docs/vtables.md](docs/vtables.md).
+- **`Box` and `Vec` over a C allocator** (`allocator` module; `758eaaf`,
+  `155b9df`). `CAllocator<P>` is a `CLenAlloc` policy, a C allocation
+  family, as the standard `core::alloc::Allocator`, so
+  `Box<T, CAllocator<P>>` and `Vec<T, CAllocator<P>>` allocate, grow and
+  free through C's `malloc` / `realloc` / `free`, and adopt what C allocated
+  with them. It is zero-sized and `Copy` over a unit-struct policy, so a box
+  stays one pointer; zero-sized requests never reach C, alignment beyond the
+  family's is an `AllocError`, and its docs say which C buffers it counts as
+  allocated and which layouts fit them. It is also the storage-only policy
+  over the family for `CBox`, `CStrBox` and `CVec`, and `CBox` / `CVec`
+  over it convert to and from `Box` / `Vec` without copying: `CBox::from`
+  and `unsafe CBox::into_box`, `Vec::from` and `CVec::try_from`.
+  `CAllocator::try_box` is `Box::try_new_in`, which std has not stabilized.
+  `CLenAlloc` gains a provided `c_realloc_len`, C's `realloc`, as
+  `c_alloc_len`, a copy and `c_drop_len`; `impl_clenalloc!` binds a
+  family's `malloc`, with `align =` and `realloc =`. Nothing existing
+  changes: a hand-written `CLenAlloc` keeps the provided `c_realloc_len`,
+  which its contract already makes sound, and yields its `CAllocator`
+  as it is. See [docs/ownership.md](docs/ownership.md#box-and-vec-over-a-c-allocator).
 
 ### Migration from 0.1.1
 
@@ -63,6 +82,8 @@ Changes on `devel` since 0.1.1.
 
 ### Changes the build reports
 
+- **Rust 1.100 is the minimum** (`f944c17`), the first release with the
+  standard `Allocator` interface; an older toolchain refuses the crate.
 - **A policy with state no longer fits `CBox`, `CArc` or `CStrBox`**
   (`2398db0`), which are now `#[repr(transparent)]` over their pointer. Such
   a policy fails at monomorphization, so `cargo build` reports it where

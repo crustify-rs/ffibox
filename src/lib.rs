@@ -42,6 +42,7 @@
 //! | [`CCallback`] / [`CCallbackBox`] | either: a callback called from Rust and handed to C alike |
 //! | [`CTable<T, S>`] / [`impl_cvtable!`] | Rust state behind a C table of function pointers C calls into, its slots minted from the trait the state implements; [`impl_clocal_handles!`] lends its handles over any state where they stay on their thread |
 //! | [`RustAlloc`] | the policy over Rust's global allocator, for what Rust allocates and C frees |
+//! | [`CAllocator<P>`] / [`impl_clenalloc!`] | a C allocation family (`malloc` / `realloc` / `free`) as the standard `Allocator`, for `Box<T, CAllocator<P>>` and `Vec<T, CAllocator<P>>` over memory C frees, and as a storage-only policy; [`CBox`] and [`CVec`] convert to and from them |
 //!
 //! Like `Box`, the owners adopt a raw pointer with an `unsafe` `from_raw` and
 //! give one out with a safe `into_raw` / `as_ptr`. A type alias names an owner with its policy.
@@ -113,7 +114,9 @@
 //! [`callback::barrier`] catch a panic before it reaches C, as [`CTable`]'s
 //! slots do. The `alloc` feature, which `std` enables, adds [`RustAlloc`],
 //! [`CPayload`], [`CCallbackBox`] and [`CTable`], which allocate through Rust's
-//! global allocator; nothing else allocates.
+//! global allocator, and the conversions between ffibox's owners and `Box` /
+//! `Vec`; nothing else allocates but through a policy the consumer chose, as
+//! [`CAllocator`], which needs no feature, allocates through its family.
 //!
 //! [README]: https://github.com/crustify-rs/ffibox#readme
 

@@ -110,7 +110,7 @@ use crate::traits::{
 /// that takes the size, `len` must be exactly the allocation's. A size of 0
 /// fits no C buffer: a buffer C allocated with 0 bytes (`malloc(0)`'s
 /// non-NULL result) adopted with capacity 0 is leaked, never freed, so
-/// [`CVec`](crate::CVec)'s conversion frees it first.
+/// [`CVec`]'s conversion frees it first.
 ///
 /// # As a policy
 ///
@@ -220,7 +220,7 @@ impl<P: CLenAlloc> CAllocator<P> {
 impl<P: CLenAlloc> CAllocator<P> {
     /// `value` in a fresh box of the family, or [`AllocError`] if the
     /// allocation fails, dropping `value` — `Box::try_new_in(value, self)`,
-    /// which std has not stabilized; [`Box::new_in`] aborts on that failure
+    /// which std has not stabilized; [`Box::new_in`](alloc::boxed::Box::new_in) aborts on that failure
     /// instead. A zero-sized `T` allocates nothing, as a `Box` of one never
     /// does. A `T` aligned beyond the family's `ALIGN` is refused at compile
     /// time:
