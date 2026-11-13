@@ -75,10 +75,14 @@ use crate::traits::{
 ///   dangling pointer reaches its `realloc` or `free`. The typed paths ffibox
 ///   offers ([`try_box`](Self::try_box), the policy impls and the
 ///   conversions) refuse a zero-sized type at compile time, so none yields a
-///   dangling pointer for C to free; std's own `Box::new_in` and
-///   `Vec::new_in` accept one, as for any allocator, and hold a dangling
-///   pointer, which reaches C only through a raw pointer the consumer takes
-///   out of them.
+///   dangling pointer for C to free. std's own `Box::new_in` and
+///   `Vec::new_in` accept one, as for any allocator, and a `Box` of a
+///   zero-sized type, like every empty `Vec`, holds a dangling pointer: a raw
+///   pointer taken out of a `Box` over `CAllocator`
+///   (`Box::into_raw_with_allocator`) may go to C's free only for a
+///   non-zero-sized `T`, as [`try_box`](Self::try_box) guarantees, and a run
+///   goes to C through [`CVec`]'s `TryFrom<Vec>` and its `into_raw_parts`,
+///   which turn an empty `Vec` into NULL.
 /// - **Alignment beyond `P::ALIGN` is an [`AllocError`]**, from every
 ///   allocating method; the typed paths ffibox offers
 ///   ([`try_box`](Self::try_box), the policy impls and the conversions)

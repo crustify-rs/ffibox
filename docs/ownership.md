@@ -363,9 +363,11 @@ a C NULL:
 - zero-sized types are refused at compile time on every path ffibox offers,
   `try_box`, the policy impls and the conversions, since a `Box` of one,
   like every empty `Vec`, holds a dangling pointer; std's own `Box::new_in`
-  and `Vec::new_in` accept them, as for any allocator, so a `Box` or `Vec`
-  reaches C only as a `CBox` or `CVec`, never as a raw pointer taken out of
-  it;
+  and `Vec::new_in` accept them, as for any allocator, so a raw pointer
+  taken out of a `Box` over `CAllocator` (`Box::into_raw_with_allocator`,
+  the only way a native-layout `T` reaches C) may go to C's free only for a
+  non-zero-sized `T`, as `try_box` guarantees, and a run goes to C through
+  `CVec::try_from` and `into_raw_parts`, never as the raw parts of a `Vec`;
 - an empty `Vec` becomes the NULL `CVec`, its capacity, if any, freed;
 - an empty non-NULL `CVec` (C's `malloc(0)`) is freed on the way to a
   `Vec`, which would otherwise leak it at capacity 0;
