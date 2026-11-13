@@ -1,0 +1,653 @@
+//! `CAllocator`, the standard `Allocator` over a C allocation family, over a
+//! stand-in family of `extern "C"` routines on `std::alloc::System`, so that
+//! Miri runs it. The family records every buffer it hands out, so a test sees
+//! each call C would get: a `free` of a pointer it never returned (a dangling
+//! one) is counted, not performed, and so is a sized free given the wrong
+//! size, a `malloc(0)` and a buffer never freed.
+
+#![allow(missing_docs)]
+
+use core::alloc::{AllocError, Allocator, Layout};
+use core::ffi::{CStr, c_void};
+use core::mem::size_of;
+use core::ptr::{NonNull, null_mut};
+use std::alloc::{GlobalAlloc, System};
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+use ffibox::{
+    CAllocator, CBox, CLenAlloc, CStrBox, CVec, CZeroable, define_ctype, impl_clenalloc,
+    impl_clendrop,
+};
+
+// ---------------------------------------------------------------------------
+// The stand-in C family
+// ---------------------------------------------------------------------------
+
+/// Every buffer is preceded by a header this wide, which keeps it 16-aligned.
+const HDR: usize = 16;
+
+#[derive(Default)]
+struct Track {
+    /// Live buffers: address to size.
+    live: HashMap<usize, usize>,
+    mallocs: usize,
+    zero_mallocs: usize,
+    reallocs: usize,
+    frees: usize,
+    /// `free` or `realloc` of a pointer the family did not hand out.
+    bad_frees: usize,
+    /// A sized free given another size than the buffer's.
+    size_mismatches: usize,
+    fail_malloc: bool,
+    fail_realloc: bool,
+}
+
+thread_local! {
+    static TRACK: RefCell<Track> = RefCell::new(Track::default());
+}
+
+fn with<R>(f: impl FnOnce(&mut Track) -> R) -> R {
+    TRACK.with(|t| f(&mut t.borrow_mut()))
+}
+
+/// What a test reads back.
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+struct Counts {
+    live: usize,
+    mallocs: usize,
+    zero_mallocs: usize,
+    reallocs: usize,
+    frees: usize,
+    bad_frees: usize,
+    size_mismatches: usize,
+}
+
+fn counts() -> Counts {
+    with(|t| Counts {
+        live: t.live.len(),
+        mallocs: t.mallocs,
+        zero_mallocs: t.zero_mallocs,
+        reallocs: t.reallocs,
+        frees: t.frees,
+        bad_frees: t.bad_frees,
+        size_mismatches: t.size_mismatches,
+    })
+}
+
+/// Starts a test on a clean family, and checks on drop that it ended with
+/// nothing live and no bad call.
+struct Fresh;
+
+fn fresh() -> Fresh {
+    with(|t| *t = Track::default());
+    Fresh
+}
+
+impl Drop for Fresh {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        let c = counts();
+        assert_eq!(c.live, 0, "a buffer was never freed: {c:?}");
+        assert_eq!(
+            c.bad_frees, 0,
+            "C was handed a pointer it never allocated: {c:?}"
+        );
+        assert_eq!(
+            c.size_mismatches, 0,
+            "a sized free got the wrong size: {c:?}"
+        );
+        assert_eq!(c.zero_mallocs, 0, "C's malloc was asked for 0 bytes: {c:?}");
+    }
+}
+
+fn raw_layout(size: usize) -> Layout {
+    Layout::from_size_align(size + HDR, 16).unwrap()
+}
+
+/// A fresh buffer, untracked.
+unsafe fn raw_alloc(size: usize) -> *mut u8 {
+    // SAFETY: the layout is never zero-sized.
+    let base = unsafe { System.alloc(raw_layout(size)) };
+    if base.is_null() {
+        return null_mut();
+    }
+    // SAFETY: `HDR` bytes into a `size + HDR`-byte allocation.
+    unsafe { base.add(HDR) }
+}
+
+/// # Safety
+///
+/// `p` must be a live `raw_alloc(size)` buffer.
+unsafe fn raw_free(p: *mut u8, size: usize) {
+    // SAFETY: the caller passes a buffer `raw_alloc` returned.
+    unsafe { System.dealloc(p.sub(HDR), raw_layout(size)) }
+}
+
+/// The family's `malloc`.
+unsafe extern "C" fn heap_malloc(size: usize) -> *mut c_void {
+    if size == 0 {
+        with(|t| t.zero_mallocs += 1);
+    }
+    if with(|t| t.fail_malloc) {
+        return null_mut();
+    }
+    // SAFETY: any size.
+    let p = unsafe { raw_alloc(size) };
+    if !p.is_null() {
+        with(|t| {
+            t.live.insert(p.addr(), size);
+            t.mallocs += 1;
+        });
+    }
+    p.cast()
+}
+
+/// The family's `free`; NULL is a no-op, as for C's.
+unsafe extern "C" fn heap_free(p: *mut c_void) {
+    if p.is_null() {
+        return;
+    }
+    let Some(size) = with(|t| t.live.remove(&p.addr())) else {
+        with(|t| t.bad_frees += 1);
+        return;
+    };
+    with(|t| t.frees += 1);
+    // SAFETY: a live buffer of `size` bytes this family handed out.
+    unsafe { raw_free(p.cast(), size) }
+}
+
+/// The family's `realloc`.
+unsafe extern "C" fn heap_realloc(p: *mut c_void, size: usize) -> *mut c_void {
+    if p.is_null() {
+        // SAFETY: as `malloc`.
+        return unsafe { heap_malloc(size) };
+    }
+    let Some(old) = with(|t| t.live.get(&p.addr()).copied()) else {
+        with(|t| t.bad_frees += 1);
+        return null_mut();
+    };
+    if size == 0 {
+        with(|t| t.zero_mallocs += 1);
+    }
+    if with(|t| t.fail_realloc) {
+        return null_mut();
+    }
+    // SAFETY: any size.
+    let new = unsafe { raw_alloc(size) };
+    if new.is_null() {
+        return null_mut();
+    }
+    // SAFETY: `p` holds `old` bytes and `new` `size`, disjoint; `p` is freed
+    // once, after.
+    unsafe {
+        core::ptr::copy_nonoverlapping(p.cast::<u8>(), new, old.min(size));
+        raw_free(p.cast(), old);
+    }
+    with(|t| {
+        t.live.remove(&p.addr());
+        t.live.insert(new.addr(), size);
+        t.reallocs += 1;
+    });
+    new.cast()
+}
+
+/// # Safety
+///
+/// `p` must be a buffer of the family.
+unsafe fn heap_free_len(p: *mut u8, _byte_len: usize) {
+    // SAFETY: the caller transfers the buffer.
+    unsafe { heap_free(p.cast()) }
+}
+
+/// A free that takes the size: given another than the buffer's, it counts a
+/// mismatch.
+///
+/// # Safety
+///
+/// `p` must be a buffer of the family.
+unsafe fn heap_sized_free(p: *mut u8, byte_len: usize) {
+    let size = with(|t| t.live.get(&p.addr()).copied());
+    if size.is_some_and(|s| s != byte_len) {
+        with(|t| t.size_mismatches += 1);
+    }
+    // SAFETY: the caller transfers the buffer.
+    unsafe { heap_free(p.cast()) }
+}
+
+fn fail_malloc(on: bool) {
+    with(|t| t.fail_malloc = on);
+}
+
+fn fail_realloc(on: bool) {
+    with(|t| t.fail_realloc = on);
+}
+
+/// The family with its `realloc`, 16-aligned, its free ignoring the size.
+#[derive(Clone, Copy, Debug, Default)]
+struct Heap;
+impl_clendrop!(Heap, heap_free_len);
+impl_clenalloc!(Heap, heap_malloc, align = 16, realloc = heap_realloc);
+
+/// The same family without a `realloc`: moves are `malloc`, copy, `free`.
+#[derive(Clone, Copy, Debug, Default)]
+struct HeapNoRealloc;
+impl_clendrop!(HeapNoRealloc, heap_free_len);
+impl_clenalloc!(HeapNoRealloc, heap_malloc, align = 16);
+
+/// The family under a free that takes the size.
+#[derive(Clone, Copy, Debug, Default)]
+struct SizedHeap;
+impl_clendrop!(SizedHeap, heap_sized_free);
+impl_clenalloc!(SizedHeap, heap_malloc, align = 16, realloc = heap_realloc);
+
+/// The family vouching for 8-byte alignment only.
+#[derive(Clone, Copy, Debug, Default)]
+struct Narrow;
+impl_clendrop!(Narrow, heap_free_len);
+impl_clenalloc!(Narrow, heap_malloc, align = 8, realloc = heap_realloc);
+
+type A = CAllocator<Heap>;
+const ALLOC: A = CAllocator::new(Heap);
+
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Wide([u8; 16]);
+
+fn layout(size: usize, align: usize) -> Layout {
+    Layout::from_size_align(size, align).unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// The detector itself
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_family_counts_a_free_of_a_dangling_pointer() {
+    let _ = fresh();
+    // SAFETY: the stand-in refuses a pointer it did not hand out, without
+    // touching it.
+    unsafe { heap_free(NonNull::<u64>::dangling().as_ptr().cast()) };
+    assert_eq!(counts().bad_frees, 1);
+    with(|t| t.bad_frees = 0);
+}
+
+// ---------------------------------------------------------------------------
+// The allocator
+// ---------------------------------------------------------------------------
+
+#[test]
+fn zero_sized_requests_never_reach_c() {
+    let _f = fresh();
+    for align in [1, 8, 16] {
+        let l = layout(0, align);
+        let block = ALLOC.allocate(l).unwrap();
+        assert_eq!(block.len(), 0);
+        assert_eq!(block.cast::<u8>().as_ptr().addr() % align, 0);
+        // SAFETY: the block `allocate` just returned, with its layout.
+        unsafe { ALLOC.deallocate(block.cast(), l) };
+        let zeroed = ALLOC.allocate_zeroed(l).unwrap();
+        // SAFETY: as above.
+        unsafe { ALLOC.deallocate(zeroed.cast(), l) };
+    }
+    assert_eq!(counts(), Counts::default());
+}
+
+#[test]
+fn blocks_are_the_size_requested_and_aligned() {
+    let _f = fresh();
+    for (size, align) in [(1, 1), (3, 2), (24, 8), (100, 16)] {
+        let l = layout(size, align);
+        let block = ALLOC.allocate(l).unwrap();
+        assert_eq!(block.len(), size);
+        assert_eq!(block.cast::<u8>().as_ptr().addr() % align, 0);
+        // SAFETY: the block `allocate` just returned, with its layout.
+        unsafe { ALLOC.deallocate(block.cast(), l) };
+    }
+    let c = counts();
+    assert_eq!((c.mallocs, c.frees), (4, 4));
+}
+
+#[test]
+fn alignment_beyond_the_family_is_an_alloc_error() {
+    let _f = fresh();
+    let narrow = CAllocator::new(Narrow);
+    assert_eq!(narrow.allocate(layout(16, 16)), Err(AllocError));
+    assert_eq!(narrow.allocate(layout(0, 16)), Err(AllocError));
+    assert_eq!(ALLOC.allocate(layout(64, 32)), Err(AllocError));
+    assert_eq!(ALLOC.allocate_zeroed(layout(64, 32)), Err(AllocError));
+
+    // A move to an alignment beyond it fails and leaves the block alone.
+    let l = layout(8, 8);
+    let block = narrow.allocate(l).unwrap().cast::<u8>();
+    // SAFETY: `block` is live under `l`.
+    unsafe {
+        block.as_ptr().write_bytes(7, 8);
+        assert_eq!(narrow.grow(block, l, layout(32, 16)), Err(AllocError));
+        assert_eq!(narrow.shrink(block, l, layout(4, 16)), Err(AllocError));
+        assert_eq!(*block.as_ptr().add(7), 7);
+        narrow.deallocate(block, l);
+    }
+    let c = counts();
+    assert_eq!((c.mallocs, c.reallocs, c.frees), (1, 0, 1));
+}
+
+#[test]
+fn allocation_failure_is_an_alloc_error() {
+    let _f = fresh();
+    fail_malloc(true);
+    assert_eq!(ALLOC.allocate(layout(8, 8)), Err(AllocError));
+    assert!(ALLOC.try_box(5u64).is_err());
+    let mut v: Vec<u8, A> = Vec::new_in(ALLOC);
+    assert!(v.try_reserve(10).is_err());
+    fail_malloc(false);
+    assert_eq!(counts().mallocs, 0);
+}
+
+#[test]
+fn grow_and_shrink_go_through_realloc() {
+    let _f = fresh();
+    let small = layout(4, 4);
+    let big = layout(64, 4);
+    let p = ALLOC.allocate(small).unwrap().cast::<u8>();
+    // SAFETY: each block is used under the layout that fits it.
+    unsafe {
+        p.as_ptr()
+            .copy_from_nonoverlapping([1, 2, 3, 4].as_ptr(), 4);
+        let p = ALLOC.grow(p, small, big).unwrap();
+        assert_eq!(p.len(), 64);
+        let p = p.cast::<u8>();
+        assert_eq!(core::slice::from_raw_parts(p.as_ptr(), 4), [1, 2, 3, 4]);
+        let p = ALLOC.shrink(p, big, layout(2, 2)).unwrap().cast::<u8>();
+        assert_eq!(core::slice::from_raw_parts(p.as_ptr(), 2), [1, 2]);
+        // The same size keeps the block, without a call.
+        let same = ALLOC.shrink(p, layout(2, 2), layout(2, 1)).unwrap();
+        assert_eq!(same.cast::<u8>(), p);
+        ALLOC.deallocate(p, layout(2, 1));
+    }
+    let c = counts();
+    assert_eq!((c.mallocs, c.reallocs, c.frees), (1, 2, 1));
+}
+
+#[test]
+fn a_family_without_realloc_moves_through_malloc_and_free() {
+    let _f = fresh();
+    let a = CAllocator::new(HeapNoRealloc);
+    let mut v: Vec<u32, CAllocator<HeapNoRealloc>> = Vec::new_in(a);
+    v.extend(0..100);
+    v.shrink_to_fit();
+    assert_eq!(v.iter().sum::<u32>(), 4950);
+    drop(v);
+    let c = counts();
+    assert_eq!(c.reallocs, 0);
+    assert_eq!(c.mallocs, c.frees);
+}
+
+#[test]
+fn a_failed_move_leaves_the_block_as_it_was() {
+    let _f = fresh();
+    let l = layout(8, 8);
+    let p = ALLOC.allocate(l).unwrap().cast::<u8>();
+    fail_realloc(true);
+    // SAFETY: `p` is live under `l` throughout.
+    unsafe {
+        p.as_ptr().write_bytes(9, 8);
+        assert_eq!(ALLOC.grow(p, l, layout(80, 8)), Err(AllocError));
+        assert_eq!(ALLOC.grow_zeroed(p, l, layout(80, 8)), Err(AllocError));
+        assert_eq!(ALLOC.shrink(p, l, layout(4, 8)), Err(AllocError));
+        assert_eq!(core::slice::from_raw_parts(p.as_ptr(), 8), [9; 8]);
+        fail_realloc(false);
+        ALLOC.deallocate(p, l);
+    }
+
+    // Through a `Vec`: `try_reserve` fails and the elements stay.
+    let mut v: Vec<u64, A> = Vec::new_in(ALLOC);
+    v.extend([1, 2, 3]);
+    v.shrink_to_fit();
+    fail_realloc(true);
+    assert!(v.try_reserve(1000).is_err());
+    fail_realloc(false);
+    assert_eq!(v, [1, 2, 3]);
+}
+
+#[test]
+fn grow_zeroed_zeroes_past_the_old_size() {
+    let _f = fresh();
+    let old = layout(3, 1);
+    let new = layout(40, 1);
+    let p = ALLOC.allocate(old).unwrap().cast::<u8>();
+    // SAFETY: each block is used under the layout that fits it.
+    unsafe {
+        p.as_ptr().write_bytes(0xAA, 3);
+        let q = ALLOC.grow_zeroed(p, old, new).unwrap().cast::<u8>();
+        let bytes = core::slice::from_raw_parts(q.as_ptr(), 40);
+        assert_eq!(bytes[..3], [0xAA; 3]);
+        assert!(bytes[3..].iter().all(|&b| b == 0));
+        ALLOC.deallocate(q, new);
+
+        // From a block of size 0, every byte is zeroed, by a fresh `malloc`.
+        let z = ALLOC.allocate(layout(0, 1)).unwrap().cast::<u8>();
+        let q = ALLOC
+            .grow_zeroed(z, layout(0, 1), new)
+            .unwrap()
+            .cast::<u8>();
+        assert!(
+            core::slice::from_raw_parts(q.as_ptr(), 40)
+                .iter()
+                .all(|&b| b == 0)
+        );
+        ALLOC.deallocate(q, new);
+    }
+}
+
+#[test]
+fn shrinking_to_zero_frees_and_returns_a_dangling_block() {
+    let _f = fresh();
+    let l = layout(16, 8);
+    let p = ALLOC.allocate(l).unwrap().cast::<u8>();
+    // SAFETY: `p` is live under `l`; the block of size 0 is never freed by C.
+    unsafe {
+        let z = ALLOC.shrink(p, l, layout(0, 8)).unwrap();
+        assert_eq!(z.len(), 0);
+        ALLOC.deallocate(z.cast(), layout(0, 8));
+    }
+    let c = counts();
+    assert_eq!((c.mallocs, c.frees), (1, 1));
+}
+
+#[test]
+fn every_instance_of_a_stateless_family_is_one_allocator() {
+    let _f = fresh();
+    let l = layout(8, 8);
+    let p = CAllocator::new(Heap).allocate(l).unwrap();
+    // SAFETY: another instance of a stateless family frees what one allocated.
+    unsafe { CAllocator::<Heap>::default().deallocate(p.cast(), l) };
+}
+
+// ---------------------------------------------------------------------------
+// Box and Vec over it
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_box_is_one_pointer_with_c_s_abi() {
+    assert_eq!(size_of::<A>(), 0);
+    assert_eq!(size_of::<Box<u64, A>>(), size_of::<*mut u64>());
+    assert_eq!(size_of::<Option<Box<u64, A>>>(), size_of::<*mut u64>());
+    assert_eq!(size_of::<Vec<u64, A>>(), size_of::<Vec<u64>>());
+    fn copy<T: Copy>() {}
+    copy::<A>();
+}
+
+#[test]
+fn the_allocator_crosses_threads_as_its_family_does() {
+    let _f = fresh();
+    fn send_sync<T: Send + Sync>() {}
+    send_sync::<A>();
+    send_sync::<Box<u64, A>>();
+    send_sync::<Vec<u64, A>>();
+
+    /// A family that frees on the allocating thread only.
+    #[derive(Clone, Copy, Default)]
+    struct Local(core::marker::PhantomData<*const ()>);
+    impl_clendrop!(Local, heap_free_len);
+    impl_clenalloc!(Local, heap_malloc, align = 16);
+    let b = Box::new_in(1u64, CAllocator::new(Local(core::marker::PhantomData)));
+    drop(b);
+    // `CAllocator<Local>`, and so a box over it, is neither `Send` nor
+    // `Sync`: the compile-fail doc test on `CAllocator` checks it.
+}
+
+#[test]
+fn boxes_allocate_and_free_through_the_family() {
+    let _f = fresh();
+    let b = Box::new_in(41u64, ALLOC);
+    assert_eq!(*b + 1, 42);
+    let c = b.clone();
+    drop(b);
+    drop(c);
+    let w = ALLOC.try_box(Wide([3; 16])).unwrap();
+    assert_eq!(core::ptr::from_ref(&*w).addr() % 16, 0);
+    drop(w);
+    let n = counts();
+    assert_eq!((n.mallocs, n.frees), (3, 3));
+}
+
+#[test]
+fn a_box_of_a_zero_sized_type_allocates_nothing() {
+    let _f = fresh();
+    let b = Box::new_in((), ALLOC);
+    let t = ALLOC.try_box(()).unwrap();
+    drop((b, t));
+    assert_eq!(counts(), Counts::default());
+}
+
+#[test]
+fn vectors_grow_through_realloc_and_free_once() {
+    let _f = fresh();
+    let mut v: Vec<u32, A> = Vec::new_in(ALLOC);
+    assert_eq!(counts().mallocs, 0, "an empty Vec allocates nothing");
+    for i in 0..1000 {
+        v.push(i);
+    }
+    assert_eq!(v.len(), 1000);
+    v.truncate(3);
+    v.shrink_to_fit();
+    assert_eq!(v, [0, 1, 2]);
+    v.clear();
+    v.shrink_to_fit(); // frees, back to the dangling empty Vec
+    assert_eq!(counts().live, 0);
+    v.push(9);
+    drop(v);
+    let c = counts();
+    assert_eq!(c.mallocs, 2);
+    assert!(c.reallocs > 0);
+    assert_eq!(c.frees, 2);
+}
+
+#[test]
+fn a_vector_of_zero_sized_elements_allocates_nothing() {
+    let _f = fresh();
+    let mut v: Vec<(), A> = Vec::new_in(ALLOC);
+    v.extend([(); 100]);
+    assert_eq!(v.len(), 100);
+    drop(v);
+    assert_eq!(counts(), Counts::default());
+}
+
+#[test]
+fn a_sized_free_gets_each_block_s_exact_size() {
+    let _f = fresh();
+    let a = CAllocator::new(SizedHeap);
+    let mut v: Vec<u16, CAllocator<SizedHeap>> = Vec::with_capacity_in(5, a);
+    v.extend(0..40);
+    v.truncate(7);
+    v.shrink_to_fit();
+    drop(v);
+    let b = Box::new_in([1u8; 3], a);
+    drop(b);
+}
+
+#[test]
+fn a_vector_adopts_a_buffer_c_allocated_without_a_capacity() {
+    let _f = fresh();
+    // C allocates four `u32`s and records only their count.
+    // SAFETY: the family's `malloc`; the buffer is filled before adoption.
+    let ptr = unsafe { heap_malloc(4 * size_of::<u32>()) }.cast::<u32>();
+    // SAFETY: as above.
+    unsafe {
+        for i in 0..4 {
+            ptr.add(i).write(i as u32 * 10);
+        }
+    }
+    // SAFETY: a buffer of the family holding four `u32`s; `free` ignores the
+    // size, so a capacity of four fits it (see `CAllocator`'s fit rule).
+    let mut v = unsafe { Vec::from_raw_parts_in(ptr, 4, 4, ALLOC) };
+    v.push(40); // `realloc`
+    assert_eq!(v, [0, 10, 20, 30, 40]);
+    drop(v);
+    let c = counts();
+    assert_eq!((c.mallocs, c.reallocs, c.frees), (1, 1, 1));
+}
+
+// ---------------------------------------------------------------------------
+// As a policy
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+pub struct point_st {
+    x: i64,
+    y: i64,
+}
+define_ctype!(Point, PointRef, PointMut, point_st);
+// SAFETY: any coordinates are valid, zero included.
+unsafe impl CZeroable for Point {}
+
+impl PointRef<'_> {
+    fn x(&self) -> i64 {
+        use ffibox::CRefSeam;
+        // SAFETY: a raw read through the shared handle.
+        unsafe { (*self.as_ptr()).x }
+    }
+}
+
+#[test]
+fn as_a_policy_it_serves_boxes_strings_and_buffers() {
+    let _f = fresh();
+    let p: CBox<Point, A> = CBox::new().unwrap();
+    assert_eq!(p.as_ref().x(), 0);
+    let z: CBox<Point, A> = CBox::new_zeroed().unwrap();
+    let mut u = CBox::<Point, A>::new_uninit().unwrap();
+    // SAFETY: storage for one `point_st`, filled whole before promotion.
+    unsafe { u.as_c_ptr().write(point_st { x: 7, y: 0 }) };
+    // SAFETY: every field was written above.
+    let u = unsafe { u.assume_init() };
+    assert_eq!(u.as_ref().x(), 7);
+    let unfilled = CBox::<Point, A>::new_uninit().unwrap();
+    drop((p, z, u, unfilled));
+
+    let s: CStrBox<A> = CStrBox::from_c_str(c"hello").unwrap();
+    assert_eq!(s.as_c_str(), c"hello");
+    drop(s);
+
+    let v: CVec<u32, A> = CVec::from_fn(3, |i| i as u32).unwrap();
+    assert_eq!(v.as_slice(), [0, 1, 2]);
+    drop(v);
+    let c = counts();
+    assert_eq!(c.mallocs, 6);
+    assert_eq!(c.frees, 6);
+
+    // Strings under a sized free are freed with `strlen + 1`.
+    let _g = fresh();
+    let s: CStrBox<CAllocator<SizedHeap>> = CStrBox::from_c_str(c"sized").unwrap();
+    let t = s.clone();
+    assert_eq!(&*t, c"sized");
+    let _ = CStr::to_bytes(&t);
+}
+
+#[test]
+fn the_policy_forwards_the_family_s_buffer_routines() {
+    assert_eq!(<A as CLenAlloc>::ALIGN, 16);
+    assert_eq!(<CAllocator<Narrow> as CLenAlloc>::ALIGN, 8);
+}

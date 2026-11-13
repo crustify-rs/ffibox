@@ -128,6 +128,7 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+pub mod allocator;
 pub mod callback;
 pub mod iter;
 pub mod macros;
@@ -152,6 +153,7 @@ pub mod vtable;
 pub struct DocExamples;
 
 // Re-export the primary items at the crate root for convenience.
+pub use crate::allocator::CAllocator;
 pub use crate::callback::{CCallback, CClosure, CFn, CFnBox};
 #[cfg(feature = "alloc")]
 pub use crate::callback::{CCallbackBox, CPayload};

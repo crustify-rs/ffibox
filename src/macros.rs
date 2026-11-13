@@ -1072,6 +1072,161 @@ macro_rules! impl_clenclone {
     };
 }
 
+/// Implement [`CLenAlloc`](crate::CLenAlloc) on a policy that already
+/// implements [`CLenDrop`](crate::CLenDrop): the `malloc` of its allocation
+/// family, and its `realloc` if it has one. With the `free`
+/// [`impl_clendrop!`](crate::impl_clendrop) binds, that declares the family
+/// once, for every owner: [`CVec::from_fn`](crate::CVec::from_fn) and
+/// [`CVec::new_uninit`](crate::CVec::new_uninit) build buffers in it, and
+/// [`CAllocator<P>`](crate::CAllocator) is its standard `Allocator`.
+///
+/// The `malloc` routine is a plain path, `unsafe fn(usize) -> *mut c_void`
+/// (or `-> *mut u8`), called with the byte length, never 0, and returning a
+/// fresh buffer or NULL. The `realloc` routine is
+/// `unsafe fn(*mut c_void, usize) -> *mut c_void` (or over `*mut u8`), called
+/// with a live buffer and its new length, never 0, as C's `realloc` is; a
+/// policy without one moves a buffer through `malloc`, a copy and its `free`.
+///
+/// ```ignore
+/// /// # Safety
+/// /// `ptr` must be a `lib_malloc` buffer.
+/// unsafe fn lib_buf_free(ptr: *mut u8, _byte_len: usize) {
+///     // SAFETY: the caller transfers the buffer.
+///     unsafe { ffi::lib_free(ptr.cast()) }
+/// }
+/// #[derive(Clone, Copy, Debug, Default)]
+/// pub struct LibAlloc;
+/// impl_clendrop!(LibAlloc, lib_buf_free);
+/// impl_clenalloc!(LibAlloc, ffi::lib_malloc, align = 16, realloc = ffi::lib_realloc);
+///
+/// pub type LibBox<T> = Box<T, CAllocator<LibAlloc>>;
+/// pub type LibVec<T> = Vec<T, CAllocator<LibAlloc>>;
+/// ```
+///
+/// `align` is the alignment every buffer the routines return has, 1 when
+/// omitted; element types aligned beyond it are refused, at compile time by
+/// the typed constructors and with `AllocError` by the allocator.
+///
+/// A routine over another pointer type does not compile; one of another
+/// shape goes behind an `unsafe fn` adapter:
+///
+/// ```compile_fail,E0277
+/// # struct Ints;
+/// # unsafe impl ffibox::CLenDrop for Ints { unsafe fn c_drop_len(&self, _: *mut u8, _: usize) {} }
+/// unsafe fn ints_alloc(_n: usize) -> *mut u32 {
+///     core::ptr::null_mut()
+/// }
+/// ffibox::impl_clenalloc!(Ints, ints_alloc);
+/// ```
+///
+/// # Safety
+///
+/// The macro is safe to invoke but emits an `unsafe impl`. You assert that
+/// `malloc` returns a fresh, uniquely-owned buffer of at least `byte_len`
+/// bytes, or NULL on failure; that `realloc`, given a live buffer of the
+/// family, returns one of at least the new length holding the old one's
+/// bytes up to it, releasing the old one, or NULL on failure with the old one
+/// untouched; that every buffer either returns is aligned to `align`; and
+/// that the policy's `c_drop_len` releases each.
+#[macro_export]
+macro_rules! impl_clenalloc {
+    (@impl [$(#[$attr:meta])*] $policy:ty, $f:path, $align:expr, [$($realloc:path)?]) => {
+        // SAFETY: the invoker asserts `$f` returns a fresh `byte_len`-byte
+        // buffer of this family, aligned to `ALIGN`, or NULL, that the
+        // policy's `c_drop_len` releases, and that `realloc`, if given, moves
+        // one as C's `realloc` does.
+        unsafe impl $crate::CLenAlloc for $policy {
+            const ALIGN: usize = $align;
+
+            $(#[$attr])*
+            #[inline]
+            #[allow(unused_unsafe)]
+            fn c_alloc_len(&self, byte_len: usize) -> ::core::option::Option<::core::ptr::NonNull<u8>> {
+                // SAFETY: `byte_len` is not 0 (`c_alloc_len`'s contract); the
+                // invoker asserts the routine allocates it or returns NULL.
+                let buf = unsafe { $f(byte_len) };
+                ::core::ptr::NonNull::new($crate::macros::__byte_ptr(buf))
+            }
+
+            $(
+                #[inline]
+                #[allow(unused_unsafe)]
+                unsafe fn c_realloc_len(
+                    &self,
+                    ptr: *mut u8,
+                    _old_len: usize,
+                    new_len: usize,
+                ) -> ::core::option::Option<::core::ptr::NonNull<u8>> {
+                    // SAFETY: the caller passes a live buffer of this family
+                    // and a `new_len` that is not 0 (`c_realloc_len`'s
+                    // contract); the invoker asserts the routine moves it as
+                    // C's `realloc` does.
+                    let buf = unsafe { $realloc($crate::macros::__from_byte_ptr(ptr), new_len) };
+                    ::core::ptr::NonNull::new($crate::macros::__byte_ptr(buf))
+                }
+            )?
+        }
+    };
+    (
+        $(#[$attr:meta])* $policy:ty, $f:path, align = $align:expr
+        $(, realloc = $realloc:path)? $(,)?
+    ) => {
+        $crate::impl_clenalloc!(@impl [$(#[$attr])*] $policy, $f, $align, [$($realloc)?]);
+    };
+    ($(#[$attr:meta])* $policy:ty, $f:path $(, realloc = $realloc:path)? $(,)?) => {
+        $crate::impl_clenalloc!(@impl [$(#[$attr])*] $policy, $f, 1, [$($realloc)?]);
+    };
+}
+
+/// The pointer types an allocation routine
+/// [`impl_clenalloc!`](crate::impl_clenalloc) binds may take and return: a
+/// `void *`, or a byte pointer.
+#[doc(hidden)]
+#[diagnostic::on_unimplemented(
+    message = "an allocation routine takes and returns `*mut c_void` or `*mut u8`, not `{Self}`",
+    note = "bind a routine of another shape through an `unsafe fn` adapter"
+)]
+pub trait __BytePtr: Copy {
+    /// The pointer as a byte pointer.
+    fn __to_bytes(self) -> *mut u8;
+    /// A byte pointer as this type.
+    fn __from_bytes(p: *mut u8) -> Self;
+}
+impl __BytePtr for *mut u8 {
+    #[inline(always)]
+    fn __to_bytes(self) -> *mut u8 {
+        self
+    }
+    #[inline(always)]
+    fn __from_bytes(p: *mut u8) -> Self {
+        p
+    }
+}
+impl __BytePtr for *mut core::ffi::c_void {
+    #[inline(always)]
+    fn __to_bytes(self) -> *mut u8 {
+        self.cast()
+    }
+    #[inline(always)]
+    fn __from_bytes(p: *mut u8) -> Self {
+        p.cast()
+    }
+}
+
+/// An allocation routine's result as a byte pointer.
+#[doc(hidden)]
+#[inline(always)]
+pub fn __byte_ptr<P: __BytePtr>(p: P) -> *mut u8 {
+    p.__to_bytes()
+}
+
+/// A byte pointer as an allocation routine's argument.
+#[doc(hidden)]
+#[inline(always)]
+pub fn __from_byte_ptr<P: __BytePtr>(p: *mut u8) -> P {
+    P::__from_bytes(p)
+}
+
 /// Implement [`CDispose<T>`](crate::CDispose) on a policy, binding the C
 /// routine that disposes a value's resources in place — `*_uninit`,
 /// `*_clear` — for a [`CVal`](crate::CVal). The routine is called with a

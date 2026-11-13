@@ -14,7 +14,7 @@
 //! | [`CRefClone<T>`] | `c_up_ref` — a refcount increment; `c_is_sole_owner` | [`CArc`] |
 //! | [`CLenDrop`] | `c_drop_len(ptr, byte_len)` | [`CVec`] |
 //! | [`CLenClone`] | `c_clone_len` — a buffer memdup | its `Clone`, `CVec::from_slice` |
-//! | [`CLenAlloc`] | `c_alloc_len` — uninitialised buffer storage (`malloc(n)`) | `CVec::from_fn`, `CVec::new_uninit` |
+//! | [`CLenAlloc`] | `c_alloc_len` — uninitialised buffer storage (`malloc(n)`); `c_realloc_len` (`realloc`) | `CVec::from_fn`, `CVec::new_uninit`, [`CAllocator`](crate::CAllocator) |
 //! | [`CDispose<T>`] | `c_dispose` — `*_uninit` / `*_clear` on a value | [`CVal`] |
 //! | [`CNew<T>`] | `c_new` — a zero-argument `*_alloc` / `*_new` | `CBox::new`, `CArc::new` |
 //! | [`CAlloc<T>`] | `c_alloc` — untyped storage (`malloc`) | `CBox::new_uninit` |
@@ -711,6 +711,13 @@ pub unsafe trait CLenClone: CLenDrop {
 /// strings), unlike [`CLenClone`]'s byte copies: the constructors write each
 /// element as a value.
 ///
+/// With [`CLenDrop`] and [`c_realloc_len`](Self::c_realloc_len), this is a C
+/// allocation family, `malloc` / `realloc` / `free` and the alignment they
+/// vouch for, which [`CAllocator`](crate::CAllocator) offers as the standard
+/// `Allocator`, so that `Box<T, CAllocator<P>>` and `Vec<T, CAllocator<P>>`
+/// hold memory C frees. [`impl_clenalloc!`](crate::impl_clenalloc) binds the
+/// C routines.
+///
 /// # Safety
 ///
 /// - A `Some` from [`c_alloc_len`](Self::c_alloc_len) must be a fresh,
@@ -719,6 +726,12 @@ pub unsafe trait CLenClone: CLenDrop {
 ///   [`c_drop_len`](CLenDrop::c_drop_len) releases given the same `byte_len`,
 ///   without reading it.
 /// - `None` must mean the allocation failed.
+/// - An override of [`c_realloc_len`](Self::c_realloc_len) must keep the
+///   provided one's contract: a `Some` is an allocation as `c_alloc_len`'s,
+///   of `new_len` bytes (at the same address or a fresh one), holding the
+///   first `min(old_len, new_len)` bytes of the buffer it was given, which it
+///   has released; a `None` means the allocation failed and the buffer it was
+///   given is unchanged, still live and still the caller's — C's `realloc`.
 pub unsafe trait CLenAlloc: CLenDrop {
     /// Alignment every allocation [`c_alloc_len`](Self::c_alloc_len) returns
     /// is guaranteed to have; the constructors reject an element type aligned
@@ -728,6 +741,46 @@ pub unsafe trait CLenAlloc: CLenDrop {
     /// Allocate `byte_len` uninitialised bytes, or `None` on failure. Never
     /// called with `byte_len == 0`: an empty buffer is NULL.
     fn c_alloc_len(&self, byte_len: usize) -> Option<NonNull<u8>>;
+
+    /// Move the buffer at `ptr`, `old_len` bytes in use, into one of
+    /// `new_len` bytes that keeps its first `min(old_len, new_len)` bytes, or
+    /// `None` on failure, leaving the buffer as it was — C's `realloc`.
+    ///
+    /// Provided as a fresh [`c_alloc_len`](Self::c_alloc_len), a copy and a
+    /// [`c_drop_len`](CLenDrop::c_drop_len) of the old buffer. A policy whose
+    /// allocator has a `realloc` overrides it, through
+    /// [`impl_clenalloc!`](crate::impl_clenalloc)'s `realloc =`, to grow or
+    /// shrink in place. Never called with a length of 0, so an override never
+    /// meets `realloc(p, 0)`, which C leaves to the implementation.
+    ///
+    /// # Safety
+    ///
+    /// - `ptr` must be a live allocation the caller owns from the allocator
+    ///   this policy targets, and `old_len` a length
+    ///   [`c_drop_len`](CLenDrop::c_drop_len) accepts for it: no larger than
+    ///   the allocation, and exactly its size when the policy's free takes a
+    ///   size.
+    /// - Neither `old_len` nor `new_len` may be 0.
+    ///
+    /// On `Some`, the caller owns the new buffer and no longer the old one;
+    /// on `None`, it still owns the old one.
+    unsafe fn c_realloc_len(
+        &self,
+        ptr: *mut u8,
+        old_len: usize,
+        new_len: usize,
+    ) -> Option<NonNull<u8>> {
+        let new = self.c_alloc_len(new_len)?;
+        // SAFETY: the caller passes a live allocation of at least `old_len`
+        // bytes; `new` is a fresh one of `new_len`, so the two do not
+        // overlap and each is valid for the bytes copied. The old buffer is
+        // then released once, with a length `c_drop_len` accepts for it.
+        unsafe {
+            core::ptr::copy_nonoverlapping(ptr, new.as_ptr(), old_len.min(new_len));
+            self.c_drop_len(ptr, old_len);
+        }
+        Some(new)
+    }
 }
 
 // ---------------------------------------------------------------------------
