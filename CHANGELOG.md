@@ -32,13 +32,16 @@ Changes on `devel` since 0.1.1.
   family, as the standard `core::alloc::Allocator`, so
   `Box<T, CAllocator<P>>` and `Vec<T, CAllocator<P>>` allocate, grow and
   free through C's `malloc` / `realloc` / `free`, and adopt what C allocated
-  with them. It is zero-sized and `Copy` over a unit-struct policy, so a box
+  with them; it is an `Allocator` over a `Copy` policy, which has no drop
+  to unwind. It is zero-sized and `Copy` over a unit-struct policy, so a box
   stays one pointer; zero-sized requests never reach C, alignment beyond the
   family's is an `AllocError`, and its docs say which C buffers it counts as
   allocated and which layouts fit them. It is also the storage-only policy
   over the family for `CBox`, `CStrBox` and `CVec`, and `CBox` / `CVec`
   over it convert to and from `Box` / `Vec` without copying: `CBox::from`
-  and `unsafe CBox::into_box`, `Vec::from` and `CVec::try_from`.
+  and `unsafe CBox::into_box` (its caller vouching that the object is a
+  valid, movable `T` nothing else reaches), `Vec::from` and
+  `CVec::try_from`.
   `CAllocator::try_box` is `Box::try_new_in`, which std has not stabilized.
   `CLenAlloc` gains a provided `c_realloc_len`, C's `realloc`, as
   `c_alloc_len`, a copy and `c_drop_len`; `impl_clenalloc!` binds a

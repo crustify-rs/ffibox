@@ -327,7 +327,8 @@ pub type LibVec<T> = Vec<T, LibAllocator>;
 pub type FooBox = CBox<Foo, LibAllocator>; // storage-only: `lib_free` releases it
 ```
 
-A policy that already implements `CLenAlloc` by hand needs nothing more:
+A policy that already implements `CLenAlloc` by hand needs nothing more (an
+`Allocator` takes a `Copy` one, which has no drop to unwind; a unit struct is):
 `CAllocator<P>` over it is the standard `core::alloc::Allocator` (what
 `System` and `Global` are for Rust's heap), and a storage-only policy for
 `CBox`, `CStrBox` and `CVec`, as `RustAlloc` is over Rust's heap.
@@ -348,8 +349,9 @@ with the value beyond its storage.
 nothing, where the owner's policy is `CAllocator<P>`:
 
 - `CBox::from(Box<T, CAllocator<P>>)`, and back with `unsafe into_box`,
-  whose caller vouches that the object is not address-sensitive and that
-  nothing else reaches it, since a `Box` lends `&mut T`, through which safe
+  whose caller vouches that the object's bytes are a valid `T` (C may
+  have left a field unwritten, or written a `bool` of 2), that it is not
+  address-sensitive and that nothing else reaches it, since a `Box` lends `&mut T`, through which safe
   code moves its bytes;
 - `Vec::from(CVec<T, CAllocator<P>>)` for the elements a `CVec` hands out
   as a slice, and `CVec::try_from(Vec<T, CAllocator<P>>)`, which gives the
@@ -375,7 +377,7 @@ beyond the family's is an `AllocError` (and a compile-time refusal in
 `try_box`, the policy impls and the conversions); `grow` and `shrink` go
 through `realloc`, the old block untouched on failure; no method unwinds.
 A buffer C allocated with the family counts as allocated by
-`CAllocator<P>`, and a layout fits it when its alignment is the family's or
+`CAllocator<P>` once its ownership has passed to the caller, and a layout fits it when its alignment is the family's or
 less and its size is one the family's free accepts: so
 `Vec::from_raw_parts_in(ptr, len, len, a)` adopts a buffer whose capacity C
 never recorded where the free ignores the size, as `free` does. `Box::new_in`

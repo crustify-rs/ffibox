@@ -814,3 +814,105 @@ fn owner_elements_cross_without_being_dropped_twice() {
     let n = counts();
     assert_eq!(n.mallocs, n.frees);
 }
+
+// ---------------------------------------------------------------------------
+// Review fixes: the abort guard, adoption of a larger allocation, a sized free
+// ---------------------------------------------------------------------------
+
+/// A family whose `malloc` panics, as a Rust-implemented one might.
+#[derive(Clone, Copy, Debug, Default)]
+struct Panicky;
+impl_clendrop!(Panicky, heap_free_len);
+// SAFETY: never returns a buffer: it panics.
+unsafe impl CLenAlloc for Panicky {
+    const ALIGN: usize = 16;
+    fn c_alloc_len(&self, _byte_len: usize) -> Option<NonNull<u8>> {
+        panic!("the family's malloc panicked");
+    }
+}
+
+/// Set in the child process `a_panicking_family_aborts_rather_than_unwinds`
+/// spawns, which runs the panicking allocation.
+const ABORT_CHILD: &str = "FFIBOX_ALLOCATOR_ABORT_CHILD";
+
+#[test]
+#[cfg(unix)]
+#[cfg_attr(miri, ignore = "spawns a process")]
+fn a_panicking_family_aborts_rather_than_unwinds() {
+    use std::os::unix::process::ExitStatusExt;
+    if std::env::var_os(ABORT_CHILD).is_some() {
+        // The child: unwinding out of `allocate` would fail this test with a
+        // panic; the guard aborts the process first.
+        let _ = CAllocator::new(Panicky).allocate(layout(8, 8));
+        return;
+    }
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "a_panicking_family_aborts_rather_than_unwinds",
+            "--exact",
+            "--test-threads=1",
+        ])
+        .env(ABORT_CHILD, "1")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.signal(),
+        Some(6), // SIGABRT
+        "the allocation unwound instead of aborting: {:?}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn a_vector_adopts_a_buffer_larger_than_its_length() {
+    let _f = fresh();
+    // C allocates room for sixteen `u32`s and fills three: its allocation is
+    // larger than the length it hands over, which a free that ignores the
+    // size accepts as the Vec's capacity.
+    // SAFETY: the family's `malloc`; the first three elements are written
+    // before adoption.
+    let ptr = unsafe { heap_malloc(16 * size_of::<u32>()) }.cast::<u32>();
+    // SAFETY: as above.
+    unsafe {
+        for i in 0..3 {
+            ptr.add(i).write(i as u32);
+        }
+    }
+    // SAFETY: a buffer of the family C gave up, three `u32`s long, at most its
+    // allocation, under a free that ignores the size.
+    let mut v = unsafe { Vec::from_raw_parts_in(ptr, 3, 3, ALLOC) };
+    v.push(3);
+    v.shrink_to_fit();
+    assert_eq!(v, [0, 1, 2, 3]);
+    drop(v);
+
+    // The same through a `CVec`, adopted with its length only.
+    // SAFETY: as above.
+    let ptr = unsafe { heap_malloc(16 * size_of::<u32>()) }.cast::<u32>();
+    // SAFETY: as above.
+    let c = unsafe {
+        ptr.write(7);
+        CVec::<u32, A>::from_raw_parts(ptr, 1).unwrap()
+    };
+    let mut w = Vec::from(c);
+    w.extend([8, 9]);
+    assert_eq!(w, [7, 8, 9]);
+    drop(w);
+    let n = counts();
+    assert_eq!(n.mallocs, n.frees);
+}
+
+#[test]
+fn an_emptied_vec_under_a_sized_free_is_freed_with_its_size() {
+    let _f = fresh();
+    let a = CAllocator::new(SizedHeap);
+    let mut v: Vec<u64, CAllocator<SizedHeap>> = Vec::with_capacity_in(8, a);
+    v.extend([1, 2, 3]);
+    v.clear();
+    let c = CVec::try_from(v).unwrap();
+    assert!(c.as_ptr().is_null());
+    // The sized free was given the 8 elements' bytes the Vec held.
+    let n = counts();
+    assert_eq!((n.mallocs, n.frees, n.size_mismatches), (1, 1, 0));
+}

@@ -85,6 +85,12 @@ use crate::traits::{
 ///   block.
 /// - **No method unwinds**: if a policy's routine panics, the process aborts,
 ///   as the standard `Allocator` requires.
+/// - **It is an `Allocator` only over a `Copy` policy**, which has no drop
+///   glue: the standard `Allocator` forbids an allocator's drop to unwind,
+///   and a `Copy` bound says so in a type, where a policy with a `Drop` would
+///   need a new obligation on every `CLenAlloc` impl. A unit-struct policy,
+///   or one holding a handle, is `Copy`; as a policy of `CBox`, `CStrBox` and
+///   `CVec`, `CAllocator<P>` takes any `P`.
 ///
 /// Every block is exactly the size requested, so a `Box` or `Vec` hands
 /// [`c_drop_len`](CLenDrop::c_drop_len) the size the block was allocated
@@ -96,10 +102,14 @@ use crate::traits::{
 /// *fits* it. `CAllocator<P>` relaxes that, and the relaxation is what makes
 /// adopting C's buffers sound:
 ///
-/// - Every live, non-empty buffer of `P`'s family, allocated by
-///   `CAllocator<P>` or by C with the family's routines, is *currently
-///   allocated* by every `CAllocator<P>` whose `P` releases it (every
-///   instance of a stateless `P`).
+/// - A non-empty buffer of `P`'s family whose ownership has passed to the
+///   caller, whether `CAllocator<P>` allocated it or C did with the
+///   family's routines and gave it up (as a `CVec` adopted with
+///   `from_raw_parts` owns it), is *currently allocated* by every
+///   `CAllocator<P>` whose `P` releases it (every instance of a stateless
+///   `P`), until the caller gives it to `deallocate`, a successful `grow` or
+///   `shrink`, or back to C. Nothing else ends it: C frees only what it owns,
+///   and a buffer the caller owns is not C's.
 /// - A layout *fits* such a buffer when its alignment is at most
 ///   `P::ALIGN` and its size is not 0 and is a length
 ///   [`c_drop_len`](CLenDrop::c_drop_len) accepts for the buffer: no larger
@@ -124,7 +134,7 @@ use crate::traits::{
 /// | Owner | Through |
 /// |-------|---------|
 /// | `CBox<Foo, CAllocator<P>>` | [`CBox::new`](crate::CBox::new) / [`new_zeroed`](crate::CBox::new_zeroed) for a [`CZeroable`] `Foo`, [`CBox::new_uninit`](crate::CBox::new_uninit) otherwise; released by dropping the `Foo` in place and freeing its `size_of::<Foo>()` bytes, as a `Box` is |
-/// | `CStrBox<CAllocator<P>>` | [`CStrBox::from_c_str`](crate::CStrBox::from_c_str), copying into `strlen + 1` bytes; freed with that length |
+/// | `CStrBox<CAllocator<P>>` | [`CStrBox::from_c_str`](crate::CStrBox::from_c_str), copying into `strlen + 1` bytes; freed with that length, so a string adopted with [`CStrBox::from_raw`](crate::CStrBox::from_raw) under a free that takes a size must be an allocation of exactly `strlen + 1` bytes |
 /// | `CVec<T, CAllocator<P>>` | everything `CVec<T, P>` does, forwarded to `P` |
 ///
 /// Zero-sized objects, and objects aligned beyond `P::ALIGN`, are refused at
@@ -221,7 +231,7 @@ impl<P: CLenAlloc> CAllocator<P> {
 
 #[cfg(feature = "alloc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
-impl<P: CLenAlloc> CAllocator<P> {
+impl<P: CLenAlloc + Copy> CAllocator<P> {
     /// `value` in a fresh box of the family, or [`AllocError`] if the
     /// allocation fails, dropping `value` — `Box::try_new_in(value, self)`,
     /// which std has not stabilized; [`Box::new_in`](alloc::boxed::Box::new_in) aborts on that failure
@@ -279,16 +289,19 @@ fn no_unwind<R>(f: impl FnOnce() -> R) -> R {
 // SAFETY: every non-empty block is a fresh allocation of the family
 // (`c_alloc_len`, `c_realloc_len`), uniquely owned, of exactly the size
 // requested and aligned to `P::ALIGN >= layout.align()` (larger alignments
-// are refused), and it stays valid until `deallocate`, a successful `grow` or
-// `shrink`, or C frees it: `CAllocator` has no `&mut` API and its drop frees
-// nothing. Blocks of size 0 are dangling and well aligned, and never reach
+// are refused), whose ownership passes to the caller; a buffer C allocated
+// counts as currently allocated only once its ownership has passed to the
+// caller, as the docs above define. Either stays valid until the caller
+// gives it to `deallocate` or a successful `grow` or `shrink`: C frees only
+// buffers it owns, `CAllocator` has no `&mut` API, and it has no drop glue
+// (`P: Copy`), so dropping it neither frees nor unwinds. Blocks of size 0 are dangling and well aligned, and never reach
 // the family. The family's blocks are disjoint and end within the address
 // space, as any allocator's. A failed `grow` or `shrink` leaves the block
 // as it was (`c_realloc_len`'s contract). `deallocate` and the moves hand
 // `c_drop_len` / `c_realloc_len` the block's size, which fits it as the
 // docs above define. No method unwinds (`no_unwind`), none reads or writes a
 // block the caller holds beyond what `grow_zeroed` zeroes.
-unsafe impl<P: CLenAlloc> Allocator for CAllocator<P> {
+unsafe impl<P: CLenAlloc + Copy> Allocator for CAllocator<P> {
     #[inline]
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         no_unwind(|| self.alloc_block(layout))
@@ -530,7 +543,9 @@ unsafe impl<P: CLenAlloc + CLenClone> CLenClone for CAllocator<P> {
 /// The policy is stateless, as every [`CBox`]'s is.
 #[cfg(feature = "alloc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
-impl<T: CCell, P: CLenAlloc> From<alloc::boxed::Box<T, CAllocator<P>>> for CBox<T, CAllocator<P>> {
+impl<T: CCell, P: CLenAlloc + Copy> From<alloc::boxed::Box<T, CAllocator<P>>>
+    for CBox<T, CAllocator<P>>
+{
     #[inline]
     fn from(b: alloc::boxed::Box<T, CAllocator<P>>) -> Self {
         let _ = CAllocator::<P>::object_layout::<T>();
@@ -544,7 +559,7 @@ impl<T: CCell, P: CLenAlloc> From<alloc::boxed::Box<T, CAllocator<P>>> for CBox<
 
 #[cfg(feature = "alloc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
-impl<T: CCell, P: CLenAlloc> CBox<T, CAllocator<P>> {
+impl<T: CCell, P: CLenAlloc + Copy> CBox<T, CAllocator<P>> {
     /// The object as a `Box<T, CAllocator<P>>`: the same pointer and
     /// allocator, nothing copied — `CBox` → `Box`, once C no longer keeps
     /// the object. The box drops it in place and frees it through the
@@ -556,9 +571,15 @@ impl<T: CCell, P: CLenAlloc> CBox<T, CAllocator<P>> {
     /// # Safety
     ///
     /// A `Box` lends `&T` and `&mut T`, through which safe code moves the
-    /// object's bytes (`mem::swap`, `mem::replace`) and reads them under a
-    /// shared reference. So:
+    /// object's bytes (`mem::swap`, `mem::replace`), copies or moves the `T`
+    /// out (`*b`) and reads it under a shared reference, none of which a
+    /// `CBox` does: it reaches the object through handles alone. So:
     ///
+    /// - the object's bytes must be a valid `T`: every field initialised and
+    ///   a valid value of its Rust type, where C may have left a field
+    ///   unwritten (storage from `new_uninit` that C filled in part) or
+    ///   written a value Rust rejects (a `bool` field holding 2, an
+    ///   out-of-range enum);
     /// - the object must not be address-sensitive: neither C nor the object
     ///   itself may hold a pointer into it (C registered it, or it points
     ///   into itself), as for a value [`define_ctype!`](crate::define_ctype)'s
@@ -566,8 +587,9 @@ impl<T: CCell, P: CLenAlloc> CBox<T, CAllocator<P>> {
     /// - nothing but the box may reach it from here on, C included, as for
     ///   any `Box`.
     ///
-    /// No type says either, so the caller does; a [`CZeroable`] `T` meets
-    /// the first by its contract.
+    /// No type says any of them, so the caller does. A [`CZeroable`] `T`
+    /// meets the second by its contract, and none of the others: its zeroed
+    /// state is valid, not what C wrote since.
     #[inline]
     pub unsafe fn into_box(self) -> alloc::boxed::Box<T, CAllocator<P>> {
         let _ = CAllocator::<P>::object_layout::<T>();
@@ -612,7 +634,7 @@ impl<T: CCell, P: CLenAlloc> CBox<T, CAllocator<P>> {
 /// ```
 #[cfg(feature = "alloc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
-impl<T: CSliceElem, P: CLenAlloc> From<CVec<T, CAllocator<P>>>
+impl<T: CSliceElem, P: CLenAlloc + Copy> From<CVec<T, CAllocator<P>>>
     for alloc::vec::Vec<T, CAllocator<P>>
 {
     #[inline]
@@ -655,7 +677,7 @@ impl<T: CSliceElem, P: CLenAlloc> From<CVec<T, CAllocator<P>>>
 /// ```
 #[cfg(feature = "alloc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
-impl<T, P: CLenAlloc> TryFrom<alloc::vec::Vec<T, CAllocator<P>>> for CVec<T, CAllocator<P>> {
+impl<T, P: CLenAlloc + Copy> TryFrom<alloc::vec::Vec<T, CAllocator<P>>> for CVec<T, CAllocator<P>> {
     /// The `Vec`, unchanged, when its spare capacity could not be given back.
     type Error = alloc::vec::Vec<T, CAllocator<P>>;
 
