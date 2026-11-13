@@ -518,9 +518,9 @@ fn boxes_allocate_and_free_through_the_family() {
 #[test]
 fn a_box_of_a_zero_sized_type_allocates_nothing() {
     let _f = fresh();
+    // std's own constructor; ffibox's `try_box` refuses a zero-sized `T`.
     let b = Box::new_in((), ALLOC);
-    let t = ALLOC.try_box(()).unwrap();
-    drop((b, t));
+    drop(b);
     assert_eq!(counts(), Counts::default());
 }
 

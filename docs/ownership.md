@@ -360,8 +360,12 @@ nothing, where the owner's policy is `CAllocator<P>`:
 C is never handed a pointer that was not allocated, and Rust is never handed
 a C NULL:
 
-- zero-sized types are refused at compile time on every path (a `Box` of
-  one, and every empty `Vec`, holds a dangling pointer);
+- zero-sized types are refused at compile time on every path ffibox offers,
+  `try_box`, the policy impls and the conversions, since a `Box` of one,
+  like every empty `Vec`, holds a dangling pointer; std's own `Box::new_in`
+  and `Vec::new_in` accept them, as for any allocator, so a `Box` or `Vec`
+  reaches C only as a `CBox` or `CVec`, never as a raw pointer taken out of
+  it;
 - an empty `Vec` becomes the NULL `CVec`, its capacity, if any, freed;
 - an empty non-NULL `CVec` (C's `malloc(0)`) is freed on the way to a
   `Vec`, which would otherwise leak it at capacity 0;

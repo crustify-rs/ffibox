@@ -72,7 +72,13 @@ use crate::traits::{
 ///   [`Layout::dangling_ptr`], `deallocate` of size 0 does nothing, `grow`
 ///   from size 0 allocates afresh and `shrink` to size 0 frees and returns a
 ///   dangling pointer. So C's `malloc` is never asked for 0 bytes, and no
-///   dangling pointer reaches its `realloc` or `free`.
+///   dangling pointer reaches its `realloc` or `free`. The typed paths ffibox
+///   offers ([`try_box`](Self::try_box), the policy impls and the
+///   conversions) refuse a zero-sized type at compile time, so none yields a
+///   dangling pointer for C to free; std's own `Box::new_in` and
+///   `Vec::new_in` accept one, as for any allocator, and hold a dangling
+///   pointer, which reaches C only through a raw pointer the consumer takes
+///   out of them.
 /// - **Alignment beyond `P::ALIGN` is an [`AllocError`]**, from every
 ///   allocating method; the typed paths ffibox offers
 ///   ([`try_box`](Self::try_box), the policy impls and the conversions)
@@ -91,6 +97,18 @@ use crate::traits::{
 ///   need a new obligation on every `CLenAlloc` impl. A unit-struct policy,
 ///   or one holding a handle, is `Copy`; as a policy of `CBox`, `CStrBox` and
 ///   `CVec`, `CAllocator<P>` takes any `P`.
+///
+///   ```compile_fail,E0277
+///   # use core::ptr::NonNull;
+///   # use ffibox::{CAllocator, CLenAlloc, CLenDrop};
+///   /// A family policy that is not `Copy`.
+///   struct Pool;
+///   # unsafe impl CLenDrop for Pool { unsafe fn c_drop_len(&self, _: *mut u8, _: usize) {} }
+///   # unsafe impl CLenAlloc for Pool {
+///   #     fn c_alloc_len(&self, _: usize) -> Option<NonNull<u8>> { None }
+///   # }
+///   let _ = Box::new_in(1u32, CAllocator::new(Pool));
+///   ```
 ///
 /// Every block is exactly the size requested, so a `Box` or `Vec` hands
 /// [`c_drop_len`](CLenDrop::c_drop_len) the size the block was allocated
@@ -234,10 +252,20 @@ impl<P: CLenAlloc> CAllocator<P> {
 impl<P: CLenAlloc + Copy> CAllocator<P> {
     /// `value` in a fresh box of the family, or [`AllocError`] if the
     /// allocation fails, dropping `value` — `Box::try_new_in(value, self)`,
-    /// which std has not stabilized; [`Box::new_in`](alloc::boxed::Box::new_in) aborts on that failure
-    /// instead. A zero-sized `T` allocates nothing, as a `Box` of one never
-    /// does. A `T` aligned beyond the family's `ALIGN` is refused at compile
-    /// time:
+    /// which std has not stabilized;
+    /// [`Box::new_in`](alloc::boxed::Box::new_in) aborts on that failure
+    /// instead.
+    ///
+    /// A zero-sized `T` is refused at compile time, as by the conversions: its
+    /// box would hold a dangling pointer, never allocated, which C's `free`
+    /// would be handed through `Box::into_raw_with_allocator`:
+    ///
+    /// ```compile_fail,E0080
+    /// # use ffibox::{CAllocator, RustAlloc};
+    /// let _ = CAllocator::new(RustAlloc).try_box(());
+    /// ```
+    ///
+    /// So is a `T` aligned beyond the family's `ALIGN`:
     ///
     /// ```compile_fail,E0080
     /// # use ffibox::{CAllocator, RustAlloc};
@@ -248,16 +276,11 @@ impl<P: CLenAlloc + Copy> CAllocator<P> {
     /// ```
     #[inline]
     pub fn try_box<T>(self, value: T) -> Result<alloc::boxed::Box<T, Self>, AllocError> {
-        const {
-            assert!(
-                core::mem::align_of::<T>() <= P::ALIGN,
-                "the family's allocator cannot align T"
-            );
-        }
-        let ptr = self.allocate(Layout::new::<T>())?.cast::<T>();
-        // SAFETY: `ptr` is a fresh block of `T`'s layout from `self` (the
-        // dangling one for a zero-sized `T`, which `Box` never frees),
-        // written once with `value` and then owned by the box.
+        let layout = Self::object_layout::<T>();
+        let ptr = self.allocate(layout)?.cast::<T>();
+        // SAFETY: `ptr` is a fresh, non-empty block of `T`'s layout from
+        // `self` (`object_layout` refuses a zero-sized `T`), written once
+        // with `value` and then owned by the box.
         unsafe {
             ptr.as_ptr().write(value);
             Ok(alloc::boxed::Box::from_non_null_in(ptr, self))
@@ -292,10 +315,11 @@ fn no_unwind<R>(f: impl FnOnce() -> R) -> R {
 // are refused), whose ownership passes to the caller; a buffer C allocated
 // counts as currently allocated only once its ownership has passed to the
 // caller, as the docs above define. Either stays valid until the caller
-// gives it to `deallocate` or a successful `grow` or `shrink`: C frees only
-// buffers it owns, `CAllocator` has no `&mut` API, and it has no drop glue
-// (`P: Copy`), so dropping it neither frees nor unwinds. Blocks of size 0 are dangling and well aligned, and never reach
-// the family. The family's blocks are disjoint and end within the address
+// gives it to `deallocate`, a successful `grow` or `shrink`, or back to C:
+// C frees only buffers it owns, `CAllocator` has no `&mut` API, and it has
+// no drop glue (`P: Copy`), so dropping it neither frees nor unwinds.
+// Blocks of size 0 are dangling and well aligned, and never reach the
+// family. The family's blocks are disjoint and end within the address
 // space, as any allocator's. A failed `grow` or `shrink` leaves the block
 // as it was (`c_realloc_len`'s contract). `deallocate` and the moves hand
 // `c_drop_len` / `c_realloc_len` the block's size, which fits it as the
