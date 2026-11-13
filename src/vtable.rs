@@ -338,21 +338,9 @@ const COUNT: usize = LENT - 1;
 struct Entries(AtomicUsize);
 
 impl Entries {
-    /// Apply `f` atomically: the previous value, or the one `f` refused. As
-    /// `fetch_update`, which is deprecated for `try_update`, newer than the
-    /// minimum supported Rust.
+    /// Apply `f` atomically: the previous value, or the one `f` refused.
     fn update(&self, f: impl Fn(usize) -> Option<usize>) -> Result<usize, usize> {
-        let mut v = self.0.load(Ordering::Acquire);
-        loop {
-            let next = f(v).ok_or(v)?;
-            match self
-                .0
-                .compare_exchange_weak(v, next, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(prev) => return Ok(prev),
-                Err(now) => v = now,
-            }
-        }
+        self.0.try_update(Ordering::AcqRel, Ordering::Acquire, f)
     }
 
     fn enter_shared(&self) -> bool {

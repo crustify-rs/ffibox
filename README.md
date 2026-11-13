@@ -66,6 +66,9 @@ declaration to the type it wants.
 ffibox = "0.1"
 ```
 
+ffibox needs Rust 1.100 or later (`rust-version` in `Cargo.toml`), the first
+release with the standard `Allocator` interface.
+
 ffibox is `#![no_std]`. The `std` feature (on by default) selects
 `std::process::abort` for the unrecoverable-failure path (`Clone` or
 `make_mut` when the C copy or up_ref fails), where without it that path is a
