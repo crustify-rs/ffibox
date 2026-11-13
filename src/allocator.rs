@@ -36,6 +36,10 @@ use crate::traits::{
 /// The standard [`Allocator`] over a C allocation family, the [`CLenAlloc`]
 /// policy `P`; and, as a policy itself, the storage-only one over it.
 ///
+/// Its standard counterpart is `std::alloc::System`, an `Allocator` over a
+/// heap; this one's heap is the C family's, so that what a `Box` or `Vec`
+/// over it allocates C may free, and what C allocated they may adopt.
+///
 /// `#[repr(transparent)]` over `P`, so with a unit-struct policy it is
 /// zero-sized and `Copy`, and `Box<T, CAllocator<P>>` is one pointer wide,
 /// C's `T *`; `Send` and `Sync` follow `P`, so a family that must free on the
@@ -597,10 +601,12 @@ impl<T: CCell, P: CLenAlloc> CBox<T, CAllocator<P>> {
 /// ```
 ///
 /// ```compile_fail,E0080
-/// # use ffibox::{CAllocator, CVec, RustAlloc};
+/// # use ffibox::{CAllocator, CPlainElem, CVec, RustAlloc};
 /// #[derive(Clone, Copy)]
 /// #[repr(align(32))]
 /// struct Wide(u8);
+/// // SAFETY: any byte is a `Wide`.
+/// unsafe impl CPlainElem for Wide {}
 /// let v = CVec::<Wide, CAllocator<RustAlloc>>::empty();
 /// let _ = Vec::from(v);
 /// ```

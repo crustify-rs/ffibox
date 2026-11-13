@@ -5,6 +5,7 @@
 //! one) is counted, not performed, and so is a sized free given the wrong
 //! size, a `malloc(0)` and a buffer never freed.
 
+#![cfg(feature = "alloc")]
 #![allow(missing_docs)]
 
 use core::alloc::{AllocError, Allocator, Layout};
