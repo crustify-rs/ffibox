@@ -101,7 +101,7 @@ Each C type gets three Rust types:
 |---|---|
 | `Foo` | The layout type: `#[repr(transparent)]` over `ffi::foo`. It is `Foo<'r>` when the C object borrows its parent. |
 | `FooRef<'a>` | The shared borrowed handle, one pointer wide. It carries the getters. |
-| `FooMut<'a>` | The exclusive borrowed handle, one pointer wide. It carries the setters. |
+| `FooMut<'a>` | The exclusive borrowed handle, one pointer wide. It carries the setters, and reaches the getters through `as_ref()`. |
 
 Field access projects a raw pointer out of the handle.
 
@@ -122,13 +122,13 @@ by the routine paired with its allocator.
 Strings, buffers and borrowed runs get their own types. A buffer drops its
 elements, so a `foo **` of owned objects releases each one.
 
-### Rust memory that C holds
+### The other direction
 
-The other direction uses the same terms:
+Memory that Rust owns and C holds, calls or reads uses the same terms:
 
 | Primitive | What it does |
 |---|---|
-| `RustAlloc` | The policy over Rust's allocator. An object that Rust allocates is held as one that C allocated. |
+| `RustAlloc` | The policy over Rust's allocator, so that an object Rust allocates is held as one that C allocated. |
 | `CAllocator` | A C allocation family as the standard `Allocator`, so a `Box` or a `Vec` holds memory that C frees. |
 | `CClosure`, `CPayload` | Put a Rust closure behind a C function pointer and its context: `CClosure` for one call, `CPayload` until C releases it. |
 | `CFn`, `CFnBox` | Hold a C function and its context that Rust calls. |
@@ -169,7 +169,7 @@ ffibox is `#![no_std]`. It has two features:
 Nothing else allocates, except through a policy that you chose, as
 `CAllocator` allocates through its family.
 
-To build without `std`:
+To build without the default features, and so without `std` and `alloc`:
 
 ```toml
 [dependencies]
@@ -198,7 +198,7 @@ When it is Rust's memory that C holds, calls or reads, read
 | [vtables.md](docs/vtables.md) | C tables of function pointers implemented in Rust: `CTable`, `impl_cvtable!`, their receivers, re-entry, panics and release, and the design |
 | [patterns.md](docs/patterns.md) | C's iteration, error and callback conventions as Rust's iterators, `Result` and closures |
 | [hand-written.md](docs/hand-written.md) | the wrappers `define_ctype!` cannot express (a layout type generic over a type), and the owners no policy expresses |
-| [goals.md](docs/goals.md) | for contributors: what the primitives aim for, in both directions, and how each aim is checked |
+| [goals.md](docs/goals.md) | what the primitives aim for, in both directions, and how each aim is checked |
 
 If you are upgrading, [CHANGELOG.md](CHANGELOG.md) says what each release
 changes, and how to migrate code that still compiles but behaves differently.
