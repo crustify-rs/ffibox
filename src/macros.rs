@@ -91,7 +91,10 @@
 /// A C object that keeps a pointer it does not own, to its parent or to a
 /// string the caller lent, lives no longer than what it points at, so its
 /// layout type carries that borrow as a lifetime. Name the lifetimes after the
-/// layout type, and give the type that carries them as `phantom`:
+/// layout type, and give the type that carries them as `phantom`. Whoever
+/// adopts a pointer as its handle vouches for those lifetimes, as
+/// [`CCell::ref_from_ptr`](crate::CCell::ref_from_ptr) requires, so the type
+/// documents what each one borrows, in an `# Adoption` section:
 ///
 /// ```
 /// # #[repr(C)] pub struct repo_st { _opaque: [u8; 0] }

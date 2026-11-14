@@ -101,7 +101,8 @@ impl<'a, T: CNullTermElem + ?Sized> CNullTerminated<'a, T> {
     /// # Safety
     ///
     /// `ptr` addresses an array of pointers ended by a NULL one, each before
-    /// it addressing a live pointee of `T::Ptr`, and neither the array nor
+    /// it addressing a live pointee of `T::Ptr`, a valid `T` as
+    /// [`CCell::ref_from_ptr`] asks, and neither the array nor
     /// the pointees are written or freed while `'a` lasts.
     #[inline]
     pub unsafe fn from_ptr(ptr: *const *const T::Ptr) -> Option<Self> {

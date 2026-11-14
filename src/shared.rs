@@ -561,7 +561,8 @@ impl<'a, T: CGuardedAll> CGuardedRef<'a, T> {
     ///
     /// # Safety
     ///
-    /// - `ptr` must be null or address a live `T::C` that outlives `'a`.
+    /// - `ptr` must be null or address a live `T::C` that outlives `'a`, a
+    ///   valid `T` as [`CCell::ref_from_ptr`] asks.
     /// - [`CGuardedAll`]'s contract must hold for this object: every access,
     ///   C's included, takes its lock.
     /// - For `'a`, nothing may reach the object's handles without the lock —

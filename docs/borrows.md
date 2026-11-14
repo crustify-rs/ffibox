@@ -60,7 +60,9 @@ where they take the type.
   defines no raw-pointer method of its own for them. The inbound half is also
   on `CCell` (`ref_from_ptr`, `mut_from_ptr` and the `void *` twins), so
   generic code over `T: CCell` can borrow a pointer C gives it; those are
-  `unsafe`, and the handles' `from_ptr` forward to them. Adopting ownership is
+  `unsafe`, and the handles' `from_ptr` forward to them. Their caller vouches
+  that the pointee is a valid `Foo`, the borrows its lifetimes name included,
+  not only an initialised C object. Adopting ownership is
   a different verb on a different type — see
   [ownership.md](ownership.md#conventions).
 

@@ -2330,7 +2330,8 @@ impl<'a, T> CSlice<'a, T> {
     ///
     /// # Safety
     ///
-    /// `ptr` must address `len` contiguous, initialised `T` that outlive `'a`.
+    /// `ptr` must address `len` contiguous, valid `T` that outlive `'a`, as
+    /// [`CCell::ref_from_ptr`] asks of one.
     #[inline]
     pub const unsafe fn from_raw_parts(ptr: NonNull<T>, len: usize) -> Self {
         Self {
@@ -2581,7 +2582,8 @@ impl<'a, T> CSliceMut<'a, T> {
     ///
     /// # Safety
     ///
-    /// `ptr` must address `len` contiguous, initialised `T` that outlive `'a`,
+    /// `ptr` must address `len` contiguous, valid `T` that outlive `'a`, as
+    /// [`CCell::ref_from_ptr`] asks of one,
     /// and no other handle or reference to any of them may be used while the
     /// result lives.
     #[inline]

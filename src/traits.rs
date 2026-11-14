@@ -909,6 +909,13 @@ pub unsafe trait CCell: Sized {
     /// `ptr` must address a live, initialised `Self::C` (or be null) that
     /// outlives `'a`, and nothing may write it while the handle lives except
     /// through a `Mut` derived from the same borrow.
+    ///
+    /// The pointee must also be a valid `Self`, not only an initialised
+    /// `Self::C`: every borrow the lifetimes of `Self` name lives for them,
+    /// and every invariant the type's safe operations rely on holds, as the
+    /// type documents it. The handle's safe methods rely on both, so a
+    /// `FooRef<'_, 'static>` over an object that borrows shorter-lived memory
+    /// dangles from safe code.
     #[inline]
     unsafe fn ref_from_ptr<'a>(ptr: *mut Self::C) -> Option<Self::Ref<'a>>
     where
