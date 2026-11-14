@@ -816,7 +816,12 @@ pub unsafe trait CLenAlloc: CLenDrop {
 ///   them from a `CBorrowedPtr` by layout alone. They borrow the pointee for
 ///   `'a` and MUST NOT hand out a reference to `Self`.
 /// - `Ref` MUST NOT offer any operation that writes through the pointer — that
-///   is `Mut`'s job, and the split is what keeps a shared borrow shared.
+///   is `Mut`'s job, and the split is what keeps a shared borrow shared. The
+///   one exception is a routine of an object that locks itself, which writes
+///   under the object's own lock, as [`ref_from_ptr`](CCell::ref_from_ptr)'s
+///   contract allows, and only for a type Rust never holds by value: a handle
+///   built from `&self` may only be read through, by whatever path the
+///   routine takes its pointer.
 /// - `Mut<'a>` MUST be invariant in `Self`, as `&'a mut Self` is. A
 ///   [`CBorrowedPtr`](crate::CBorrowedPtr) alone is covariant, like `&'a T`, so
 ///   add a `PhantomData<&'a mut Self>` field. This matters only when `Self`
@@ -908,7 +913,9 @@ pub unsafe trait CCell: Sized {
     ///
     /// `ptr` must address a live, initialised `Self::C` (or be null) that
     /// outlives `'a`, and nothing may write it while the handle lives except
-    /// through a `Mut` derived from the same borrow.
+    /// through a `Mut` derived from the same borrow, or, for an object that
+    /// locks itself, under a lock that every read through `Self::Ref` of what
+    /// those writes reach takes too.
     ///
     /// The pointee must also be a valid `Self`, not only an initialised
     /// `Self::C`: every borrow the lifetimes of `Self` name lives for them,
@@ -934,8 +941,8 @@ pub unsafe trait CCell: Sized {
     /// # Safety
     ///
     /// As [`ref_from_ptr`](CCell::ref_from_ptr), plus: `ptr` must carry write
-    /// provenance, and no other handle to the same object may be used while
-    /// the result lives.
+    /// provenance, and nothing else may access the object while the result
+    /// lives, no other handle and no C, under a lock or not.
     #[inline]
     unsafe fn mut_from_ptr<'a>(ptr: *mut Self::C) -> Option<Self::Mut<'a>>
     where
@@ -1043,7 +1050,12 @@ pub trait CRefSeam<'a>: Copy {
     }
 
     /// Read-only pointer to the C object, for FFI calls taking
-    /// `*const C` and for field reads through `addr_of!`.
+    /// `*const C` and for field reads through `addr_of!`. A C routine that
+    /// writes the object under a lock it takes itself, which
+    /// [`CCell::ref_from_ptr`]'s contract allows, may take it only for a type
+    /// Rust never holds by value: a handle built from `&self`, as a layout
+    /// type's own `as_ref` builds one, carries a pointer that may only be
+    /// read through.
     #[inline]
     #[must_use]
     fn as_ptr(&self) -> *const <Self::Cell as CCell>::C {
