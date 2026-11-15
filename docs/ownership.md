@@ -159,7 +159,8 @@ above).
 declares it or it is written by hand. A layout type that carries a lifetime is
 written `Foo<'_>`, as **A layout type with a lifetime** below describes. Two
 macros are the exception: `impl_cdupclone!` and `impl_cguarded!` name the
-lifetime in a leading list, `<'r> P, Foo<'r>`.
+lifetime in a leading list, as `<'r> P, Foo<'r>, f` and
+`<'r> Foo<'r>, FooLocked, lock = …`.
 
 **Because the policy is a type parameter, an owner cannot exist without a
 destructor, and one C type can have several.** `CBox<Foo, FooFree>` can sit
@@ -303,9 +304,11 @@ is the only way around that, which is why it is `unsafe`.
 
 **The construction phase.** Hold an allocation that is still being filled in
 under a storage-only policy, either `new_uninit` or a hand-written
-`CBox<Foo, StorageFree>`. Promote it with `with_policy(FooFree)` once it
-satisfies the full destructor. If you bail with `?` before promoting, only the
-storage is freed.
+`CBox<Foo, StorageFree>`. Promote it with `unsafe with_policy(FooFree)` once
+it satisfies the full destructor. `with_policy` is an `unsafe fn`: its caller
+vouches that the object satisfies every invariant `FooFree`'s `c_drop` relies
+on. It returns a pair: the promoted box and the old policy.
+If you bail with `?` before promoting, only the storage is freed.
 
 ## Choosing a policy
 
@@ -325,9 +328,9 @@ For boxes, strings and buffers.
 | a global, never freed, under one C lock | no policy: `impl_cguarded!(Foo, all, …)` → `CGuardedRef<'static, Foo>` |
 | a counted reference with no up_ref | `impl_cdrop!` alone → `CArc` without `Clone` |
 | teardown needs runtime state | a hand-written policy; adopt with `from_raw_with` |
-| built in place, not by a C constructor | `CAlloc` → `new_uninit` → `assume_init`, then `with_policy` if a fuller destructor takes over |
+| built in place, not by a C constructor | `CAlloc` → `new_uninit` → `unsafe assume_init`, then `unsafe with_policy` if a fuller destructor takes over |
 | a routine of another shape: a slot, an out-parameter, extra arguments | the macro, over a private `unsafe fn` adapter passed by path, not a hand-written impl |
-| any of the above, over a layout type with a lifetime (`Blob<'r>`) | the same macros with `Blob<'_>`, but a hand-written `CDupClone` and `CGuarded` |
+| any of the above, over a layout type with a lifetime (`Blob<'r>`) | the same macros with `Blob<'_>`; `impl_cdupclone!` and `impl_cguarded!` name the lifetime in a leading list instead: `<'r> P, Blob<'r>, f` and `<'r> Blob<'r>, BlobLocked, lock = …` |
 | Rust allocates it (`alloc` feature) | `RustAlloc`: objects, buffers and strings from Rust's global allocator |
 
 An owned pointer crosses the FFI boundary on the owner's raw seam:

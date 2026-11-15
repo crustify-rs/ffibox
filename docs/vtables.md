@@ -9,8 +9,8 @@ such tables; so is any "C inheritance" base struct with a `free` slot.
 
 In Rust, you implement a table with a trait, and ffibox supplies the rest:
 
-- [`CTable<T, S>`](#the-primitive) holds Rust state `S` behind the C table of
-  the layout type `T`.
+- [`CTable<T, S>`](#a-a-generic-owner-and-a-macro-for-the-slots-only) holds
+  Rust state `S` behind the C table of the layout type `T`.
 - [`impl_cvtable!`](#declaring-a-table) mints the slots.
 
 A `CTable` is `Box<dyn Trait>` handed to C: a data part and a table of
@@ -151,12 +151,17 @@ not declare. The entry state is a non-blocking read-write lock over `S`, as
   another slot runs, and a shared slot cannot enter while an exclusive one
   runs.
 
-So re-entry is declared per slot, by its receiver, and a table whose slots
-all take `&S` is never refused. The owner's own accessors take part:
+So re-entry is declared per slot, by its receiver. A table whose slots all
+take `&S` is refused in two cases only: while a release of the table is
+deferred, as described below, and when the count of shared slots running at once is full
+(2^(`usize::BITS` − 4) − 1 of them). The owner's own accessors take part:
 
-- `state(&self)` lends `&S`, and from then on exclusive slots are refused
-  until the owner is next borrowed mutably. The owner cannot see when the
-  `&S` ends, so it waits for the `&mut self` that proves the `&S` has ended.
+- `state(&self)` returns `Option<&S>`: `None` while an exclusive slot runs,
+  and `Some(&S)` otherwise. Once it has lent `&S`, exclusive slots are
+  refused until the owner is next borrowed mutably, through `state_mut`,
+  `as_mut` or `as_mut_local`. The owner cannot see when
+  the `&S` ends, so it waits for the `&mut self` that proves the `&S` has
+  ended.
 - `state_mut` and `as_mut` take `&mut self`.
 
 Release follows the same state:
@@ -166,8 +171,9 @@ Release follows the same state:
   last frees the allocation, on its own thread, and every slot entered while
   the drop is deferred is refused.
 - If C calls `free` on a table that the owner still holds, the release is
-  deferred to the owner's drop. The release is forgotten if the owner then
-  surrenders the table to C, which holds the table anew.
+  deferred to the owner's drop, and every slot is refused while it is
+  deferred. If the owner instead surrenders the table to C, the release is
+  forgotten: C holds the table anew, and its slots enter again.
 
 Each allocation is dropped exactly once, whichever order C and Rust release
 it in.

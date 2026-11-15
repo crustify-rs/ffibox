@@ -20,12 +20,19 @@ that it corresponds to.
 | a callback that is a Rust closure or a C function, whichever supplied it | `impl FnMut`, `Box<dyn Fn>` | `CCallback`, `CCallbackBox` |
 | a struct of function pointers the library calls into, each passed the struct | a trait the Rust side implements, `Box<dyn Trait>` | `CTable`, `impl_cvtable!` |
 
-The `status` functions return the code itself as the error, so `?` converts
-it into your binding's error type through that type's `From` impl:
+`status::nonneg` and `status::zero` return the code itself as the error, so
+`?` converts it into your binding's error type through that type's `From`
+impl:
 
 ```rust,ignore
 let n = status::nonneg(unsafe { sys::foo_read(f.as_mut_ptr(), buf, len) })?;
 ```
+
+The other two do not return the value as the error.
+`status::non_null(ptr, err)` returns as the error whatever the closure `err`
+returns, and `err` is called only on NULL. `status::errno` (`std` feature)
+returns an `io::Result`: on `-1`, its error is
+`std::io::Error::last_os_error()`.
 
 Not yet covered: read and write callback pairs as `Read` / `Write` / `Seek`,
 and option setters as builders.
