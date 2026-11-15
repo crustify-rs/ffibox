@@ -39,9 +39,9 @@ For the borrowed side — handles over objects C or a parent releases — see
 - **Constructing through the policy is safe.** `new`, `new_zeroed` and
   `new_uninit` (each with a `_with(policy)` form) allocate through the routine
   the owner frees with, and return `None` when C fails, as `from_raw` does on
-  NULL. The one `unsafe` step is `assume_init`, which promotes storage C has
-  filled through `as_c_ptr`. There is no safe `write(value)`: a C object is
-  initialised where it lives.
+  NULL. The one `unsafe` step of building through a policy is `assume_init`,
+  which promotes storage C has filled through `as_c_ptr`. There is no safe
+  `write(value)`: a C object is initialised where it lives.
 - **`from_raw*` adopts ownership; `from_ptr*` borrows.** Pick the verb by what
   you return.
 - **Thread safety is opt-in for wrapped C types, opt-out for raw memory.**
@@ -230,8 +230,9 @@ you pass to the macro by path. Such shapes are:
 - a routine with extra arguments.
 
 The adapter is private and has a `# Safety` section of its own. It sits beside
-the policy it serves, where the crate keeps its unsafe code (its unsafe
-region, if it has one), as a hand-written impl would. Prefer the adapter to a
+the policy it serves, where the crate keeps its unsafe code (the module that
+holds it, if the crate gathers its unsafe code in one), as a hand-written impl
+would. Prefer the adapter to a
 hand-written `unsafe impl CDrop` (or `CRefClone`, `CDupClone`), for two
 reasons. The macro keeps the impl's shape and its type check of the C
 pointer. And the adapter adds no public unsafe surface: it adds only a
@@ -330,7 +331,7 @@ For boxes, strings and buffers.
 | teardown needs runtime state | a hand-written policy; adopt with `from_raw_with` |
 | built in place, not by a C constructor | `CAlloc` → `new_uninit` → `unsafe assume_init`, then `unsafe with_policy` if a fuller destructor takes over |
 | a routine of another shape: a slot, an out-parameter, extra arguments | the macro, over a private `unsafe fn` adapter passed by path, not a hand-written impl |
-| any of the above, over a layout type with a lifetime (`Blob<'r>`) | the same macros with `Blob<'_>`; `impl_cdupclone!` and `impl_cguarded!` name the lifetime in a leading list instead: `<'r> P, Blob<'r>, f` and `<'r> Blob<'r>, BlobLocked, lock = …` |
+| any of the above, over a layout type with a lifetime (`Blob<'r>`) | the same macros with `Blob<'_>`; `impl_cdupclone!` and `impl_cguarded!` name the lifetime in a leading list instead: `<'r> P, Blob<'r>, f` and `<'r> Blob<'r>, BlobLocked, lock = …` (or `<'r> Blob<'r>, all, lock = …`) |
 | Rust allocates it (`alloc` feature) | `RustAlloc`: objects, buffers and strings from Rust's global allocator |
 
 An owned pointer crosses the FFI boundary on the owner's raw seam:
