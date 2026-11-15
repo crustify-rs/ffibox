@@ -1,7 +1,7 @@
 # Examples
 
-Each example is self-contained and compiled as a doctest; the `sys` modules
-declare C routines a real `*-sys` crate would provide.
+Each example is self-contained and compiled as a doctest. The `sys` modules
+declare C routines that a real `*-sys` crate would provide.
 
 ## A boxed object — `CBox`
 
@@ -54,10 +54,10 @@ let q = p.clone();           // point_dup
 // `point_free` runs twice here.
 ```
 
-`CBox` is a foreign type, so constructors that take arguments go on the local
-`Foo` (or in free functions) rather than in an `impl CBox<Foo, _>` block. A
-zero-argument constructor can instead go on the policy, as the next example
-shows.
+`CBox` is a foreign type, so you put constructors that take arguments on the
+local `Foo` (or in free functions) rather than in an `impl CBox<Foo, _>`
+block. You can instead put a zero-argument constructor on the policy, as the
+next example shows.
 
 ## Constructed by its policy — `CNew` / `CAlloc` / `CAllocZeroed`
 
@@ -132,9 +132,10 @@ let half = unsafe { slot.assume_init() };   // CBox<Rational, MemFree>
 ```
 
 `Frame` is not `CZeroable`, so `CBox::<Frame, MemFree>::new_zeroed()` does not
-compile: its C constructor sets a non-zero default that a zeroed frame would
-lack. Every constructor returns `None` when C reports failure. `CArc` has the
-same `new` / `new_zeroed`, and a filled `CBox` converts with `.into()`.
+compile: `Frame`'s C constructor sets a non-zero default that a zeroed frame
+would lack. Every constructor returns `None` when C reports failure. `CArc`
+has the same `new` / `new_zeroed`, and a filled `CBox` converts to a `CArc`
+with `.into()`.
 
 ## A shared object — `CArc`, and its lock
 
@@ -254,16 +255,16 @@ g.as_locked().set_count(n + 1);          // registry_unlock when `g` drops
 ## An opaque payload — no erased owner
 
 A `void *` crossing FFI is never a [`CBox`] or [`CArc`]: both own only
-`CCell` layout types, such as `define_ctype!` defines. What the payload
-really is decides the owner:
+`CCell` layout types, such as the ones `define_ctype!` defines. What the
+payload really is decides the owner:
 
 - **bytes** (an arena block, an I/O buffer) → `CVec<u8, P>` (or
   `CVec<MaybeUninit<u8>, P>` before it is filled), released through `CLenDrop`;
 - **a C struct the caller knows** → `CBox<Foo, P>`, or `CArc<Foo, P>` when
   counted, after `define_ctype!`.
 
-Neither `CBox` nor `CArc` owns a `c_void`: an erased payload whose type Rust
-chooses (a refcounted user object, say) gets its own typed owner over the C
+Neither `CBox` nor `CArc` owns a `c_void`. Give an erased payload whose type
+Rust chooses (a refcounted user object, say) its own typed owner over the C
 routines.
 
 ```rust,no_run
@@ -381,10 +382,11 @@ assert_eq!(s.to_str(), Ok("name"));
 
 A C object that keeps a pointer to its parent, as a blob keeps its
 repository, lives no longer than the parent: its layout type carries the
-parent's borrow. `define_ctype!` takes the lifetime after the type's name and
-the marker that carries it as `phantom`; the handles are `BlobRef<'a, 'r>` and
-`BlobMut<'a, 'r>`. The policies come from the macros, with the lifetime
-spelled `'_`, or named in a leading list where the macro needs it.
+parent's borrow. `define_ctype!` takes the lifetime after the type's name, and
+takes the marker that carries the lifetime as `phantom`. The handles are
+`BlobRef<'a, 'r>` and `BlobMut<'a, 'r>`. The policies come from the macros,
+with the lifetime spelled `'_`, or named in a leading list where the macro
+needs it.
 
 ```rust,no_run
 use core::{ffi::c_int, ptr};
@@ -467,8 +469,12 @@ let n = again.as_ref().content().len();
 ```
 
 `impl_cdupclone!` and `impl_cguarded!` name the lifetime rather than elide
-it, in a list ahead of their arguments: a deep copy over such a type is
-`impl_cdupclone!(<'r> P, Blob<'r>, blob_copy)`, and a C lock
-`impl_cguarded!(<'r> Blob<'r>, BlobLocked, lock = …, unlock = …)`, whose
-handle is `BlobLocked<'a, 'r>`. A layout type generic over a type is still
-written by hand, as [hand-written.md](hand-written.md) describes.
+it, in a list ahead of their arguments:
+
+- a deep copy over such a type is
+  `impl_cdupclone!(<'r> P, Blob<'r>, blob_copy)`; and
+- a C lock is `impl_cguarded!(<'r> Blob<'r>, BlobLocked, lock = …, unlock = …)`,
+  whose handle is `BlobLocked<'a, 'r>`.
+
+You still write a layout type that is generic over a type by hand, as
+[hand-written.md](hand-written.md) describes.

@@ -1,148 +1,188 @@
 # C tables implemented in Rust
 
-A C library often takes a **table**: a struct of function pointers it calls
-into, each slot passed a pointer to the table itself, which the implementer
-embeds at the start of a larger allocation holding its own state. libgit2's
-`git_config_backend`, `git_odb_backend` and `git_writestream` are such tables;
-so is any "C inheritance" base struct with a `free` slot. Rust implements one
-with a trait, and ffibox supplies the rest: [`CTable<T, S>`](#the-primitive)
-holds Rust state `S` behind the C table of the layout type `T`, and
-[`impl_cvtable!`](#declaring-a-table) mints the slots. It is `Box<dyn Trait>`
-handed to C: a data part and a table of functions over it, the table embedded
-rather than pointed to.
+A C library often takes a **table**: a struct of function pointers that the
+library calls into. C passes each **slot**, one function pointer of the
+table, a pointer to the table itself. The implementer embeds the table at the
+start of a larger allocation that also holds the implementer's own state.
+libgit2's `git_config_backend`, `git_odb_backend` and `git_writestream` are
+such tables; so is any "C inheritance" base struct with a `free` slot.
 
-The inbound counterpart, a table C implements held from Rust, needs nothing
-new: it is a `CBox` under a policy whose release calls the table's `free`
-slot (`impl_cdrop!` over a private adapter), and its slots are called
-through its handles. A binding with one owner for both, as libgit2's write
-streams have, adopts a surrendered `CTable` into it (see (b)).
+In Rust, you implement a table with a trait, and ffibox supplies the rest:
 
-The binding still writes what is specific to the table: each slot's body,
-which turns C's arguments into Rust's, calls the trait, and turns the result
-into C's status convention. ffibox supplies only what is the same for every
-table: the layout, the recovery of the state from the table pointer, the
-re-entry rule, the panic barrier, the release and the owner.
+- [`CTable<T, S>`](#the-primitive) holds Rust state `S` behind the C table of
+  the layout type `T`.
+- [`impl_cvtable!`](#declaring-a-table) mints the slots.
+
+A `CTable` is `Box<dyn Trait>` handed to C: a data part and a table of
+functions over it, with the table embedded rather than pointed to.
+
+The inbound counterpart is a table that C implements and Rust holds. It needs
+nothing new: it is a `CBox` under a policy whose release calls the table's
+`free` slot (`impl_cdrop!` over a private adapter), and you call its slots
+through its handles. A binding (your Rust wrapper over the C library) may
+have one owner for both kinds of table, as libgit2's write streams have. Such
+a binding adopts a surrendered `CTable` into that owner (see
+[(b)](#b-slots-that-hand-out-c-memory-and-the-tables-own-owner)).
+
+You still write what is specific to the table: each slot's body. The body
+turns C's arguments into Rust's, calls the trait, and turns the result into
+C's status convention. ffibox supplies only what is the same for every table:
+
+- the layout;
+- the recovery of the state from the table pointer;
+- the re-entry rule;
+- the panic barrier;
+- the release; and
+- the owner.
 
 ## Decisions
 
 ### (a) A generic owner, and a macro for the slots only
 
-`CTable<T, S>` is ordinary generic code: its layout (`#[repr(C)]`, the C table
-first, then the entry state, then `S`), the entry protocol, the release, and
-the owner's methods are written once, checked by the compiler and run under
-Miri. The binding writes no struct of its own, so the table cannot be placed
-anywhere but at offset zero; a compile-time assertion keeps it there.
+`CTable<T, S>` is ordinary generic code. Its layout, the entry protocol, the
+release and the owner's methods are written once, checked by the compiler and
+run under Miri. The layout is `#[repr(C)]`: the C table first, then the entry
+state (see [(c)](#c-receivers-and-re-entry)), then `S`. You write no struct
+of your own, so the table cannot be placed anywhere but at offset zero; a
+compile-time assertion keeps it there.
 
-What generics cannot express is the slots: an `extern "C" fn` of the C
-declaration's exact signature, with the table at whichever argument C passes
-it. `impl_cvtable!` mints those, and nothing else: one trampoline per slot,
-whose whole body is a call to `CTable::enter`, and the `CSlots<S>` impl
-(`base` and `install`, a safe trait) that installs them. The
-trampolines are local to `install`, which takes a token only `CTable` makes,
-branded with that one borrow of the table and the impl's types, so a slot
-cannot be named, let alone installed in another table or over another state
-type: each slot reaches `S` only through the table it was installed in. That
-removes the recovery `unsafe` from every slot.
+What generics cannot express is the slots. A slot is an `extern "C" fn` of
+the C declaration's exact signature, with the table at whichever argument C
+passes it in. `impl_cvtable!` mints the slots, and nothing else. It emits:
 
-What types cannot check is one `unsafe impl CVtable<S> for T {}` per table,
-an item-less trait whose contract it is: that C passes each slot its table in
-the argument marked `@` (types check that where the table's is the only
-argument of its type, but not where C passes another table of that type too,
-`cmp(ops *self, ops *other)`), and that no slot C calls is left NULL. The
-binding writes that line out in the macro's input, and the macro emits it
-with the binding's own `unsafe` and braces, so the binding's lints see it:
+- one trampoline per slot, whose whole body is a call to `CTable::enter`; and
+- the `CSlots<S>` impl that installs the trampolines. `CSlots` is a safe
+  trait with two items, `base` and `install`.
+
+The trampolines are local to `install`. `install` takes a token that only
+`CTable` makes. The token is branded with that one borrow of the table and
+with the impl's types. So a slot cannot be named, let alone installed in
+another table or over another state type: each slot reaches `S` only through
+the table it was installed in. That removes the recovery `unsafe` from every
+slot.
+
+What types cannot check is stated by one `unsafe impl CVtable<S> for T {}`
+per table. `CVtable` is a trait with no items, and the `unsafe impl` states
+its contract:
+
+- C passes each slot its table in the argument marked `@`. Types check this
+  where the table's argument is the only argument of its type. They cannot
+  check it where C passes another table of that type too, as in
+  `cmp(ops *self, ops *other)`.
+- No slot that C calls is left NULL.
+
+You write that line out in the macro's input. The macro emits it with your
+own `unsafe` and braces, so your binding's lints see it:
 `#![forbid(unsafe_code)]` rejects the invocation, and clippy's
 `undocumented_unsafe_blocks` asks for its `SAFETY` comment. The rest of C's
 contract with the table is stated where the table is handed to C.
 
-The table starts from `CSlots::base`, which the binding writes out
-(`base = …;`, with no default: `Default::default()`, every slot NULL, is
-right only when every slot C calls unconditionally is declared), and
-`install` sets the slots it implements. Safe code therefore chooses no slot:
-a binding's safe handle method that calls a slot of the table never runs a
-function a consumer put there. A table whose fields are set per instance, or
-that a C routine initialises, is built with the `unsafe` `CTable::with_base`,
-whose caller states the same of its base.
+The table starts from `CSlots::base`, which you write out as `base = …;`.
+There is no default, because `Default::default()`, which leaves every slot
+NULL, is right only when every slot that C calls unconditionally is declared.
+`install` then sets the slots that it implements. Safe code therefore chooses
+no slot: when a safe handle method of your binding calls a slot of the table,
+it never runs a function that a consumer put there. If a table has fields
+that are set per instance, or a C routine initialises it, build it with the
+`unsafe` `CTable::with_base`. Its caller states the same of the base it
+passes.
 
-The alternative, a generic `CTable<T: Table>` with an `unsafe` trait per C
-table and hand-written trampolines, is also supported, since `enter` and
-`release` are public: a slot the macro cannot express (a release of another
-shape) is written by hand on the same terms, with one `unsafe` block per
-slot. A slot takes doc comments only: an attribute such as
-`#[target_feature]` would add an obligation to calling it that C cannot see. The macro is preferred
-because it ties every slot to its table and state by construction; it is kept
-to what an `unsafe impl` written by hand would contain (G20).
+The alternative is also supported: a generic `CTable<T: Table>` with an
+`unsafe` trait per C table and hand-written trampolines. It is supported
+because `enter` and `release` are public. A slot that the macro cannot
+express, such as a release of another shape, is written by hand on the same
+terms, with one `unsafe` block per slot. A slot takes doc
+comments only: an attribute such as `#[target_feature]` would add an
+obligation to calling the slot that C cannot see. The macro is preferred
+because it ties every slot to its table and state by construction. It is kept
+to what an `unsafe impl` written by hand would contain
+([G20](goals.md#g20-simple-macros)).
 
 ### (b) Slots that hand out C memory, and the table's own owner
 
-A slot that hands C an object, an entry, an iterator, a buffer, returns it
-through the owner that object already has: the body builds the owner and
-surrenders it into C's out-parameter with `into_c` / `into_raw`. A nested
-table (an iterator, an entry with its own `free`) is another `CTable`,
-surrendered the same way and released by its own `free` slot. Nothing new is
-needed: surrendering is safe, writing C's out-parameter is the binding's
-`unsafe`, as it is today.
+A slot may hand C an object: an entry, an iterator, a buffer. The slot
+returns the object through the owner that the object already has: the body
+builds the owner and surrenders it into C's out-parameter with `into_c` /
+`into_raw`. A nested table (an iterator, an entry with its own `free`) is
+another `CTable`, surrendered the same way and released by its own `free`
+slot. Nothing new is needed: surrendering is safe, and writing C's
+out-parameter is your binding's `unsafe`, as it is today.
 
-The table itself is owned by `CTable<T, S>` while Rust holds it. It lends
-the table's handles, `T::Ref` / `T::Mut`, as `CBox` does, so the binding's
-methods on them (a `write` that calls the slot) work on a Rust table as on a
-C one. Those handles are the binding's, `Send` or `Sync` as the binding
-decided for the C type, not for `S`; since their methods may call any slot,
-`as_ref` and `as_mut` ask `S: Send + Sync`, as a `&RwLock<S>` shared between
-threads does. Where the handles stay on their thread, as `define_ctype!`'s
-do unless the binding opts in, the binding says so once per type with
-`impl_clocal_handles!(T)`, which checks at compile time that neither handle
-is `Send` or `Sync` before it implements `CLocalHandles`, and
-`as_ref_local` / `as_mut_local` lend them, safely, over any `S`. `into_c` surrenders the table to C, which
-releases it through the slot declared `release`. C keeps it past any borrow
-and may use it on any thread, so `into_c` asks `S: Send + Sync + 'static`,
-as `CPayload::into_raw` asks `Send + Sync`; the `unsafe` `into_c_local` asks
-only `'static`, its caller stating the threads C uses. Where the binding has one owner for every table of that
-type, C's and Rust's alike (`CBox<WriteStream, WriteStreamFree>`, whose
-policy calls the `free` slot), the surrendered pointer is adopted into it with
-`from_c`, `unsafe` as every adoption is: its obligation is that the policy
-releases through the `free` slot. ffibox does not add a trait for that
-obligation, which is one block per table type.
+The table itself is owned by `CTable<T, S>` while Rust holds it. `CTable`
+lends the table's handles, `T::Ref` / `T::Mut`, as `CBox` does. So your
+binding's methods on the handles (a `write` that calls the slot) work on a
+Rust table as on a C one.
+
+Those handles are your binding's: they are `Send` or `Sync` as you decided
+for the C type, not for `S`. Their methods may call any slot, so `as_ref` and
+`as_mut` ask `S: Send + Sync`, as a `&RwLock<S>` shared between threads does.
+
+Where the handles stay on their thread, as `define_ctype!`'s do unless you
+opt in, say so once per type with `impl_clocal_handles!(T)`. The macro checks
+at compile time that neither handle is `Send` or `Sync` before it implements
+`CLocalHandles`. `as_ref_local` / `as_mut_local` then lend the handles,
+safely, over any `S`.
+
+`into_c` surrenders the table to C, which releases it through the slot
+declared `release`. C keeps the table past any borrow and may use it on any
+thread, so `into_c` asks `S: Send + Sync + 'static`, as `CPayload::into_raw`
+asks `Send + Sync`. The `unsafe` `into_c_local` asks only `'static`; its
+caller states the threads C uses.
+
+Your binding may have one owner for every table of that type, C's and Rust's
+alike: for example `CBox<WriteStream, WriteStreamFree>`, whose policy calls
+the `free` slot. In that case, adopt the surrendered pointer into that owner
+with `from_c`. `from_c` is `unsafe`, as every adoption is; its obligation
+here is that the policy releases through the `free` slot. ffibox does not add
+a trait for that obligation, which is one block per table type.
 
 ### (c) Receivers and re-entry
 
 A slot declares its receiver in its body's argument type: `|s: &S|` is a
-**shared** slot, `|s: &mut S|` an **exclusive** one, inferred by `enter`
-from the closure, so a slot cannot get a receiver it did not declare. The
-entry state is a non-blocking read-write lock over `S`, as
+**shared** slot, and `|s: &mut S|` is an **exclusive** one. `enter` infers
+the receiver from the closure, so a slot cannot get a receiver that it did
+not declare. The entry state is a non-blocking read-write lock over `S`, as
 `RwLock::try_read` / `try_write` are:
 
-- any number of shared slots run at once, re-entrant or on several threads;
-- an exclusive slot runs only when no other slot does;
-- a slot that cannot enter, an exclusive one while another slot runs or a
-  shared one while an exclusive one does, is **refused**: it returns the value
-  it declares `on busy`, without reaching `S`.
+- Any number of shared slots run at once, re-entrant or on several threads.
+- An exclusive slot runs only when no other slot does.
+- A slot that cannot enter is **refused**: it returns the value it declares
+  `on busy`, without reaching `S`. An exclusive slot cannot enter while
+  another slot runs, and a shared slot cannot enter while an exclusive one
+  runs.
 
 So re-entry is declared per slot, by its receiver, and a table whose slots
 all take `&S` is never refused. The owner's own accessors take part:
-`state(&self)` lends `&S` and refuses exclusive slots until the owner is next
-borrowed mutably (it cannot see when the `&S` ends, so it waits for the
-`&mut self` that proves it has); `state_mut` and `as_mut` take `&mut self`.
 
-Release follows the same state. C's `free` while a slot runs, re-entrantly
-from inside it or on another thread, is deferred: the slot that exits last
-frees the allocation, on its own thread, and every slot entered while the
-drop is deferred is refused. A `free` C calls on a table the owner still
-holds is deferred to the owner's drop, and forgotten if the owner then
-surrenders the table to C, which holds it anew. Each allocation is dropped
-exactly once, whichever order C and Rust release it in.
+- `state(&self)` lends `&S`, and from then on exclusive slots are refused
+  until the owner is next borrowed mutably. The owner cannot see when the
+  `&S` ends, so it waits for the `&mut self` that proves the `&S` has ended.
+- `state_mut` and `as_mut` take `&mut self`.
+
+Release follows the same state:
+
+- If C calls `free` while a slot runs, whether re-entrantly from inside the
+  slot or on another thread, the release is deferred. The slot that exits
+  last frees the allocation, on its own thread, and every slot entered while
+  the drop is deferred is refused.
+- If C calls `free` on a table that the owner still holds, the release is
+  deferred to the owner's drop. The release is forgotten if the owner then
+  surrenders the table to C, which holds the table anew.
+
+Each allocation is dropped exactly once, whichever order C and Rust release
+it in.
 
 ### (d) Panics
 
-Every trampoline runs its body in `callback::barrier`, and a slot declares
-what a panic returns `on panic`, as it declares `on busy`: an error code, a
-NULL, or `std::process::abort()` for a slot whose C convention cannot fail.
-There is no default, so no two bindings of one convention disagree by
-omission. Without `std` there is no barrier, and a panic aborts at the
-`extern "C"` boundary. The `release` slot has no result: a panic in `S`'s
-drop there aborts, as `CPayload::release_fn`'s does. A slot is not poisoned
-by a panic: later calls run, and `S` is left as the unwinding left it, as
-after any `barrier`.
+Every trampoline runs its body in `callback::barrier`. A slot declares what a
+panic returns `on panic`, as it declares `on busy`: an error code, a NULL, or
+`std::process::abort()` for a slot whose C convention cannot fail. There is
+no default, so no two bindings of one convention disagree by omission.
+Without `std` there is no barrier, and a panic aborts at the `extern "C"`
+boundary. The `release` slot has no result: a panic in `S`'s drop there
+aborts, as `CPayload::release_fn`'s does. A panic does not poison a slot:
+later calls run, and `S` is left as the unwinding left it, as after any
+`barrier`.
 
 ## Declaring a table
 
@@ -169,30 +209,31 @@ ffibox::impl_cvtable! {
 let table = CTable::<WriteStream, W>::new(writer);
 ```
 
-- `unsafe impl<…> CVtable<S> for T {}` names the layout type `T` (a
-  `CCell`, from `define_ctype!`, by a path with type arguments, if any) and
-  the state `S`; each generic takes one trait-path bound. It is emitted as
-  written, so its `SAFETY` comment is the binding's: which argument C passes
-  each slot its table in, and that no slot C calls is left NULL.
+- `unsafe impl<…> CVtable<S> for T {}` names the layout type `T` and the
+  state `S`. `T` is a `CCell`, such as one from `define_ctype!`, named by a
+  path, with type arguments if it has any. Each generic takes one trait-path
+  bound. The macro emits the line as written, so its `SAFETY` comment is
+  yours. The comment states which argument C passes each slot its table in,
+  and that no slot C calls is left NULL.
 - `base = expr;` is the table before the slots are set, written out.
-- `fn slot(…)` names the C field, then its C arguments in order, the table's
-  marked `@name`; `name` is the table pointer inside the body. Only doc
-  comments go before it.
+- `fn slot(…)` names the C field, then its C arguments in order. The table's
+  argument is marked `@name`; `name` is the table pointer inside the body.
+  Only doc comments go before the `fn`.
 - `on panic:` and `on busy:` are the slot's results when its body panics or
-  it is refused; both are expressions, evaluated only then.
-- The body is a closure over the receiver; its other inputs are the C
+  when it is refused. Both are expressions, evaluated only then.
+- The body is a closure over the receiver. Its other inputs are the C
   arguments, captured by name.
-- `release field;` installs `CTable::release` in the `free` slot, if C frees
-  the table.
+- `release field;` installs `CTable::release` in the slot that `field` names
+  (`free` above). Write it if C frees the table.
 
 ## Not a table: hooks without a context
 
 `git_allocator`, and reftable's `reftable_set_alloc(malloc, realloc, free)`,
-are families of hooks that C calls with no pointer back to anything: there is
+are families of hooks that C calls with no pointer back to anything. There is
 no table to recover state from, nothing to release and no owner. They stay
-trampolines generic over the implementing type, each body in
+trampolines generic over the implementing type. Each body runs in
 `callback::barrier` with its declared result, and C's `free` hook, which
-cannot fail, aborting on a panic. That is the rule both allocator bindings
+cannot fail, aborts on a panic. That is the rule both allocator bindings
 follow; there is no primitive to add.
 
 ## What the binding still states
@@ -201,7 +242,7 @@ follow; there is no primitive to add.
 |------------|-------|
 | C passes each slot its table in the argument marked `@`; `base` leaves NULL only slots C lets be NULL | the `unsafe impl CVtable` in `impl_cvtable!`'s input |
 | C calls each slot only with the table it read it from, while the table is live, and calls `release` once | the `unsafe` C call that lends (`as_c_ptr`) or surrenders (`into_c`) the table |
-| C uses the table on a thread other than `S`'s only if `S` allows it: `S: Send + Sync` for shared slots, which share `&S` and may drop `S` there as the last slot out of a deferred release, and `S: Send` for exclusive slots and the release | `into_c` asks `S: Send + Sync`; otherwise `into_c_local`, and the C call a table lent through `as_c_ptr` or a handle method is passed to; `CTable` itself is `Send` / `Sync` on `RwLock<S>`'s terms, and `T`'s |
+| C uses the table on a thread other than `S`'s only if `S` allows it. Shared slots need `S: Send + Sync`: they share `&S`, and may drop `S` there as the last slot out of a deferred release. Exclusive slots and the release need `S: Send` | `into_c` asks `S: Send + Sync`. Otherwise: `into_c_local`, and the C call that receives a table lent through `as_c_ptr` or a handle method. `CTable` itself is `Send` / `Sync` on `RwLock<S>`'s terms, and `T`'s |
 | a table built from a base of the caller's chooses no slot `install` leaves | `CTable::with_base` |
 | nothing derived from `T`'s handles that keeps the table pointer is `Send` or `Sync` (the handles themselves are checked by `impl_clocal_handles!`) | `impl_clocal_handles!(T)`, for `as_ref_local` / `as_mut_local` |
 | the policy of the owner a surrendered table is adopted into releases it through its `release` slot | that `from_c` |

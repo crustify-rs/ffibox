@@ -1,8 +1,8 @@
 # Patterns
 
-Beyond ownership, a C API follows recurring patterns. Each is reached as the
-standard Rust trait or idiom it corresponds to, from the C routines that
-implement it.
+Beyond ownership, a C API follows recurring patterns. From the C routines
+that implement a pattern, you reach it as the standard Rust trait or idiom
+that it corresponds to.
 
 | C pattern | Rust | ffibox |
 |-----------|------|--------|
@@ -21,7 +21,7 @@ implement it.
 | a struct of function pointers the library calls into, each passed the struct | a trait the Rust side implements, `Box<dyn Trait>` | `CTable`, `impl_cvtable!` |
 
 The `status` functions return the code itself as the error, so `?` converts
-it into the binding's error type through its `From` impl:
+it into your binding's error type through that type's `From` impl:
 
 ```rust,ignore
 let n = status::nonneg(unsafe { sys::foo_read(f.as_mut_ptr(), buf, len) })?;

@@ -1,10 +1,13 @@
 # Goals
 
 ffibox is one vocabulary for every value that crosses the boundary between
-Rust and a foreign language, in both directions: memory the foreign side
-allocates, frees, copies, refcounts or locks, held from Rust (**inbound**),
-and memory Rust owns that the foreign side holds, calls or reads
-(**outbound**). The foreign language is C, as G8 states.
+Rust and a foreign language, in both directions:
+
+- **inbound**: memory the foreign side allocates, frees, copies, refcounts or
+  locks, held from Rust;
+- **outbound**: memory Rust owns that the foreign side holds, calls or reads.
+
+The foreign language is C, as G8 states.
 
 Two parties use each primitive:
 
@@ -28,11 +31,13 @@ how it is checked.
 
 Each primitive mirrors a standard Rust one a Rust programmer already knows:
 `CBox` is `Box`, `CArc` is `Arc`, `CVec` is `Vec`, `CGuard` is `MutexGuard`,
-`FooRef` / `FooMut` are `&` / `&mut`. Where a foreign convention has no
-standard counterpart, it is expressed as the closest composition of standard
-idioms rather than a new concept: a lock over part of an object is `Arc<T>`
-with a `Mutex` field; a refcount that proves sole ownership is
-`Arc::get_mut`.
+`FooRef` / `FooMut` are `&` / `&mut`.
+
+Where a foreign convention has no standard counterpart, it is expressed as the
+closest composition of standard idioms rather than as a new concept:
+
+- a lock over part of an object is `Arc<T>` with a `Mutex` field;
+- a refcount that proves sole ownership is `Arc::get_mut`.
 
 Where ownership allows it, each primitive converts to and from its standard
 counterpart (`Box`, `Vec`, `Arc`, `CStr`, `&[T]`) and implements the standard
@@ -53,13 +58,17 @@ In particular, a consumer writes no `unsafe`.
 
 ### G3. Continue ffibox's style
 
-New primitives continue the style ffibox has established: its terms (owner,
-handle, policy, seam, adopt, surrender), its naming patterns (`C`-prefixed
-owners, `Foo` / `FooRef` / `FooMut` per type, `impl_*!` per policy trait) and
-its preference for reusing one primitive across cases over adding one per
-case. This is a direction, not a freeze: a new term, name or primitive is
-welcome where it is clearer than stretching an existing one, and it states
-what it adds and how it relates to the terms beside it.
+New primitives continue the style ffibox has established:
+
+- its terms (owner, handle, policy, seam, adopt, surrender);
+- its naming patterns (`C`-prefixed owners, `Foo` / `FooRef` / `FooMut` per
+  type, `impl_*!` per policy trait);
+- its preference for reusing one primitive across cases over adding one per
+  case.
+
+This is a direction, not a freeze. A new term, name or primitive is welcome
+where it is clearer than stretching an existing one. It states what it adds
+and how it relates to the terms beside it.
 
 *Checked by:* the documentation's walk from a foreign declaration to its
 wrapper stays a short decision table per direction, and each term it uses is
@@ -70,11 +79,18 @@ defined once.
 ### G4. Ownership conventions as Rust idioms
 
 A foreign language's ownership conventions are expressed with Rust's own:
-`Drop` for release, `Clone` for copies and reference counts, lifetimes for
-borrows and keepalive, `&` / `&mut` exclusivity for access, `Send` / `Sync`
-for thread affinity, `Pin` for address sensitivity, `Option` for nullability
-and slices for cardinality. A convention that one primitive cannot express is
-a gap in the vocabulary, not a reason for a raw pointer in the consumer's API.
+
+- `Drop` for release;
+- `Clone` for copies and reference counts;
+- lifetimes for borrows and keepalive;
+- `&` / `&mut` exclusivity for access;
+- `Send` / `Sync` for thread affinity;
+- `Pin` for address sensitivity;
+- `Option` for nullability;
+- slices for cardinality.
+
+A convention that one primitive cannot express is a gap in the vocabulary, not
+a reason for a raw pointer in the consumer's API.
 
 *Checked by:* the public interface of a binding carries no raw pointer and no
 `unsafe fn` except where an obligation cannot be expressed in types, each
@@ -108,39 +124,51 @@ check, no out-parameter to fill.
 
 ### G6. Both directions, symmetrically
 
-Every primitive serves both directions with the same terms. Adopting has
-surrendering; a policy that binds a foreign routine has an export that offers
-a Rust routine to the foreign side; a foreign callback has a Rust closure
-behind a foreign function pointer; a foreign global has a Rust static the
-foreign side reads. Either side can produce any ownership shape, and either
-can consume it.
+Every primitive serves both directions with the same terms:
+
+- adopting has surrendering;
+- a policy that binds a foreign routine has an export that offers a Rust
+  routine to the foreign side;
+- a foreign callback has a Rust closure behind a foreign function pointer;
+- a foreign global has a Rust static the foreign side reads.
+
+Either side can produce any ownership shape, and either can consume it.
 
 *Checked by:* every inbound primitive names its outbound counterpart, or
 states why it has none.
 
 ### G7. Composable axes
 
-Shape (one object, a run, a string), policy (what release, copy and
-construction mean), sharing (sole or counted), lock scope, thread affinity,
-address sensitivity and element ownership are independent axes. Primitives
-compose along them: owners are elements of vectors, fields of
-`#[repr(C)]` structs and contents of guards, with no primitive of their own
-for each combination.
+These are independent axes:
+
+- shape (one object, a run, a string);
+- policy (what release, copy and construction mean);
+- sharing (sole or counted);
+- lock scope;
+- thread affinity;
+- address sensitivity;
+- element ownership.
+
+Primitives compose along them: owners are elements of vectors, fields of
+`#[repr(C)]` structs and contents of guards. No combination has a primitive of
+its own.
 
 *Checked by:* a new combination of axes needs no new primitive.
 
 ### G8. C first
 
-ffibox targets C. Its names, the `C`-prefixed owners, `c_drop`, `as_c_ptr`,
-are C's, and so are the conventions its primitives encode: `malloc` and
-`free`, refcounts, C locks, NUL-terminated strings, status codes and `errno`,
-callbacks with a context pointer. No primitive is shaped for a language ffibox
-does not serve yet: C++'s move constructors, exceptions and smart pointers,
-and Go's pointer-passing rules, are out of scope for now.
+ffibox targets C. Its names are C's: the `C`-prefixed owners, `c_drop`,
+`as_c_ptr`. So are the conventions its primitives encode: `malloc` and `free`,
+refcounts, C locks, NUL-terminated strings, status codes and `errno`,
+callbacks with a context pointer.
+
+No primitive is shaped for a language ffibox does not serve yet: C++'s move
+constructors, exceptions and smart pointers, and Go's pointer-passing rules,
+are out of scope for now.
 
 When another language is taken on, its conventions are added beside C's
-rather than folded into them, and what the two share is factored out then,
-from what they actually share, without changing what C bindings write.
+rather than folded into them. What the two share is factored out then, from
+what they actually share, without changing what C bindings write.
 
 *Checked by:* every primitive serves a convention a C API uses.
 
@@ -175,53 +203,61 @@ reach it, a compile-fail test where the type system rejects it.
 
 ### G10. Safe by default
 
-Every default is the conservative one: foreign types are neither `Send` nor
-`Sync`, adopting a pointer is `unsafe`, no status code is discarded, and an
-unknown fact selects the more restrictive primitive. Every relaxation is an
-explicit opt-in that states its justification.
+Every default is the conservative one:
+
+- foreign types are neither `Send` nor `Sync`;
+- adopting a pointer is `unsafe`;
+- no status code is discarded;
+- an unknown fact selects the more restrictive primitive.
+
+Every relaxation is an explicit opt-in that states its justification.
 
 *Checked by:* a binding with no opt-ins is sound, if less capable.
 
 ### G11. Failure semantics
 
-No panic crosses into the foreign language: exports and callbacks have a
-barrier that maps a panic to the routine's error convention. No foreign unwind
-or `longjmp` crosses Rust frames with destructors. Allocation failure is a
-value, `Option` or `Result`, never an abort. Teardown that fails or panics
-still releases each object exactly once.
+- No panic crosses into the foreign language: exports and callbacks have a
+  barrier that maps a panic to the routine's error convention.
+- No foreign unwind or `longjmp` crosses Rust frames with destructors.
+- Allocation failure is a value, `Option` or `Result`, never an abort.
+- Teardown that fails or panics still releases each object exactly once.
 
 *Checked by:* tests that panic in callbacks, exports and drops, under the
 sanitizers.
 
 ### G12. Unsafe encapsulated, obligations local
 
-`unsafe` stays with producers, in policy implementations, layout types, seams
-and exports, and is crate-private to the binding wherever it can be. Every
-unsafe trait and seam states a falsifiable `# Safety` contract in terms of the
-foreign side's observable behaviour, checkable one implementation at a time,
-without reasoning about the whole program. The distinct obligations are few
-and listed, so that auditing a binding is a checklist.
+`unsafe` stays with producers: in policy implementations, layout types, seams
+and exports. It is crate-private to the binding wherever it can be.
+
+Every unsafe trait and seam states a falsifiable `# Safety` contract in terms
+of the foreign side's observable behaviour. The contract is checkable one
+implementation at a time, without reasoning about the whole program. The
+distinct obligations are few and listed, so that auditing a binding is a
+checklist.
 
 *Checked by:* every `unsafe impl` and `unsafe` block maps to one listed
 obligation.
 
 ### G13. Type safety through traits
 
-Generic code is bound by traits rather than raw pointers: a policy implements
-the lifecycle traits for the exact type it releases, a routine of the wrong
-type does not compile, erased values are recovered through the trait of the
-type they hold, and a family of foreign types generated from one template or
-macro shares one generic wrapper.
+Generic code is bound by traits rather than raw pointers:
+
+- a policy implements the lifecycle traits for the exact type it releases;
+- a routine of the wrong type does not compile;
+- erased values are recovered through the trait of the type they hold;
+- a family of foreign types generated from one template or macro shares one
+  generic wrapper.
 
 *Checked by:* compile-fail tests binding a routine, an element or an erased
 value to the wrong type.
 
 ### G14. A small, verified trusted base
 
-ffibox's own unsafe code is minimal, and exercised under Miri with strict
-provenance, the sanitizers and BorrowSanitizer. Each misuse it claims to
-prevent has a compile-fail test. Its guarantees are only as strong as this
-base.
+ffibox's own unsafe code is minimal. It is exercised under Miri with strict
+provenance, the sanitizers and BorrowSanitizer. Each misuse ffibox claims to
+prevent has a compile-fail test. ffibox's guarantees are only as strong as
+this base.
 
 *Checked by:* the test suite runs clean under each instrument.
 
@@ -229,8 +265,8 @@ base.
 
 ### G15. Zero overhead
 
-A primitive costs what the equivalent raw code costs. With a stateless policy
-an owner is pointer-sized and a handle is one pointer; runtime state is
+A primitive costs what the equivalent raw code costs. With a stateless policy,
+an owner is pointer-sized and a handle is one pointer. Runtime state is
 carried only when the foreign contract needs it, and no check is made that the
 foreign contract does not require.
 
@@ -239,8 +275,10 @@ foreign contract does not require.
 ### G16. ABI fidelity
 
 A primitive that stands in for a foreign value has a guaranteed ABI:
-`#[repr(transparent)]` where it crosses by value, the null pointer as `None`,
-the foreign layout where the foreign side reads its fields.
+
+- `#[repr(transparent)]` where it crosses by value;
+- the null pointer as `None`;
+- the foreign layout where the foreign side reads its fields.
 
 *Checked by:* compile-time size and alignment assertions against the foreign
 layout.
@@ -262,12 +300,16 @@ variadic functions, is documented as unsupported.
 The primitives do not depend on who produces a binding. A binding follows from
 facts about each foreign item: ownership and transfer, access, nullability,
 cardinality, keepalive, lifecycle role, thread affinity and address
-sensitivity. The choice of primitive is a function of those facts, documented
-as a table a human reads, an agent follows and a tool implements. A
-fact is visible in the binding's types, so that a reviewer or a tool recovers
-the facts from the binding. A fact no producer has established selects the
-conservative primitive, as G10 describes, so that a partial analysis still
-yields a sound binding, and establishing the fact later relaxes it.
+sensitivity.
+
+The choice of primitive is a function of those facts. It is documented as a
+table that a human reads, an agent follows and a tool implements. A fact is
+visible in the binding's types, so that a reviewer or a tool recovers the
+facts from the binding.
+
+A fact no producer has established selects the conservative primitive, as G10
+describes, so that a partial analysis still yields a sound binding, and
+establishing the fact later relaxes it.
 
 *Checked by:* two producers given the same facts emit the same binding.
 
@@ -275,7 +317,8 @@ yields a sound binding, and establishing the fact later relaxes it.
 
 A consumer's code does not change when the producer behind a primitive
 changes: a C allocator replaced by Rust's, a C implementation by a Rust
-port. Only the policy changes. This is what lets a codebase be ported one module at a time.
+port. Only the policy changes. This is what lets a codebase be ported one
+module at a time.
 
 *Checked by:* a ported module's consumers compile unchanged against the port.
 
@@ -284,10 +327,12 @@ port. Only the policy changes. This is what lets a codebase be ported one module
 Macros mint only what traits and generics cannot: layout types, handles, and
 the impls that name a foreign routine. Everything else is ordinary generic
 code, provided methods and blanket impls, which the compiler checks and
-documents. Each macro does one thing, with a few arms that differ only in
-optional trailing parameters; a variant whose expansion differs is a macro of
-its own with its own name, as `impl_cdrop_str!` is beside `impl_cdrop!`,
-rather than another arm of a larger one. A misuse fails with a type error at
+documents.
+
+Each macro does one thing, with a few arms that differ only in optional
+trailing parameters. A variant whose expansion differs is a macro of its own
+with its own name, as `impl_cdrop_str!` is beside `impl_cdrop!`, rather than
+another arm of a larger one. A misuse fails with a type error at
 the invocation, not inside the expansion.
 
 *Checked by:* each macro's expansion reads as the impl a producer would write
