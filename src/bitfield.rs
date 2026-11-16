@@ -22,9 +22,13 @@
 //! target, so the binding writes the C's order and widths, not masks.
 //!
 //! **Which unit, System V and AAPCS.** A run of bitfields is packed bit after
-//! bit, starting where the previous member ended; a field moves on to the
-//! next boundary of its declared type's size only if it would cross one, and
-//! `:0` moves to the next boundary. So the unit is **not** the declared type:
+//! bit, starting where the previous member ended. A field of declared type
+//! `T` stays where it is only if it fits in some `sizeof(T)`-byte span that
+//! starts at a multiple of `alignof(T)`; otherwise it moves on to the next
+//! such boundary, and `:0` moves to the next boundary. The boundary is the
+//! **alignment**, which is the size but for `long long` on i686 (aligned to
+//! 4 there, so a 40-bit field after 5 bytes stays at bit 40). So the unit is
+//! **not** the declared type:
 //! the mirror's `W` is an unsigned integer covering the bytes the run
 //! occupies, at the run's offset, and any byte of `W` beyond the run must be
 //! padding in C, never another member. Members after the run may sit inside
@@ -33,6 +37,14 @@
 //! unsigned a:4;` puts `a` in byte 1). The declared type still gives the
 //! struct its alignment, which may need `#[repr(C, align(N))]`, and, where
 //! the last unit extends past the last byte, its size.
+//!
+//! **Runs no `W` covers.** A run whose bytes no aligned unsigned integer
+//! covers without also covering another member cannot be mirrored with
+//! `CBitfield`: `unsigned char c[3]; unsigned long long a:40;` puts `a` in
+//! bytes 3 to 7, and the only integer over them at an aligned offset, a
+//! `u64` at 0, covers `c`. Mirror such a run as a byte array, with accessors
+//! that read and write its bytes by hand (as the layout test's `T1` on i686
+//! and `T2` do), or as a `#[repr(packed)]` integer at the run's offset.
 //!
 //! **Which unit, Microsoft.** Each run of fields of one declared type is a
 //! unit of that type, aligned as it; a change of declared type starts a new
@@ -91,18 +103,30 @@ use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 pub trait CBitWord: Copy + Eq + fmt::Debug + sealed::Sealed {
     /// Its width in bits.
     const BITS: u32;
-    /// The atomic of the same width, for [`CAtomicBitfield`].
-    type Atomic: CAtomicWord<Word = Self>;
     #[doc(hidden)]
     fn to_u64(self) -> u64;
     #[doc(hidden)]
     fn from_u64(v: u64) -> Self;
 }
 
-/// The atomic of a [`CBitWord`]. Sealed.
+/// A [`CBitWord`] that a [`CAtomicBitfield`] can hold: one whose atomic has
+/// its size and alignment, so that the atomic unit sits where C puts the
+/// plain one. Sealed.
+///
+/// Implemented for `u8`, `u16` and `u32`, and for `u64` on targets with
+/// 64-bit atomics where `u64` is 8-aligned: not on 32-bit x86 (i686), where
+/// C aligns a `long long` member to 4 and `AtomicU64` to 8, so that
+/// `CAtomicBitfield<u64>` is not a type there at all. A mirror holding one
+/// fails to build, whether or not anything calls `new`.
+pub trait CAtomicBitWord: CBitWord {
+    /// The atomic of the same width.
+    type Atomic: CAtomicWord<Word = Self>;
+}
+
+/// The atomic of a [`CAtomicBitWord`]. Sealed.
 pub trait CAtomicWord: sealed::Sealed {
     /// The word it holds.
-    type Word: CBitWord;
+    type Word: CAtomicBitWord;
     #[doc(hidden)]
     fn new(v: Self::Word) -> Self;
     #[doc(hidden)]
@@ -128,12 +152,10 @@ mod sealed {
 }
 
 macro_rules! bit_word {
-    ($($w:ty => $a:ty),*) => {$(
+    ($($w:ty),*) => {$(
         impl sealed::Sealed for $w {}
-        impl sealed::Sealed for $a {}
         impl CBitWord for $w {
             const BITS: u32 = <$w>::BITS;
-            type Atomic = $a;
             #[inline(always)]
             fn to_u64(self) -> u64 {
                 self as u64
@@ -143,6 +165,24 @@ macro_rules! bit_word {
                 v as $w
             }
         }
+    )*};
+}
+bit_word!(u8, u16, u32, u64);
+
+macro_rules! atomic_bit_word {
+    ($($w:ty => $a:ty),*) => {$(
+        impl sealed::Sealed for $a {}
+        impl CAtomicBitWord for $w {
+            type Atomic = $a;
+        }
+        // The property the trait states, checked for every target the impl
+        // exists on: a target where it fails does not build ffibox.
+        const _: () = assert!(
+            core::mem::align_of::<$a>() == core::mem::align_of::<$w>()
+                && core::mem::size_of::<$a>() == core::mem::size_of::<$w>()
+                && core::mem::align_of::<CAtomicBitfield<$w>>() == core::mem::align_of::<$w>()
+                && core::mem::size_of::<CAtomicBitfield<$w>>() == core::mem::size_of::<$w>()
+        );
         impl CAtomicWord for $a {
             type Word = $w;
             #[inline(always)]
@@ -178,7 +218,19 @@ macro_rules! bit_word {
         }
     )*};
 }
-bit_word!(u8 => AtomicU8, u16 => AtomicU16, u32 => AtomicU32, u64 => AtomicU64);
+#[cfg(target_has_atomic = "8")]
+atomic_bit_word!(u8 => AtomicU8);
+#[cfg(target_has_atomic = "16")]
+atomic_bit_word!(u16 => AtomicU16);
+#[cfg(target_has_atomic = "32")]
+atomic_bit_word!(u32 => AtomicU32);
+// `u64` is 4-aligned in C and Rust on 32-bit x86 (and 2-aligned on m68k),
+// but `AtomicU64` is 8-aligned.
+#[cfg(all(
+    target_has_atomic = "64",
+    not(any(target_arch = "x86", target_arch = "m68k"))
+))]
+atomic_bit_word!(u64 => AtomicU64);
 
 /// One field of a C bitfield word `W`: its position and width, which
 /// [`first`](Self::first) and [`next`](Self::next) compute from the C
@@ -385,9 +437,10 @@ impl<W: CBitWord> fmt::Debug for CBitfield<W> {
 /// A C bitfield word that several threads update: the atomic of `W`, read
 /// and written by field, each change one atomic read-modify-write of the
 /// word. `#[repr(transparent)]` over the atomic, which has `W`'s size and
-/// alignment: a `W` whose atomic is more aligned than it, `u64` on i686
-/// (where C aligns a `long long` member to 4), fails to build, as the mirror
-/// would put the unit at another offset than C's.
+/// alignment. `W` is a [`CAtomicBitWord`]: `u64` is not one on i686, where
+/// C aligns a `long long` member to 4 and `AtomicU64` is 8-aligned, so
+/// `CAtomicBitfield<u64>` is not a type there, and a mirror naming it fails
+/// to build (E0277), whether or not anything calls `new`.
 ///
 /// Its counterparts are `AtomicU32::fetch_or`, `fetch_and`, `store` and
 /// `swap`, over the field's bits. The orderings are std's, but for
@@ -411,20 +464,13 @@ impl<W: CBitWord> fmt::Debug for CBitfield<W> {
 /// assert!(!bits.is_set(ON_DISK, Relaxed));
 /// ```
 #[repr(transparent)]
-pub struct CAtomicBitfield<W: CBitWord>(W::Atomic);
+pub struct CAtomicBitfield<W: CAtomicBitWord>(W::Atomic);
 
-impl<W: CBitWord> CAtomicBitfield<W> {
-    /// Fails the build where the atomic is more aligned than `W`.
-    const C_ALIGNED: () = assert!(
-        core::mem::align_of::<W::Atomic>() == core::mem::align_of::<W>(),
-        "ffibox: this target aligns the atomic of W more than W, so the unit would not sit where C puts it"
-    );
-
+impl<W: CAtomicBitWord> CAtomicBitfield<W> {
     /// The word `raw`.
     #[inline]
     #[must_use]
     pub fn new(raw: W) -> Self {
-        let () = Self::C_ALIGNED;
         Self(W::Atomic::new(raw))
     }
 
@@ -523,14 +569,14 @@ fn load_order(order: Ordering) -> Ordering {
     }
 }
 
-impl<W: CBitWord> Default for CAtomicBitfield<W> {
+impl<W: CAtomicBitWord> Default for CAtomicBitfield<W> {
     #[inline]
     fn default() -> Self {
         Self::new(W::from_u64(0))
     }
 }
 
-impl<W: CBitWord> fmt::Debug for CAtomicBitfield<W> {
+impl<W: CAtomicBitWord> fmt::Debug for CAtomicBitfield<W> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -546,11 +592,7 @@ const _: () = {
         ($($w:ty),*) => {$(
             assert!(size_of::<CBitfield<$w>>() == size_of::<$w>());
             assert!(align_of::<CBitfield<$w>>() == align_of::<$w>());
-            assert!(size_of::<CAtomicBitfield<$w>>() == size_of::<$w>());
         )*};
     }
     same_layout!(u8, u16, u32, u64);
-    assert!(align_of::<CAtomicBitfield<u8>>() == align_of::<u8>());
-    assert!(align_of::<CAtomicBitfield<u16>>() == align_of::<u16>());
-    assert!(align_of::<CAtomicBitfield<u32>>() == align_of::<u32>());
 };
