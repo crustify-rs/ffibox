@@ -133,6 +133,7 @@ extern crate std;
 
 pub mod allocator;
 pub mod atomic_owner;
+pub mod bitfield;
 pub mod callback;
 #[cfg(feature = "alloc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
@@ -162,6 +163,7 @@ pub struct DocExamples;
 // Re-export the primary items at the crate root for convenience.
 pub use crate::allocator::CAllocator;
 pub use crate::atomic_owner::{CAtomicOwner, CPtrOwner};
+pub use crate::bitfield::{CAtomicBitfield, CBitfield, CBits};
 pub use crate::callback::{CCallback, CClosure, CFn, CFnBox};
 #[cfg(feature = "alloc")]
 pub use crate::callback::{CCallbackBox, CPayload};
