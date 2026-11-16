@@ -179,6 +179,9 @@ unsafe impl<T: crate::counted::CCounted> CPtrOwner for crate::counted::CShared<T
 /// loser must undo first (an owner it set), use
 /// [`try_insert`](Self::try_insert), which hands the loser back.
 ///
+/// All-zero bytes are an empty field, as a NULL pointer is: a struct that
+/// C or Rust `calloc`s starts with its `CAtomicOwner` fields empty.
+///
 /// **What C may do.** C reads the field, and fills it when it is NULL, with
 /// an owner of the same kind. It replaces or clears a full field only where
 /// the binding's contract with C already says no borrow of the old value is
