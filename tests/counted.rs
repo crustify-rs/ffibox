@@ -2,45 +2,109 @@
 //! and drops too: libgit2's `git_refcount { refcount; owner; }`, with an
 //! owner that keeps the object alive past its last counted reference, a
 //! release that frees through another allocation family, a type C writes
-//! beyond its count (no `Deref`), and references taken and dropped from
-//! several threads and through the C-side routines.
+//! beyond its count (no `Deref`), references taken and dropped from several
+//! threads and through the C-side routines, a count reset on adoption, a
+//! full count that aborts rather than wraps, and panics in teardown.
 
 #![allow(missing_docs)]
 
 use core::alloc::{AllocError, Allocator, Layout};
 use core::ffi::c_void;
 use core::ptr::{self, NonNull};
-use core::sync::atomic::{AtomicI32, AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicPtr, AtomicUsize, Ordering, fence};
 
 use ffibox::{CAtomicOwner, CCounted, CShareable, CShared};
 
 // ---------------------------------------------------------------------------
-// `git_refcount`, and an object that starts with one
+// `git_refcount`, and objects that start with one
 // ---------------------------------------------------------------------------
 
-/// `git_refcount`: the count and the owner, both atomic.
+/// `git_refcount`: the count and the owner, both atomic. Its fields are
+/// private and its mutators `unsafe`, and it has no `Default` or `Clone`:
+/// safe code cannot change a count (`CCounted`'s contract).
 #[repr(C)]
 pub struct Refcount {
     count: AtomicI32,
     owner: AtomicPtr<c_void>,
 }
 
+/// The highest count `inc` takes, as `Arc`'s `MAX_REFCOUNT`; tests lower it
+/// to reach it.
+static MAX: AtomicI32 = AtomicI32::new(i32::MAX / 2);
+
 impl Refcount {
-    const fn one() -> Self {
+    /// A fresh count, set by `c_init` when the object is adopted.
+    const fn new() -> Self {
         Refcount {
-            count: AtomicI32::new(1),
+            count: AtomicI32::new(0),
             owner: AtomicPtr::new(ptr::null_mut()),
         }
     }
-    /// `GIT_REFCOUNT_INC`.
-    fn inc(&self) {
-        self.count.fetch_add(1, Ordering::Relaxed);
+    /// `c_init`.
+    unsafe fn init(&self) {
+        self.count.store(1, Ordering::Relaxed);
+        self.owner.store(ptr::null_mut(), Ordering::Relaxed);
     }
-    /// `GIT_REFCOUNT_DEC` without the free: whether to free now.
-    fn dec(&self) -> bool {
-        let v = self.count.fetch_sub(1, Ordering::AcqRel) - 1;
-        v <= 0 && self.owner.load(Ordering::Acquire).is_null()
+    /// `GIT_REFCOUNT_INC`, refusing before the count could wrap.
+    unsafe fn inc(&self) -> bool {
+        let max = MAX.load(Ordering::Relaxed);
+        let mut n = self.count.load(Ordering::Relaxed);
+        while n < max {
+            match self
+                .count
+                .compare_exchange_weak(n, n + 1, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return true,
+                Err(now) => n = now,
+            }
+        }
+        false
     }
+    /// `GIT_REFCOUNT_DEC` without the free: `Release`, then `Acquire` before
+    /// it answers "free now"; the owner read after the decrement.
+    unsafe fn dec(&self) -> bool {
+        if self.count.fetch_sub(1, Ordering::Release) != 1 {
+            return false;
+        }
+        fence(Ordering::Acquire);
+        self.owner.load(Ordering::Acquire).is_null()
+    }
+    /// One reference, no owner, read with `Acquire`.
+    unsafe fn sole(&self) -> bool {
+        self.count.load(Ordering::Acquire) == 1 && self.owner.load(Ordering::Acquire).is_null()
+    }
+}
+
+/// The count of the live object at `this`.
+///
+/// # Safety
+///
+/// `this` is live for `'a`, and starts with its `Refcount`.
+unsafe fn rc<'a, T>(this: NonNull<T>) -> &'a Refcount {
+    // SAFETY: the caller's contract; the count is all atomics.
+    unsafe { this.cast::<Refcount>().as_ref() }
+}
+
+/// The `CCounted` methods over a leading `Refcount`.
+macro_rules! counted_by_refcount {
+    () => {
+        unsafe fn c_init(this: NonNull<Self>) {
+            // SAFETY: the caller has the object to itself.
+            unsafe { rc(this).init() }
+        }
+        unsafe fn c_up_ref(this: NonNull<Self>) -> bool {
+            // SAFETY: a live object (the caller's reference).
+            unsafe { rc(this).inc() }
+        }
+        unsafe fn c_down_ref(this: NonNull<Self>) -> bool {
+            // SAFETY: as above.
+            unsafe { rc(this).dec() }
+        }
+        unsafe fn c_is_sole_owner(this: NonNull<Self>) -> bool {
+            // SAFETY: as above.
+            unsafe { rc(this).sole() }
+        }
+    };
 }
 
 /// A counted object, `git_odb`-like: the C-visible count, then Rust state
@@ -58,35 +122,13 @@ impl Drop for Odb {
     }
 }
 
-/// The count of the live object at `this`.
-///
-/// # Safety
-///
-/// `this` is live for `'a`.
-unsafe fn rc<'a, T>(this: NonNull<T>) -> &'a Refcount {
-    // SAFETY: every counted type here starts with its `Refcount`, which is
-    // all atomics.
-    unsafe { this.cast::<Refcount>().as_ref() }
-}
-
-// SAFETY: `rc` counts the references as `GIT_REFCOUNT_*` do, atomically; an
-// object with an owner is released by the owner; `Odb::new` is the only
-// constructor, with a count of 1 and no owner; objects live in a `Box`.
+// SAFETY: `rc` counts the references as `GIT_REFCOUNT_*` do, atomically,
+// refusing before it wraps, with `Arc`'s orderings; an object with an owner
+// is released by the owner; safe code cannot change `rc`; objects live in a
+// `Box` of `Global`.
 unsafe impl CCounted for Odb {
     type Alloc = std::alloc::Global;
-    unsafe fn c_up_ref(this: NonNull<Self>) {
-        // SAFETY: a live object (the caller's reference).
-        unsafe { rc(this) }.inc();
-    }
-    unsafe fn c_down_ref(this: NonNull<Self>) -> bool {
-        // SAFETY: as above.
-        unsafe { rc(this) }.dec()
-    }
-    unsafe fn c_is_sole(this: NonNull<Self>) -> bool {
-        // SAFETY: as above.
-        let rc = unsafe { rc(this) };
-        rc.count.load(Ordering::Acquire) == 1 && rc.owner.load(Ordering::Acquire).is_null()
-    }
+    counted_by_refcount!();
 }
 // SAFETY: C writes `rc` only, and holders `reads`, both atomic.
 unsafe impl CShareable for Odb {}
@@ -94,7 +136,7 @@ unsafe impl CShareable for Odb {}
 impl Odb {
     fn new(freed: &'static AtomicUsize) -> CShared<Odb> {
         CShared::from_box(Box::new(Odb {
-            rc: Refcount::one(),
+            rc: Refcount::new(),
             reads: AtomicUsize::new(0),
             freed,
         }))
@@ -109,14 +151,15 @@ mod c {
     use super::*;
 
     pub unsafe extern "C" fn git_odb_free(db: *mut Odb) {
+        // A real export runs this in its panic barrier.
         // SAFETY: C passes NULL or a reference it gives up.
         unsafe { CShared::release(db) }
     }
 
-    /// What C's inline macro does to the field directly.
+    /// What C's inline macro does to the field directly (`SEQ_CST`).
     pub unsafe fn refcount_inc(db: *mut Odb) {
         // SAFETY: C's caller holds a reference.
-        unsafe { (*db).rc.count.fetch_add(1, Ordering::Relaxed) };
+        unsafe { (*db).rc.count.fetch_add(1, Ordering::SeqCst) };
     }
 }
 
@@ -148,7 +191,7 @@ fn references_cross_to_c_and_back() {
     let freed = counter!();
     let a = Odb::new(freed);
     // Handed to C, which keeps it and takes one more with its own macro.
-    let p = a.clone().into_raw();
+    let p = CShared::into_raw(a.clone());
     // SAFETY: `p` is live, C holds a reference.
     unsafe { c::refcount_inc(p) };
     // C gives one back through Rust, then frees the other.
@@ -163,7 +206,7 @@ fn references_cross_to_c_and_back() {
     assert_eq!(freed.load(Ordering::Relaxed), 0);
     // A pointer C only lends becomes a reference of Rust's own.
     // SAFETY: `a` keeps the object alive.
-    let lent = unsafe { CShared::from_borrowed(a.as_ptr()) }.unwrap();
+    let lent = unsafe { CShared::from_borrowed(CShared::as_ptr(&a)) }.unwrap();
     drop(a);
     assert_eq!(lent.read(), 1);
     drop(lent);
@@ -174,7 +217,7 @@ fn references_cross_to_c_and_back() {
 fn increment_and_decrement_count_as_arc() {
     let freed = counter!();
     let a = Odb::new(freed);
-    let p = a.into_raw();
+    let p = CShared::into_raw(a);
     // SAFETY: `p` holds a reference.
     unsafe { CShared::increment_count(p) };
     // SAFETY: one of the two references.
@@ -189,12 +232,32 @@ fn increment_and_decrement_count_as_arc() {
 fn get_mut_only_when_sole() {
     let freed = counter!();
     let mut a = Odb::new(freed);
-    assert!(a.get_mut().is_some());
+    assert!(CShared::get_mut(&mut a).is_some());
     let b = a.clone();
-    assert!(a.get_mut().is_none());
+    assert!(CShared::get_mut(&mut a).is_none());
     drop(b);
-    *a.get_mut().unwrap().reads.get_mut() = 7;
+    *CShared::get_mut(&mut a).unwrap().reads.get_mut() = 7;
     assert_eq!(a.read(), 8);
+}
+
+#[test]
+fn adoption_sets_the_count_whatever_the_value_carried() {
+    // A value whose count says 0 (a derived `Default` would) or 5: `from_box`
+    // resets it to one reference, so a clone and a drop leave it alive.
+    let freed = counter!();
+    for start in [0, 5, -3] {
+        let v = Odb {
+            rc: Refcount::new(),
+            reads: AtomicUsize::new(0),
+            freed,
+        };
+        v.rc.count.store(start, Ordering::Relaxed);
+        let a = CShared::from_box(Box::new(v));
+        drop(a.clone());
+        assert_eq!(a.read(), 1, "still alive after a clone's drop");
+        drop(a);
+    }
+    assert_eq!(freed.load(Ordering::Relaxed), 3);
 }
 
 #[test]
@@ -203,12 +266,11 @@ fn an_owner_keeps_the_object_past_its_last_reference() {
     // reference of its own here, so the count may reach zero first.
     let freed = counter!();
     let owner = 0xdead_u32;
-    let a = Odb::new(freed);
-    let p = a.as_ptr();
+    let mut a = Odb::new(freed);
+    let p = CShared::as_ptr(&a);
     a.rc.owner
         .store(ptr::from_ref(&owner).cast_mut().cast(), Ordering::Release);
-    let mut a = a;
-    assert!(a.get_mut().is_none(), "owned: not sole");
+    assert!(CShared::get_mut(&mut a).is_none(), "owned: not sole");
     drop(a);
     assert_eq!(freed.load(Ordering::Relaxed), 0, "the owner keeps it");
     // The owner lets go: clears the owner and frees it, as
@@ -216,7 +278,7 @@ fn an_owner_keeps_the_object_past_its_last_reference() {
     // SAFETY: the owner's object, still live.
     let rc = unsafe { &(*p).rc };
     rc.owner.store(ptr::null_mut(), Ordering::Release);
-    assert!(rc.count.load(Ordering::Acquire) <= 0);
+    assert_eq!(rc.count.load(Ordering::Acquire), 0);
     // SAFETY: nothing else holds it: what the owner's cleanup frees.
     drop(unsafe { Box::from_raw(p) });
     assert_eq!(freed.load(Ordering::Relaxed), 1);
@@ -234,7 +296,7 @@ fn shared_across_threads() {
                     let more = mine.clone();
                     more.read();
                     // A C holder on this thread too.
-                    let p = more.clone().into_raw();
+                    let p = CShared::into_raw(more.clone());
                     // SAFETY: the reference `p` holds.
                     unsafe { c::git_odb_free(p) };
                 }
@@ -246,6 +308,126 @@ fn shared_across_threads() {
     assert_eq!(freed.load(Ordering::Relaxed), 1);
 }
 
+#[test]
+fn the_last_drop_on_another_thread_happens_before_the_free_and_get_mut() {
+    // Arc's orderings: a holder's last use on another thread, then its drop,
+    // happen-before the free on this one, and before `get_mut`'s `&mut`.
+    // Miri's race detector checks it (run with several seeds).
+    let freed = counter!();
+    let mut a = Odb::new(freed);
+    let b = a.clone();
+    let t = std::thread::spawn(move || {
+        b.read();
+        drop(b);
+    });
+    while CShared::get_mut(&mut a).is_none() {
+        std::thread::yield_now();
+    }
+    *CShared::get_mut(&mut a).unwrap().reads.get_mut() += 1;
+    t.join().unwrap();
+    let c = a.clone();
+    let t = std::thread::spawn(move || drop(c));
+    drop(a);
+    t.join().unwrap();
+    assert_eq!(freed.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "spawns a process")]
+fn a_full_count_aborts_rather_than_wraps() {
+    // In a child process: lower the bound, leak clones up to it, and clone
+    // once more. `Clone` must abort, as `Arc`'s does.
+    if std::env::var_os("FFIBOX_FULL_COUNT_CHILD").is_some() {
+        MAX.store(8, Ordering::Relaxed);
+        let a = Odb::new(counter!());
+        for _ in 0..7 {
+            core::mem::forget(a.clone());
+        }
+        let _ = a.clone();
+        unreachable!("the clone past the bound aborts");
+    }
+    let me = std::env::current_exe().unwrap();
+    let out = std::process::Command::new(me)
+        .args([
+            "--exact",
+            "a_full_count_aborts_rather_than_wraps",
+            "--nocapture",
+        ])
+        .env("FFIBOX_FULL_COUNT_CHILD", "1")
+        .output()
+        .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(out.status.signal(), Some(6), "SIGABRT: {out:?}");
+    }
+    assert!(!out.status.success());
+}
+
+// ---------------------------------------------------------------------------
+// Panics in teardown
+// ---------------------------------------------------------------------------
+
+/// An object whose `Drop` panics once its flag is set.
+#[repr(C)]
+pub struct Fragile {
+    rc: Refcount,
+    panic: bool,
+    freed: &'static AtomicUsize,
+}
+
+impl Drop for Fragile {
+    fn drop(&mut self) {
+        self.freed.fetch_add(1, Ordering::Relaxed);
+        assert!(!self.panic, "teardown panics");
+    }
+}
+
+// SAFETY: as for `Odb`.
+unsafe impl CCounted for Fragile {
+    type Alloc = std::alloc::Global;
+    counted_by_refcount!();
+}
+
+#[test]
+fn a_panicking_drop_frees_once_and_unwinds_to_the_holder() {
+    let freed = counter!();
+    let a = CShared::from_box(Box::new(Fragile {
+        rc: Refcount::new(),
+        panic: true,
+        freed,
+    }));
+    let b = a.clone();
+    drop(a);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(b)));
+    assert!(r.is_err(), "the panic reaches the last holder");
+    // The box was deallocated while unwinding: the drop ran once, and
+    // nothing is left to free (Miri checks for a leak or a double free).
+    assert_eq!(freed.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn a_panicking_release_from_c_is_caught_by_the_export_barrier() {
+    let freed = counter!();
+    let a = CShared::from_box(Box::new(Fragile {
+        rc: Refcount::new(),
+        panic: true,
+        freed,
+    }));
+    let p = CShared::into_raw(a);
+    // The export: `CShared::release` inside the barrier.
+    let status = ffibox::callback::barrier(
+        // SAFETY: C's last reference.
+        || unsafe {
+            CShared::release(p);
+            0
+        },
+        || -1,
+    );
+    assert_eq!(status, -1);
+    assert_eq!(freed.load(Ordering::Relaxed), 1);
+}
+
 // ---------------------------------------------------------------------------
 // A release of the binding's own, and an allocator that can fail
 // ---------------------------------------------------------------------------
@@ -254,7 +436,7 @@ static POOL_LIVE: AtomicUsize = AtomicUsize::new(0);
 static POOL_FAIL: AtomicUsize = AtomicUsize::new(0);
 
 /// An allocation family that counts its live blocks, and fails on demand:
-/// the stand-in for `git__allocator`.
+/// the stand-in for `git__allocator`. Zero-sized and stateless.
 #[derive(Clone, Copy, Default)]
 pub struct Pool;
 
@@ -286,14 +468,7 @@ pub struct Refdb {
 // replaced `c_release` frees after disposing the backend.
 unsafe impl CCounted for Refdb {
     type Alloc = Pool;
-    unsafe fn c_up_ref(this: NonNull<Self>) {
-        // SAFETY: a live object.
-        unsafe { rc(this) }.inc();
-    }
-    unsafe fn c_down_ref(this: NonNull<Self>) -> bool {
-        // SAFETY: a live object.
-        unsafe { rc(this) }.dec()
-    }
+    counted_by_refcount!();
     unsafe fn c_release(this: NonNull<Self>) {
         // SAFETY: the last reference: nothing else reaches it.
         let b = unsafe { Box::from_raw_in(this.as_ptr(), Pool) };
@@ -312,7 +487,7 @@ unsafe impl CShareable for Refdb {}
 fn try_new_allocates_in_the_family_and_releases_there() {
     let before = POOL_LIVE.load(Ordering::Relaxed);
     let db = CShared::try_new(Refdb {
-        rc: Refcount::one(),
+        rc: Refcount::new(),
         backend: AtomicPtr::new(Box::into_raw(Box::new(5))),
     })
     .ok()
@@ -329,12 +504,12 @@ fn try_new_allocates_in_the_family_and_releases_there() {
 fn try_new_hands_the_value_back_on_failure() {
     POOL_FAIL.store(1, Ordering::Relaxed);
     let r = CShared::try_new(Refdb {
-        rc: Refcount::one(),
+        rc: Refcount::new(),
         backend: AtomicPtr::new(ptr::null_mut()),
     });
     POOL_FAIL.store(0, Ordering::Relaxed);
     let v = r.expect_err("the allocation failed");
-    assert_eq!(v.rc.count.load(Ordering::Relaxed), 1);
+    assert!(v.backend.load(Ordering::Relaxed).is_null());
 }
 
 // ---------------------------------------------------------------------------
@@ -351,21 +526,10 @@ pub struct Index {
 
 // SAFETY: as for `Odb`; only the count is borrowed. (`entries` is written
 // without synchronisation, so `Index` keeps it out of `&Index` instead of
-// being `CShareable`; a real index is also not `Sync`.)
+// being `CShareable`.)
 unsafe impl CCounted for Index {
     type Alloc = std::alloc::Global;
-    unsafe fn c_up_ref(this: NonNull<Self>) {
-        // SAFETY: a live object; only the count is borrowed.
-        unsafe { rc(this) }.inc();
-    }
-    unsafe fn c_down_ref(this: NonNull<Self>) -> bool {
-        // SAFETY: as above.
-        unsafe { rc(this) }.dec()
-    }
-    unsafe fn c_is_sole(this: NonNull<Self>) -> bool {
-        // SAFETY: as above.
-        unsafe { rc(this) }.count.load(Ordering::Acquire) == 1
-    }
+    counted_by_refcount!();
 }
 
 /// C's `index->entries++`, through the pointer.
@@ -377,15 +541,81 @@ unsafe fn c_add_entry(ix: *mut Index) {
 #[test]
 fn a_type_c_writes_is_reached_by_pointer() {
     let mut ix = CShared::from_box(Box::new(Index {
-        rc: Refcount::one(),
+        rc: Refcount::new(),
         entries: 0,
     }));
     let other = ix.clone();
     // SAFETY: a live index, used on this thread only.
-    unsafe { c_add_entry(other.as_ptr()) };
+    unsafe { c_add_entry(CShared::as_ptr(&other)) };
     drop(other);
     // Sole again: the exclusive borrow is sound.
-    assert_eq!(ix.get_mut().map(|i| i.entries), Some(1));
+    assert_eq!(CShared::get_mut(&mut ix).map(|i| i.entries), Some(1));
+}
+
+// ---------------------------------------------------------------------------
+// `Arc`'s traits through `T`
+// ---------------------------------------------------------------------------
+
+/// A shareable value with order, hash and display.
+#[repr(C)]
+pub struct Name {
+    rc: Refcount,
+    name: &'static str,
+}
+impl PartialEq for Name {
+    fn eq(&self, o: &Self) -> bool {
+        self.name == o.name
+    }
+}
+impl Eq for Name {}
+impl PartialOrd for Name {
+    fn partial_cmp(&self, o: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for Name {
+    fn cmp(&self, o: &Self) -> core::cmp::Ordering {
+        self.name.cmp(o.name)
+    }
+}
+impl core::hash::Hash for Name {
+    fn hash<H: core::hash::Hasher>(&self, h: &mut H) {
+        self.name.hash(h);
+    }
+}
+impl core::fmt::Display for Name {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.name)
+    }
+}
+// SAFETY: as for `Odb`.
+unsafe impl CCounted for Name {
+    type Alloc = std::alloc::Global;
+    counted_by_refcount!();
+}
+// SAFETY: `name` is fixed; `rc` is atomic.
+unsafe impl CShareable for Name {}
+
+fn name(n: &'static str) -> CShared<Name> {
+    CShared::from(Box::new(Name {
+        rc: Refcount::new(),
+        name: n,
+    }))
+}
+
+#[test]
+fn compares_hashes_and_displays_as_t() {
+    use std::collections::{BTreeSet, HashSet};
+    let (a, b, a2) = (name("a"), name("b"), name("a"));
+    assert!(a == a2 && a != b && a < b);
+    assert!(!CShared::ptr_eq(&a, &a2));
+    assert_eq!(format!("{a}"), "a");
+    let set: HashSet<_> = [a.clone(), a2.clone(), b.clone()].into_iter().collect();
+    assert_eq!(set.len(), 2);
+    let tree: BTreeSet<_> = [b, a].into_iter().collect();
+    assert_eq!(tree.iter().map(|n| n.name).collect::<Vec<_>>(), ["a", "b"]);
+    let borrowed: &Name = core::borrow::Borrow::borrow(&a2);
+    assert_eq!(borrowed.name, "a");
 }
 
 // ---------------------------------------------------------------------------
