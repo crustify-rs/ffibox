@@ -9,9 +9,8 @@
 #![allow(missing_docs)]
 
 use core::alloc::{AllocError, Allocator, Layout};
-use core::ffi::c_void;
 use core::ptr::{self, NonNull};
-use core::sync::atomic::{AtomicI32, AtomicPtr, AtomicUsize, Ordering, fence};
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use ffibox::{CAtomicOwner, CCounted, CShareable, CShared};
 
@@ -19,61 +18,115 @@ use ffibox::{CAtomicOwner, CCounted, CShareable, CShared};
 // `git_refcount`, and objects that start with one
 // ---------------------------------------------------------------------------
 
-/// `git_refcount`: the count and the owner, both atomic. Its fields are
-/// private and its mutators `unsafe`, and it has no `Default` or `Clone`:
-/// safe code cannot change a count (`CCounted`'s contract).
-#[repr(C)]
-pub struct Refcount {
-    count: AtomicI32,
-    owner: AtomicPtr<c_void>,
-}
+/// `git_refcount` in a module of its own, so that its fields are private to
+/// it: safe code anywhere else (this file's tests included) can make a count
+/// only at one reference with no owner (`new`), and change it only through
+/// `unsafe` methods, as `CCounted`'s contract asks of a type with a
+/// `c_is_sole_owner`.
+mod rc {
+    use core::ffi::c_void;
+    use core::ptr;
+    use core::sync::atomic::{AtomicI32, AtomicPtr, Ordering, fence};
 
-/// The highest count `inc` takes, as `Arc`'s `MAX_REFCOUNT`; tests lower it
-/// to reach it.
-static MAX: AtomicI32 = AtomicI32::new(i32::MAX / 2);
+    /// The count and the owner, both atomic; no `Default`, no `Clone`.
+    #[repr(C)]
+    pub struct Refcount {
+        count: AtomicI32,
+        owner: AtomicPtr<c_void>,
+    }
 
-impl Refcount {
-    /// A fresh count, set by `c_init` when the object is adopted.
-    const fn new() -> Self {
-        Refcount {
-            count: AtomicI32::new(0),
-            owner: AtomicPtr::new(ptr::null_mut()),
-        }
-    }
-    /// `c_init`.
-    unsafe fn init(&self) {
-        self.count.store(1, Ordering::Relaxed);
-        self.owner.store(ptr::null_mut(), Ordering::Relaxed);
-    }
-    /// `GIT_REFCOUNT_INC`, refusing before the count could wrap.
-    unsafe fn inc(&self) -> bool {
-        let max = MAX.load(Ordering::Relaxed);
-        let mut n = self.count.load(Ordering::Relaxed);
-        while n < max {
-            match self
-                .count
-                .compare_exchange_weak(n, n + 1, Ordering::Relaxed, Ordering::Relaxed)
-            {
-                Ok(_) => return true,
-                Err(now) => n = now,
+    /// The highest count `inc` takes, as `Arc`'s `MAX_REFCOUNT`; a test
+    /// lowers it to reach it.
+    pub static MAX: AtomicI32 = AtomicI32::new(i32::MAX / 2);
+
+    impl Refcount {
+        /// One reference, no owner: the only count safe code can make.
+        pub const fn new() -> Self {
+            Refcount {
+                count: AtomicI32::new(1),
+                owner: AtomicPtr::new(ptr::null_mut()),
             }
         }
-        false
-    }
-    /// `GIT_REFCOUNT_DEC` without the free: `Release`, then `Acquire` before
-    /// it answers "free now"; the owner read after the decrement.
-    unsafe fn dec(&self) -> bool {
-        if self.count.fetch_sub(1, Ordering::Release) != 1 {
-            return false;
+        /// The count, for assertions.
+        pub fn count(&self) -> i32 {
+            self.count.load(Ordering::Acquire)
         }
-        fence(Ordering::Acquire);
-        self.owner.load(Ordering::Acquire).is_null()
-    }
-    /// One reference, no owner, read with `Acquire`.
-    unsafe fn sole(&self) -> bool {
-        self.count.load(Ordering::Acquire) == 1 && self.owner.load(Ordering::Acquire).is_null()
+        /// Overwrite the count: what C, or a broken constructor, might do.
+        ///
+        /// # Safety
+        ///
+        /// The object is adopted afterwards by `CShared::from_box` (whose
+        /// `c_init` resets it) and is not reached through `get_mut` first.
+        pub unsafe fn set_count(&self, n: i32) {
+            self.count.store(n, Ordering::Relaxed);
+        }
+        /// `GIT_REFCOUNT_OWN`.
+        ///
+        /// # Safety
+        ///
+        /// `owner` is NULL or keeps the object alive until it sets NULL
+        /// again, and releases it then if the count is spent.
+        pub unsafe fn own(&self, owner: *mut c_void) {
+            self.owner.store(owner, Ordering::Release);
+        }
+        /// `c_init`.
+        ///
+        /// # Safety
+        ///
+        /// Nothing else reaches the object.
+        pub unsafe fn init(&self) {
+            self.count.store(1, Ordering::Relaxed);
+            self.owner.store(ptr::null_mut(), Ordering::Relaxed);
+        }
+        /// `GIT_REFCOUNT_INC`, refusing before the count could wrap.
+        ///
+        /// # Safety
+        ///
+        /// The caller holds a reference.
+        pub unsafe fn inc(&self) -> bool {
+            let max = MAX.load(Ordering::Relaxed);
+            let mut n = self.count.load(Ordering::Relaxed);
+            while n < max {
+                match self.count.compare_exchange_weak(
+                    n,
+                    n + 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return true,
+                    Err(now) => n = now,
+                }
+            }
+            false
+        }
+        /// C's own increment, `SEQ_CST`, unchecked.
+        ///
+        /// # Safety
+        ///
+        /// The caller holds a reference.
+        pub unsafe fn c_inc(&self) {
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+        /// `GIT_REFCOUNT_DEC` without the free: `Release`, then `Acquire`
+        /// before it answers "free now"; the owner read after the decrement.
+        ///
+        /// # Safety
+        ///
+        /// The caller gives up a reference it holds.
+        pub unsafe fn dec(&self) -> bool {
+            if self.count.fetch_sub(1, Ordering::Release) != 1 {
+                return false;
+            }
+            fence(Ordering::Acquire);
+            self.owner.load(Ordering::Acquire).is_null()
+        }
+        /// One reference, no owner, read with `Acquire`.
+        pub fn sole(&self) -> bool {
+            self.count.load(Ordering::Acquire) == 1 && self.owner.load(Ordering::Acquire).is_null()
+        }
     }
 }
+use rc::{MAX, Refcount};
 
 /// The count of the live object at `this`.
 ///
@@ -102,7 +155,7 @@ macro_rules! counted_by_refcount {
         }
         unsafe fn c_is_sole_owner(this: NonNull<Self>) -> bool {
             // SAFETY: as above.
-            unsafe { rc(this).sole() }
+            unsafe { rc(this) }.sole()
         }
     };
 }
@@ -159,7 +212,7 @@ mod c {
     /// What C's inline macro does to the field directly (`SEQ_CST`).
     pub unsafe fn refcount_inc(db: *mut Odb) {
         // SAFETY: C's caller holds a reference.
-        unsafe { (*db).rc.count.fetch_add(1, Ordering::SeqCst) };
+        unsafe { (*db).rc.c_inc() };
     }
 }
 
@@ -251,12 +304,42 @@ fn adoption_sets_the_count_whatever_the_value_carried() {
             reads: AtomicUsize::new(0),
             freed,
         };
-        v.rc.count.store(start, Ordering::Relaxed);
+        // SAFETY: `from_box` adopts `v` next.
+        unsafe { v.rc.set_count(start) };
         let a = CShared::from_box(Box::new(v));
         drop(a.clone());
         assert_eq!(a.read(), 1, "still alive after a clone's drop");
         drop(a);
     }
+    assert_eq!(freed.load(Ordering::Relaxed), 3);
+}
+
+#[test]
+fn a_value_stored_through_get_mut_keeps_the_object_counted() {
+    // N1 (review r2): `get_mut` lets safe code store any `Odb` it can make.
+    // Every count safe code can make is one reference, so the stored value
+    // still counts `a`'s reference: a clone and its drop free nothing.
+    let freed = counter!();
+    let mut a = Odb::new(freed);
+    let fresh = Odb {
+        rc: Refcount::new(),
+        reads: AtomicUsize::new(0),
+        freed,
+    };
+    let old = core::mem::replace(CShared::get_mut(&mut a).unwrap(), fresh);
+    drop(old); // a plain value: its `Drop` counts, nothing is deallocated
+    assert_eq!(freed.load(Ordering::Relaxed), 1);
+    drop(a.clone());
+    assert_eq!(a.read(), 1, "still alive after a clone's drop");
+    let mut b = Odb::new(freed);
+    core::mem::swap(
+        CShared::get_mut(&mut a).unwrap(),
+        CShared::get_mut(&mut b).unwrap(),
+    );
+    drop(b.clone());
+    drop(a);
+    assert_eq!(b.read(), 2, "`b` holds `a`'s value now, read once before");
+    drop(b);
     assert_eq!(freed.load(Ordering::Relaxed), 3);
 }
 
@@ -268,8 +351,8 @@ fn an_owner_keeps_the_object_past_its_last_reference() {
     let owner = 0xdead_u32;
     let mut a = Odb::new(freed);
     let p = CShared::as_ptr(&a);
-    a.rc.owner
-        .store(ptr::from_ref(&owner).cast_mut().cast(), Ordering::Release);
+    // SAFETY: `owner` outlives the object here, and releases it below.
+    unsafe { a.rc.own(ptr::from_ref(&owner).cast_mut().cast()) };
     assert!(CShared::get_mut(&mut a).is_none(), "owned: not sole");
     drop(a);
     assert_eq!(freed.load(Ordering::Relaxed), 0, "the owner keeps it");
@@ -277,8 +360,9 @@ fn an_owner_keeps_the_object_past_its_last_reference() {
     // `git_repository__cleanup` does with a count at zero.
     // SAFETY: the owner's object, still live.
     let rc = unsafe { &(*p).rc };
-    rc.owner.store(ptr::null_mut(), Ordering::Release);
-    assert_eq!(rc.count.load(Ordering::Acquire), 0);
+    // SAFETY: the owner lets go, and frees the spent object next.
+    unsafe { rc.own(ptr::null_mut()) };
+    assert_eq!(rc.count(), 0);
     // SAFETY: nothing else holds it: what the owner's cleanup frees.
     drop(unsafe { Box::from_raw(p) });
     assert_eq!(freed.load(Ordering::Relaxed), 1);
