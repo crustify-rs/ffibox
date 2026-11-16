@@ -134,6 +134,9 @@ Memory that Rust owns and C holds, calls or reads uses the same terms:
 | `CFn`, `CFnBox` | Hold a C function and its context that Rust calls. |
 | `CCallback`, `CCallbackBox` | Hold either half: a Rust closure or a C function. |
 | `CTable` | Holds Rust state behind a C table of function pointers that C calls into. `impl_cvtable!` mints its slots from a trait that the Rust side implements. |
+| `CShared` | Holds a counted reference to a Rust object whose count is its own field, which C also increments and decrements (`CCounted`). |
+| `CAtomicOwner` | Holds an owner in a C pointer field that is filled once with compare-and-swap, as `OnceLock` does. |
+| `CBitfield`, `CAtomicBitfield` | Read and write C bitfields by field, named once in C's declaration order with `CBits`. |
 | `export_*!` macros | Offer a policy to C as the routine it calls, with the owner and handle types in its signature. |
 
 [docs/ownership.md](docs/ownership.md) lists the owners and the policies, and
@@ -162,7 +165,7 @@ ffibox is `#![no_std]`. It has two features:
   - lets `CClosure`, `CTable`'s slots and `callback::barrier` catch a panic
     before it reaches C.
 - **`alloc`**, which `std` enables:
-  - adds `RustAlloc`, `CPayload`, `CCallbackBox` and `CTable`, which allocate
+  - adds `RustAlloc`, `CPayload`, `CCallbackBox`, `CTable` and `CShared`, which allocate
     through Rust's global allocator; and
   - adds the conversions between ffibox's owners and `Box` / `Vec`.
 
@@ -194,7 +197,7 @@ When it is Rust's memory that C holds, calls or reads, read
 | [examples.md](docs/examples.md) | eight self-contained wrappers, each compiled as a doctest |
 | [ownership.md](docs/ownership.md) | `CBox`, `CBoxState`, `CVal`, `CStrBox`, `CVec`, `CArc`; the lifecycle policies; picking an owner and a policy; `Box` and `Vec` over a C allocator (`CAllocator`) |
 | [borrows.md](docs/borrows.md) | `Foo`, `FooRef`, `FooMut`, `FooLocked`, `CGuard`, `CGuardedRef`, `CSlice`, `CSliceMut`, `CNullTerminated`; where the accessors live; the seam traits |
-| [outbound.md](docs/outbound.md) | Rust's side: `RustAlloc`, the callbacks (`CClosure`, `CPayload`, `CFn`, `CFnBox`, `CCallback`, `CCallbackBox`), C tables (`CTable`), out-parameters, the panic barrier, the `export_*!` macros |
+| [outbound.md](docs/outbound.md) | Rust's side: `RustAlloc`, the callbacks (`CClosure`, `CPayload`, `CFn`, `CFnBox`, `CCallback`, `CCallbackBox`), C tables (`CTable`), counted Rust objects (`CShared`), published pointer fields (`CAtomicOwner`), bitfields (`CBitfield`), out-parameters, the panic barrier, the `export_*!` macros |
 | [vtables.md](docs/vtables.md) | C tables of function pointers implemented in Rust: `CTable`, `impl_cvtable!`, their receivers, re-entry, panics and release, and the design |
 | [patterns.md](docs/patterns.md) | C's iteration, error and callback conventions as Rust's iterators, `Result` and closures |
 | [hand-written.md](docs/hand-written.md) | the wrappers `define_ctype!` cannot express (a layout type generic over a type), and the owners no policy expresses |
