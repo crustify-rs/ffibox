@@ -18,12 +18,60 @@
 //!
 //! ```
 //! use core::ptr::NonNull;
-//! use core::sync::atomic::{AtomicI32, AtomicU32, Ordering, fence};
+//! use core::sync::atomic::{AtomicU32, Ordering};
 //! use ffibox::counted::{CCounted, CShareable, CShared};
 //!
-//! /// `int rc`, which C increments and decrements in place with sequentially
-//! /// consistent atomics. Private: only the impl below changes it.
-//! pub struct Count(AtomicI32);
+//! mod count {
+//!     use core::sync::atomic::{AtomicI32, Ordering, fence};
+//!
+//!     /// `int rc`, which C increments and decrements in place with
+//!     /// sequentially consistent atomics. Safe code can make one only at one
+//!     /// reference, and change it not at all: its field is private to this
+//!     /// module and its mutators are `unsafe`.
+//!     pub struct Count(AtomicI32);
+//!
+//!     impl Count {
+//!         /// One reference: the only count safe code can make.
+//!         pub const fn one() -> Self {
+//!             Count(AtomicI32::new(1))
+//!         }
+//!         /// Back to one reference (`c_init`).
+//!         /// # Safety
+//!         /// Nothing else reaches the object.
+//!         pub unsafe fn reset(&self) {
+//!             self.0.store(1, Ordering::Relaxed);
+//!         }
+//!         /// Take a reference, refusing long before the count could wrap,
+//!         /// as `Arc`'s bound does.
+//!         /// # Safety
+//!         /// The caller holds a reference.
+//!         pub unsafe fn up(&self) -> bool {
+//!             let mut n = self.0.load(Ordering::Relaxed);
+//!             while n < i32::MAX / 2 {
+//!                 match self.0.compare_exchange_weak(n, n + 1, Ordering::Relaxed, Ordering::Relaxed) {
+//!                     Ok(_) => return true,
+//!                     Err(now) => n = now,
+//!                 }
+//!             }
+//!             false
+//!         }
+//!         /// Drop a reference: `Release`, then `Acquire` before "last".
+//!         /// # Safety
+//!         /// The caller gives up a reference it holds.
+//!         pub unsafe fn down(&self) -> bool {
+//!             if self.0.fetch_sub(1, Ordering::Release) != 1 {
+//!                 return false;
+//!             }
+//!             fence(Ordering::Acquire);
+//!             true
+//!         }
+//!         /// Whether one reference is left, read with `Acquire`.
+//!         pub fn is_one(&self) -> bool {
+//!             self.0.load(Ordering::Acquire) == 1
+//!         }
+//!     }
+//! }
+//! use count::Count;
 //!
 //! /// `struct session { int rc; ... }`: C calls `session_free`, below, to
 //! /// drop a reference.
@@ -35,40 +83,30 @@
 //! }
 //!
 //! // SAFETY: `rc` counts the references, as C's own increment and decrement
-//! // do, and nothing else changes it (`Count` has no safe constructor or
-//! // method). `c_up_ref` refuses before the count could wrap. A decrement is
-//! // `Release`, and the last one is followed by an `Acquire` fence, as
-//! // `Arc`'s are, so every use through another reference happens-before the
-//! // free; C's decrement is `SEQ_CST`. `c_is_sole_owner` reads with
-//! // `Acquire`. Sessions live in a `Box` of `Global`, which the provided
-//! // `c_release` frees.
+//! // do; safe code can make a `Count` only at one reference and cannot change
+//! // one (see `count`), so a `Session` stored through `get_mut` holds one.
+//! // `up` refuses before the count could wrap. A decrement is `Release`, and
+//! // the last one is followed by an `Acquire` fence, as `Arc`'s are, so every
+//! // use through another reference happens-before the free; C's decrement
+//! // is `SEQ_CST`. `c_is_sole_owner` reads with `Acquire`. Sessions live in a
+//! // `Box` of `Global`, which the provided `c_release` frees.
 //! unsafe impl CCounted for Session {
 //!     type Alloc = std::alloc::Global;
 //!     unsafe fn c_init(this: NonNull<Self>) {
 //!         // SAFETY: the caller has the object to itself.
-//!         unsafe { (*this.as_ptr()).rc.0.store(1, Ordering::Relaxed) };
+//!         unsafe { this.as_ref().rc.reset() }
 //!     }
 //!     unsafe fn c_up_ref(this: NonNull<Self>) -> bool {
-//!         // SAFETY: a live session; `rc` is atomic.
-//!         let rc = unsafe { &this.as_ref().rc.0 };
-//!         // `Arc`'s bound: refuse long before the count could wrap.
-//!         if rc.fetch_add(1, Ordering::Relaxed) >= i32::MAX / 2 {
-//!             rc.fetch_sub(1, Ordering::Relaxed);
-//!             return false;
-//!         }
-//!         true
+//!         // SAFETY: a live session, on which the caller holds a reference.
+//!         unsafe { this.as_ref().rc.up() }
 //!     }
 //!     unsafe fn c_down_ref(this: NonNull<Self>) -> bool {
-//!         // SAFETY: as above.
-//!         if unsafe { this.as_ref() }.rc.0.fetch_sub(1, Ordering::Release) != 1 {
-//!             return false;
-//!         }
-//!         fence(Ordering::Acquire);
-//!         true
+//!         // SAFETY: as above; the caller gives it up.
+//!         unsafe { this.as_ref().rc.down() }
 //!     }
 //!     unsafe fn c_is_sole_owner(this: NonNull<Self>) -> bool {
 //!         // SAFETY: as above.
-//!         unsafe { this.as_ref() }.rc.0.load(Ordering::Acquire) == 1
+//!         unsafe { this.as_ref() }.rc.is_one()
 //!     }
 //! }
 //! // SAFETY: what C writes, and what holders write while it is shared, is
@@ -78,7 +116,7 @@
 //! impl Session {
 //!     pub fn new() -> CShared<Session> {
 //!         // `from_box` sets the count (`c_init`).
-//!         CShared::from(Box::new(Session { rc: Count(AtomicI32::new(0)), hits: AtomicU32::new(0) }))
+//!         CShared::from(Box::new(Session { rc: Count::one(), hits: AtomicU32::new(0) }))
 //!     }
 //!     pub fn hit(&self) -> u32 {
 //!         self.hits.fetch_add(1, Ordering::Relaxed) + 1
@@ -156,8 +194,9 @@ use crate::refs::abort_process;
 ///   alive, so that nothing, Rust or C, is left to reach it: at most once per
 ///   object. A count with an owner answers `false` while the owner holds the
 ///   object, reading the owner after the decrement with at least `Acquire`.
-/// - **Ordering**, as `Arc`'s: every decrement, Rust's and C's, is at least a
-///   `Release` operation, and a `c_down_ref` that returns `true` performs an
+/// - **Ordering**, as `Arc`'s: every decrement that drops a reference
+///   (`c_down_ref`, and C's release) is at least a `Release` operation (an
+///   undo of a refused increment, which drops none, is not one), and a `c_down_ref` that returns `true` performs an
 ///   `Acquire` (the decrement itself, or a fence after it) before it returns,
 ///   so that every use of the object through another reference
 ///   happens-before its release. [`c_is_sole_owner`](Self::c_is_sole_owner)
@@ -170,14 +209,20 @@ use crate::refs::abort_process;
 ///   or later: every reference is counted, weak ones and any pointer C keeps
 ///   and could count later. Through the `&mut Self` that
 ///   [`CShared::get_mut`] then grants, safe code can store any `Self` value
-///   it can make or move; so the count's type must have no safe way to be
-///   made or changed into a state other than one reference with no owner (a
-///   private field, without a `Default`, `Clone` or safe constructor or
-///   mutator to another state). An impl that cannot say so keeps the
-///   provided `c_is_sole_owner`, which answers `false`.
+///   it can make or move (`mem::replace`, `mem::swap`). So **every value of
+///   the count's type that safe code anywhere can create or obtain holds one
+///   reference and no owner**: its safe constructors make that state only,
+///   it has no `Default` or `Clone` to another state, and whatever changes
+///   it is `unsafe`. A private or crate-private constructor is still safe
+///   code: one that makes a count of 0, or takes the count as an argument,
+///   must be `unsafe` (or the impl keeps the provided `c_is_sole_owner`).
+///   [`c_init`](Self::c_init) resetting the count at adoption does not
+///   help here, as nothing resets it after a store through `get_mut`. An
+///   impl that cannot say so keeps the provided `c_is_sole_owner`, which
+///   answers `false`.
 /// - **No safe access to the count.** Safe code that reaches `&Self` (through
 ///   [`CShareable`]'s `Deref`) or `&mut Self` cannot change the count or the
-///   owner: whatever changes them is `unsafe` or private to the impl.
+///   owner: whatever changes them is `unsafe`.
 /// - **Allocation.** [`Alloc`](Self::Alloc) is stateless and interchangeable:
 ///   a zero-sized type (checked at compile time) whose every instance,
 ///   including a fresh `Default`, deallocates any other instance's blocks,
@@ -196,6 +241,32 @@ pub unsafe trait CCounted: Sized {
     /// The allocator the object lives in: zero-sized and stateless (see the
     /// contract), which the provided [`c_release`](Self::c_release) frees it
     /// to, and [`CShared::from_box`] adopts it from.
+    ///
+    /// An allocator with state fails to build where `CShared` uses it:
+    ///
+    /// ```compile_fail,E0080
+    /// use core::alloc::{AllocError, Allocator, Layout};
+    /// use core::ptr::NonNull;
+    /// use ffibox::{CCounted, CShared};
+    /// #[derive(Default)]
+    /// struct Arena(usize); // a handle: not zero-sized
+    /// unsafe impl Allocator for Arena {
+    ///     fn allocate(&self, l: Layout) -> Result<NonNull<[u8]>, AllocError> {
+    ///         std::alloc::Global.allocate(l)
+    ///     }
+    ///     unsafe fn deallocate(&self, p: NonNull<u8>, l: Layout) {
+    ///         unsafe { std::alloc::Global.deallocate(p, l) }
+    ///     }
+    /// }
+    /// struct Obj(u32);
+    /// unsafe impl CCounted for Obj {
+    ///     type Alloc = Arena;
+    ///     unsafe fn c_init(_: NonNull<Self>) {}
+    ///     unsafe fn c_up_ref(_: NonNull<Self>) -> bool { false }
+    ///     unsafe fn c_down_ref(_: NonNull<Self>) -> bool { true }
+    /// }
+    /// let _ = CShared::try_new(Obj(1));
+    /// ```
     type Alloc: Allocator + Default;
 
     /// Set the count of a fresh object to one reference, and clear its
