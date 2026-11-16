@@ -18,6 +18,8 @@ For the borrowed side — handles over objects C or a parent releases — see
 | | `CStrBox<P>` | ffibox | an owned NUL-terminated `char *`; read-only `CStr` / `str` / byte views |
 | | `CVec<T, P>` | ffibox | an owned `(ptr, len)` array, NULL when empty; drops its elements, then frees the buffer; `&[T]` for plain elements and owners, `CSlice` for wrapped C objects; `from_fn` / `new_uninit` build one in `P`'s allocator, `from_slice` copies a Rust slice into it |
 | shared owner | `CArc<Foo, P>` | ffibox | one counted reference to a refcounted object; `Clone` through the up_ref; the shared handle always, `get_mut` / `make_mut` when the count proves it sole or after a copy, and `lock()` → `CGuard` when `Foo` is `CGuarded` over part of it |
+| | `CShared<T>` | ffibox (`alloc`) | one counted reference to an object *Rust* allocated, whose count is its own field that C also changes (`CCounted`); `Clone` through that count; `&T` when `T` is `CShareable`; see [outbound.md](outbound.md#counted-objects-published-fields-and-bitfields) |
+| owner in a C field | `CAtomicOwner<O>` | ffibox | a C pointer field holding an owner `O` (`CBox`, `CArc`, `CStrBox`, `CShared`, `Box`), filled once with compare-and-swap; `OnceLock`'s methods, `unsafe replace` |
 | standard owners over a C allocator | `Box<T, CAllocator<P>>`, `Vec<T, CAllocator<P>>` | std, over ffibox's `CAllocator` | a value or buffer Rust owns natively in storage C allocates or frees with the family `P` (`malloc` / `realloc` / `free`); to and from `CBox` / `CVec` over the same `CAllocator<P>` without copying — see [`Box` and `Vec` over a C allocator](#box-and-vec-over-a-c-allocator) |
 
 ## Conventions
@@ -333,6 +335,7 @@ For boxes, strings and buffers.
 | a routine of another shape: a slot, an out-parameter, extra arguments | the macro, over a private `unsafe fn` adapter passed by path, not a hand-written impl |
 | any of the above, over a layout type with a lifetime (`Blob<'r>`) | the same macros with `Blob<'_>`; `impl_cdupclone!` and `impl_cguarded!` name the lifetime in a leading list instead: `<'r> P, Blob<'r>, f` and `<'r> Blob<'r>, BlobLocked, lock = …` (or `<'r> Blob<'r>, all, lock = …`) |
 | Rust allocates it (`alloc` feature) | `RustAlloc`: objects, buffers and strings from Rust's global allocator |
+| Rust allocates it, and C counts references through a field of the object (a ported type) | `unsafe impl CCounted` (+ `CShareable`) → `CShared<T>`; no policy type |
 
 An owned pointer crosses the FFI boundary on the owner's raw seam:
 

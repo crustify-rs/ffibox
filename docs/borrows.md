@@ -38,6 +38,10 @@ where the macros take the type.
   `FooMut` reaches the getters with `as_ref()`, so you write them once. Both
   kinds project a raw pointer out of the handle and read or write through
   `addr_of!` / `addr_of_mut!`.
+- **C bitfields are read by field.** A mirror holds the storage unit as a
+  `CBitfield<W>` (or `CAtomicBitfield<W>`, when threads share it), and the
+  getters and setters pass the field's `CBits<W>`, declared once in C's
+  order with `CBits::first` / `next`. No mask is written by hand.
 - **Every holder reaches the handles the same way:**
   - `as_ref()` / `as_mut()` on `Foo`, `CBox`, `CBoxState`, `CVal` and
     `FooMut` itself. On `FooMut`, `as_mut()` is the reborrow that a `&mut`
@@ -129,6 +133,9 @@ object. When it does, the answer is an owner; see
     `impl_cguarded!(Foo, all, …)`;
   - a NUL string → `&CStr` / `&str` / `&[u8]` tied to the owner's borrow,
     on the terms of a counted byte run above;
+  - the object a pointer field holds, filled once and kept while its
+    struct lives (C's weak pointer, `repo->_odb`) → `&'a O` from
+    `CAtomicOwner<O>::get`, where `O` is the field's owner;
   - an out-parameter slot → `&'a mut MaybeUninit<T>` from
     `ptr.cast::<MaybeUninit<T>>().as_mut()`. It needs no ffibox type;
   - a `void *` → one of two cases:

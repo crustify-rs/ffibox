@@ -25,6 +25,9 @@ down for one call, and that C does not keep, is plain Rust:
 | hands Rust a function and its context to call | `CFn` for the call or borrow that the pair came with, or `CFnBox` with the routine that releases the context: `call()`, `parts()` / `into_raw()` | a closure |
 | holds a callback that is either a Rust closure or a C function | `CCallback` (for a call or borrow) or `CCallbackBox` (kept until released): `call()` from Rust, `c_form()` / `into_c()` to C | `impl FnMut`, `Box<dyn Fn>` |
 | calls into a table of function pointers, where each slot is passed the table (a backend, a stream) | `CTable<T, S>`, with its slots from `impl_cvtable!`: `as_c_ptr()` / `into_c()`, released through its `release` slot | `Box<dyn Trait>` |
+| takes and drops references to an object Rust allocated, through a count field of its own (`GIT_REFCOUNT_INC`, `foo_free`) | `CShared<T>` over a `CCounted` type (`alloc` feature): `clone()`, `into_raw()` / `from_raw()`, `release` behind C's free | `Arc<T>` |
+| reads a pointer field that Rust fills on first use, or fills it itself with compare-and-swap (`repo->_odb`) | `CAtomicOwner<O>` over a one-pointer owner: `get_or_init()`, `try_insert()`, `as_ptr()`, `unsafe replace()` | `OnceLock<O>`, `AtomicPtr` |
+| reads or writes bitfields of a struct Rust mirrors | `CBitfield<W>` / `CAtomicBitfield<W>`, fields named by `CBits<W>` | the integer's shifts and masks, `AtomicU32::fetch_or` |
 | returns an object through an out-parameter | `CBox::from_c_out`, `CStrBox::from_raw_out` | a return value |
 | calls a Rust routine that must not unwind into it | `callback::barrier` | `catch_unwind` |
 | frees, copies or constructs a ported type's objects | `export_cdrop!`, `export_cdupclone!`, `export_cnew!` | the C routines they replace |
@@ -89,6 +92,40 @@ down for one call, and that C does not keep, is plain Rust:
   A family of hooks that C calls with no pointer back (`git_allocator`) is
   not a table. It is trampolines generic over the implementing type, in
   `barrier`.
+- **C counts references to a Rust object** (a ported `git_odb`, whose
+  `git_refcount` C's macros still increment, and whose `git_odb_free` C
+  still calls). Implement `CCounted` for the type: `c_up_ref` and
+  `c_down_ref` over its count field, with C's meaning (an owner field
+  included), and `Alloc`, the allocator it lives in, or a `c_release` of
+  its own. Hold references as `CShared<T>`. Then:
+  - if every field C writes, and every field holders write while it is
+    shared, is an atomic or behind the type's own lock, also implement
+    `CShareable`: `CShared<T>` derefs to `T`, as `Arc<T>` does;
+  - otherwise (C writes a plain field, `index->entries`), reach it through
+    `as_ptr()` and the binding's handles, and `get_mut()` when the count
+    proves the reference sole;
+  - C's free is a one-line export over `CShared::release`, and a pointer C
+    returns or lends is adopted with `from_raw` or `from_borrowed`.
+- **C reads a pointer field that is filled once** (a repository's `_odb`,
+  `_config`, `_refdb`, `_index`; a lazily built cache). Make the field a
+  `CAtomicOwner<O>`, where `O` is the owner of what it points to (`CShared`,
+  `CArc`, `CBox`, `CStrBox`, `Box`):
+  - `get_or_init` / `get_or_try_init` create it on first use; a thread that
+    loses the race drops its own value, as C's compare-and-swap loser
+    frees. Where the loser must undo something first (an owner it set),
+    `try_insert` hands it back;
+  - `get()` borrows it for as long as the struct, C's weak pointer;
+    `as_ptr()` is that pointer for an export to write out;
+  - a setter (`git_repository_set_odb`) is `unsafe replace`, whose caller
+    states that no weak borrow of the old value is used afterwards: the
+    contract C's own weak pointers already have.
+- **C reads or writes a bitfield** (`unsigned on_disk:1, dirty:1;`). Name
+  each field once with `CBits<W>`, in C's order: `CBits::first(1)`, then
+  `.next(width)` for each later field; the bits follow the target's ABI.
+  The storage unit is a `CBitfield<W>` in the `#[repr(C)]` mirror, or a
+  `CAtomicBitfield<W>` where several threads update it: each change is
+  one read-modify-write that keeps the other fields, where a load and a
+  store of the word would lose a concurrent change to another field.
 - **C returns something through an out-parameter.** Use `from_c_out` /
   `from_raw_out`. The slot starts NULL and is adopted whatever the routine
   returns, so an object handed over on failure is still released.
@@ -98,6 +135,44 @@ down for one call, and that C does not keep, is plain Rust:
   that holds the routines the module offers to C. C then allocates and frees
   through Rust's allocator, and never through `malloc` / `free` crossed with
   it.
+
+## Counted objects, published fields and bitfields
+
+**`CShared<T>`** is `Arc<T>` whose count is a field of `T`, which C
+increments and decrements in place. What `CArc` is for an object C
+allocates, `CShared` is for one Rust allocates: the object is a Rust struct,
+reached as `&T`, not through handles. The binding's `unsafe impl CCounted`
+states, once, what the field means: how a reference is taken and dropped,
+when the object must go, how it is freed. libgit2's `git_refcount` also
+records an owner, which keeps the object alive past its last counted
+reference. That logic stays in `c_down_ref`, which answers "release now"
+only when the count is spent and no owner holds the object. `CShareable`
+states that a `&T` may live while the object is shared: what C writes is
+atomic. Without it, `CShared` gives a pointer and `get_mut`, never a `&T`.
+`Send` and `Sync` follow `Arc`'s terms. A lifetime the object keeps (a
+repository it borrows) goes in the binding's wrapper,
+`struct Odb<'r>(CShared<GitOdb>, PhantomData<&'r Repo>)`, which then
+derives `Clone`.
+
+**`CAtomicOwner<O>`** is a C pointer field that holds an owner, with
+`OnceLock`'s methods for filling it once and C's compare-and-swap for the
+race. It is `#[repr(transparent)]` over `AtomicPtr<O::Target>`, so a mirror
+keeps C's layout, and C may read the field, or fill it when NULL, as it
+did. Safe code fills only an empty field, so a borrow from `get` lives as
+long as `&self`. Replacing a full field invalidates every borrow, Rust's and
+C's weak pointers alike, so `replace` is `unsafe`. `O` is any owner that is
+one pointer (`CPtrOwner`). It is `Sync` when `O: Send + Sync`, as `OnceLock`.
+
+**`CBits<W>`, `CBitfield<W>`, `CAtomicBitfield<W>`** read and write C
+bitfields by field. Which bits a field occupies is the ABI's: on System V
+and AAPCS, the first field declared takes the least significant bits of its
+unit on a little-endian target, the most significant on a big-endian one.
+`CBits::first` and `next` encode that rule, so the binding states the
+declaration and not the masks. `CBits::at(lsb, width)` states a position
+the declaration order does not give (after a `:0`). A field that does not
+fit its unit fails at compile time. Assignment truncates to the field's
+width, as C's does. Only unsigned fields are covered. A layout test against
+the C compiler still checks the unit's offset and the bit positions.
 
 ## Conventions
 

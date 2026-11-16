@@ -11,8 +11,8 @@
 //!
 //! `CAtomicOwner<O>` is that field: `#[repr(transparent)]` over
 //! `AtomicPtr<O::Target>`, so it has the layout of the C pointer, holding
-//! the owner `O` (a [`CBox`](crate::CBox), [`CArc`](crate::CArc),
-//! [`CStrBox`](crate::CStrBox), [`CShared`](crate::CShared) or `Box`). Its
+//! the owner `O` (a [`CBox`], [`CArc`],
+//! [`CStrBox`], [`CShared`](crate::CShared) or `Box`). Its
 //! loser releases itself, by the owner's drop:
 //!
 //! ```

@@ -41,6 +41,9 @@
 //! | [`CFn`] / [`CFnBox`] | a C function and its context that Rust calls, borrowed or owned |
 //! | [`CCallback`] / [`CCallbackBox`] | either: a callback called from Rust and handed to C alike |
 //! | [`CTable<T, S>`] / [`impl_cvtable!`] | Rust state behind a C table of function pointers C calls into, its slots minted from the trait the state implements; [`impl_clocal_handles!`] lends its handles over any state where they stay on their thread |
+//! | [`CShared<T>`] / [`CCounted`] | one counted reference to a Rust-allocated object whose count is its own field, which C also changes: `Arc<T>` over an intrusive count; `&T` when [`CShareable`] |
+//! | [`CAtomicOwner<O>`] / [`CPtrOwner`] | a C pointer field holding a one-pointer owner, filled once with compare-and-swap: `OnceLock<O>` with C's layout |
+//! | [`CBits<W>`] / [`CBitfield<W>`] / [`CAtomicBitfield<W>`] | C bitfields read and written by field, named once in C's declaration order |
 //! | [`RustAlloc`] | the policy over Rust's global allocator, for what Rust allocates and C frees |
 //! | [`CAllocator<P>`] / [`impl_clenalloc!`] | a C allocation family (`malloc` / `realloc` / `free`) as the standard `Allocator`, for `Box<T, CAllocator<P>>` and `Vec<T, CAllocator<P>>` over memory C frees, and as a storage-only policy; [`CBox`] and [`CVec`] convert to and from them |
 //!
@@ -113,7 +116,7 @@
 //! without it that path is a double-panic, and lets [`CClosure`] and
 //! [`callback::barrier`] catch a panic before it reaches C, as [`CTable`]'s
 //! slots do. The `alloc` feature, which `std` enables, adds [`RustAlloc`],
-//! [`CPayload`], [`CCallbackBox`] and [`CTable`], which allocate through Rust's
+//! [`CPayload`], [`CCallbackBox`], [`CTable`] and [`CShared`], which allocate through Rust's
 //! global allocator, and the conversions between ffibox's owners and `Box` /
 //! `Vec`; nothing else allocates but through a policy the consumer chose, as
 //! [`CAllocator`], which needs no feature, allocates through its family.

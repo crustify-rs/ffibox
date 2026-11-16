@@ -11,6 +11,47 @@ Changes on `devel` since 0.1.1.
 
 ### Added
 
+- **Counted Rust objects whose count C shares** (`counted` module, `alloc`
+  feature). `CShared<T>` is `Arc<T>` for an object Rust allocates whose
+  reference count is a field of its own, which C increments and decrements
+  in place (libgit2's `git_refcount`, touched by `GIT_REFCOUNT_INC` and
+  `git_odb_free`). The binding's `unsafe impl CCounted` states how a
+  reference is taken (`c_up_ref`), dropped (`c_down_ref`, which also
+  decides whether an owner field keeps the object alive), proved sole
+  (`c_is_sole`) and freed (`c_release`, by default the `Box<T, Alloc>` it
+  lives in); `unsafe impl CShareable` adds that a `&T` may live while C
+  holds references, which gives `Deref`. `CShared` is
+  `#[repr(transparent)]` over the pointer, `Clone` and `Drop` through the
+  count, `Send` / `Sync` on `Arc`'s terms, and has `from_box` / `try_new`,
+  `from_raw` / `into_raw` / `from_borrowed` for references crossing to C,
+  `increment_count` / `decrement_count` as `Arc`'s, `get_mut` when sole, and
+  `release`, C's `foo_free`, for the binding's export. It is the outbound
+  counterpart of `CArc`, which counts objects C allocates and reaches through
+  handles. Nothing existing changes. See
+  [docs/outbound.md](docs/outbound.md#counted-objects-published-fields-and-bitfields).
+- **Owners in C pointer fields filled once** (`atomic_owner` module).
+  `CAtomicOwner<O>` is a C struct's pointer field, `#[repr(transparent)]`
+  over `AtomicPtr<O::Target>`, holding an owner that is one pointer
+  (`CPtrOwner`: `CBox`, `CArc`, `CStrBox`, `CShared`, `Box`), with
+  `OnceLock`'s methods: `get`, `set`, `try_insert` (which hands the loser
+  back), `get_or_init`, `get_or_try_init`, `take`, `get_mut`,
+  `into_inner`. Two threads may both create a value; the loser of the
+  compare-and-swap drops its own, as C's does. `as_ptr` is C's weak
+  pointer, and `unsafe replace` is C's setter, whose caller states that no
+  borrow of the old value is used afterwards. `Sync` when `O: Send + Sync`.
+  `CPtrOwner` is a new unsafe trait, implemented for ffibox's pointer owners
+  under a `Default` policy; nothing existing changes.
+- **C bitfields by field** (`bitfield` module). `CBits<W>` names a field of
+  the storage unit `W` (`u8` to `u64`) once, in C's declaration order:
+  `CBits::first(width)` then `.next(width)`, which place the bits as the
+  System V and AAPCS ABIs do for the target's endianness, or `CBits::at`;
+  a field that does not fit fails to build. `CBitfield<W>` is the unit,
+  `#[repr(transparent)]` over `W`, with `get` / `set` (truncating as C's
+  assignment does) / `is_set` / `set_flag`. `CAtomicBitfield<W>` is the unit
+  shared between threads: `load` / `store` / `is_set` / `set_flag`, each
+  change one atomic read-modify-write that keeps the other fields, and
+  `set_flag` skips the write when the flag is already as asked. Unsigned
+  fields only.
 - **C tables implemented in Rust** (`vtable` module, `alloc` feature).
   `CTable<T, S>` holds Rust state `S` behind a C table of function pointers
   of the layout type `T`, which C calls into: the table first, each slot
