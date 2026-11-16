@@ -151,7 +151,7 @@ unsafe impl<T: crate::counted::CCounted> CPtrOwner for crate::counted::CShared<T
     #[inline]
     fn into_raw_ptr(self) -> NonNull<T> {
         // SAFETY: a shared reference's pointer is non-null.
-        unsafe { NonNull::new_unchecked(self.into_raw()) }
+        unsafe { NonNull::new_unchecked(crate::counted::CShared::into_raw(self)) }
     }
     #[inline]
     unsafe fn from_raw_ptr(ptr: NonNull<T>) -> Self {
@@ -196,6 +196,17 @@ unsafe impl<T: crate::counted::CCounted> CPtrOwner for crate::counted::CShared<T
 /// let v = slot.get_or_init(|| Box::new(1));
 /// let old = slot.take();
 /// assert_eq!(**v, 1);
+/// ```
+///
+/// nor exclusively borrowed:
+///
+/// ```compile_fail,E0502
+/// use ffibox::CAtomicOwner;
+/// let mut slot = CAtomicOwner::<Box<u32>>::new();
+/// let v = slot.get_or_init(|| Box::new(1));
+/// let m = slot.get_mut();
+/// assert_eq!(**v, 1);
+/// # drop(m);
 /// ```
 ///
 /// and replacing it through `&self` is `unsafe`:
@@ -355,10 +366,12 @@ impl<O: CPtrOwner> CAtomicOwner<O> {
     ///
     /// # Safety
     ///
-    /// No borrow of the old value is used after the call: none that
-    /// [`get`](Self::get) and the other borrowing methods lent, on any
-    /// thread, and no pointer C read from the field and keeps as a weak
-    /// pointer.
+    /// Every borrow of the old value that [`get`](Self::get) and the other
+    /// borrowing methods lent has ended, on every thread: not only unused
+    /// from now on, but no longer live (a reference held in a caller's
+    /// argument is live until that call returns, and the write would
+    /// invalidate it). No pointer C read from the field and keeps as a weak
+    /// pointer is used afterwards.
     #[inline]
     pub unsafe fn replace(&self, value: Option<O>) -> Option<O> {
         let new = value.map_or(ptr::null_mut(), |v| v.into_raw_ptr().as_ptr());

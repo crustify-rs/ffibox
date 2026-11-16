@@ -302,6 +302,34 @@ fn holds_every_pointer_owner() {
     assert_eq!(strong.as_ref().id(), 5);
 }
 
+#[test]
+fn a_panicking_initialiser_leaves_the_field_empty() {
+    let slot = CAtomicOwner::<Box<u32>>::new();
+    let r = std::panic::catch_unwind(|| {
+        slot.get_or_init(|| panic!("no value"));
+    });
+    assert!(r.is_err());
+    assert!(slot.get().is_none());
+    assert_eq!(**slot.get_or_init(|| Box::new(3)), 3);
+}
+
+#[test]
+fn a_loser_whose_drop_panics_leaves_the_winner_in_place() {
+    struct Loud(bool);
+    impl Drop for Loud {
+        fn drop(&mut self) {
+            assert!(!self.0, "the loser's drop panics");
+        }
+    }
+    let slot = CAtomicOwner::<Box<Loud>>::with(Box::new(Loud(false)));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // The field is full: `f`'s value loses, and its drop panics.
+        let _ = slot.set(Box::new(Loud(true)));
+    }));
+    assert!(r.is_err());
+    assert!(!slot.get().unwrap().0);
+}
+
 /// The consumer side writes no `unsafe`.
 #[forbid(unsafe_code)]
 mod consumer {
