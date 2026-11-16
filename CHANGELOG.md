@@ -60,8 +60,9 @@ Changes on `devel` since 0.1.1.
   / `swap` / `is_set` / `set_flag`, each change one atomic
   read-modify-write that keeps the other fields; `set_flag` skips the write
   when the flag is already as asked only for an ordering with no release
-  part; it fails to build where `W`'s atomic is more aligned than `W`
-  (`u64` on i686). Which bytes the unit is follows the ABI: on System V and
+  part. `CAtomicBitfield<W>` needs `W: CAtomicBitWord`, which `u64` is
+  not on i686 (`AtomicU64` is more aligned than C's `long long` member), so
+  the type itself is rejected there. Which bytes the unit is follows the ABI: on System V and
   AAPCS it covers the bytes the run occupies, not the declared type. The
   layouts are checked against clang for seven targets
   (`tests/bitfield_c_layout.rs`). Unsigned fields only.

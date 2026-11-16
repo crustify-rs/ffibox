@@ -206,6 +206,36 @@ When it is Rust's memory that C holds, calls or reads, read
 If you are upgrading, [CHANGELOG.md](CHANGELOG.md) says what each release
 changes, and how to migrate code that still compiles but behaves differently.
 
+## Testing
+
+The full matrix, which a change runs before it lands:
+
+```sh
+cargo test                                  # stable, the MSRV
+FFIBOX_REQUIRE_CLANG=1 cargo test --test bitfield_c_layout
+cargo clippy --all-targets
+cargo clippy --lib --no-default-features
+cargo clippy --lib --no-default-features --features alloc
+MIRIFLAGS=-Zmiri-strict-provenance cargo +nightly miri test
+MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-tree-borrows" cargo +nightly miri test
+MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-many-seeds=0..16" \
+    cargo +nightly miri test --test counted --test atomic_owner --test bitfield
+for t in s390x-unknown-linux-gnu powerpc64-unknown-linux-gnu i686-unknown-linux-gnu \
+         aarch64-unknown-linux-gnu armv7-unknown-linux-gnueabihf x86_64-pc-windows-msvc; do
+    MIRIFLAGS=-Zmiri-strict-provenance \
+        cargo +nightly miri test --target $t --test bitfield --test bitfield_c_layout
+done
+```
+
+`tests/bitfield_c_layout.rs` checks the bitfield mirrors against a table
+that clang computes (`tests/data/bitfield_layouts.txt`). Rebuilding the table
+needs `clang` and `llvm-objdump` (or their `-18` names). Without them that
+test passes with a note on stderr, unless `FFIBOX_REQUIRE_CLANG=1` is set,
+when it fails: set it wherever the matrix runs. `FFIBOX_BLESS=1` rewrites the
+table from clang's output. Review its diff before committing it. The
+cross-target Miri runs are what check big-endian and i686 layouts. A native
+run checks only the host's.
+
 ## Maintainers
 
 - Marius Momeu <marius.momeu@berkeley.edu>
