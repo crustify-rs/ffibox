@@ -132,7 +132,11 @@ extern crate alloc;
 extern crate std;
 
 pub mod allocator;
+pub mod atomic_owner;
 pub mod callback;
+#[cfg(feature = "alloc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+pub mod counted;
 pub mod iter;
 pub mod macros;
 pub mod refs;
@@ -157,9 +161,12 @@ pub struct DocExamples;
 
 // Re-export the primary items at the crate root for convenience.
 pub use crate::allocator::CAllocator;
+pub use crate::atomic_owner::{CAtomicOwner, CPtrOwner};
 pub use crate::callback::{CCallback, CClosure, CFn, CFnBox};
 #[cfg(feature = "alloc")]
 pub use crate::callback::{CCallbackBox, CPayload};
+#[cfg(feature = "alloc")]
+pub use crate::counted::{CCounted, CShareable, CShared};
 pub use crate::refs::{CBorrowedPtr, CBox, CBoxState, CSlice, CSliceMut, CStrBox, CVal, CVec};
 #[cfg(feature = "alloc")]
 pub use crate::rust_alloc::RustAlloc;
