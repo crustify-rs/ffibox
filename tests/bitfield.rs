@@ -18,17 +18,24 @@ const ADDED: CBits<u16> = PARSED.next(1);
 const FLAGS: CBits<u16> = ADDED.next(4);
 
 #[test]
-#[cfg(target_endian = "little")]
-fn declaration_order_gives_the_sysv_bits() {
-    // What the port's hand-written masks say, and clang computes.
-    assert_eq!(SEEN.mask(), 1 << 0);
-    assert_eq!(UNINTERESTING.mask(), 1 << 1);
-    assert_eq!(TOPO_DELAY.mask(), 1 << 2);
-    assert_eq!(PARSED.mask(), 1 << 3);
-    assert_eq!(ADDED.mask(), 1 << 4);
-    assert_eq!(FLAGS.mask(), 0xf << 5);
-    assert_eq!((FLAGS.lsb(), FLAGS.width()), (5, 4));
-    assert_eq!(CBits::<u16>::at(5, 4), FLAGS);
+fn declaration_order_gives_the_abi_bits() {
+    // Little-endian: from bit 0 up; big-endian: from the top bit down. The
+    // C compiler's own placement is checked in `bitfield_c_layout.rs`.
+    let at = |lsb_le: u32, w: u32| {
+        if cfg!(target_endian = "little") {
+            lsb_le
+        } else {
+            16 - lsb_le - w
+        }
+    };
+    assert_eq!(SEEN.mask(), 1 << at(0, 1));
+    assert_eq!(UNINTERESTING.mask(), 1 << at(1, 1));
+    assert_eq!(TOPO_DELAY.mask(), 1 << at(2, 1));
+    assert_eq!(PARSED.mask(), 1 << at(3, 1));
+    assert_eq!(ADDED.mask(), 1 << at(4, 1));
+    assert_eq!(FLAGS.mask(), 0xf << at(5, 4));
+    assert_eq!((FLAGS.lsb(), FLAGS.width()), (at(5, 4), 4));
+    assert_eq!(CBits::<u16>::at(at(5, 4), 4), FLAGS);
 }
 
 #[test]
@@ -58,14 +65,20 @@ fn whole_words_and_edges() {
     w.set(all, 0xa5);
     assert_eq!(w.into_inner(), 0xa5);
     let top = CBits::<u64>::at(63, 1);
+    assert_eq!(CBits::<u64>::first(64).mask(), u64::MAX);
     let mut w = CBitfield::new(0u64);
     w.set_flag(top, true);
     assert_eq!(w.into_inner(), 1 << 63);
     let wide = CBits::<u32>::first(31).next(1);
+    let last = if cfg!(target_endian = "little") {
+        1 << 31
+    } else {
+        1
+    };
     let a = CAtomicBitfield::<u32>::new(0);
     assert!(!a.set_flag(wide, true, SeqCst));
-    assert_eq!(a.load_word(SeqCst), 1 << 31);
-    assert_eq!(a.into_inner(), 1 << 31);
+    assert_eq!(a.load_word(SeqCst), last);
+    assert_eq!(a.into_inner(), last);
 }
 
 #[test]
@@ -92,9 +105,10 @@ fn atomic_flags_and_fields() {
     assert!(w.set_flag(DIRTY, false, Relaxed));
     assert!(!w.set_flag(DIRTY, false, Relaxed), "already clear");
     let level = DIRTY.next(3);
-    assert_eq!(w.store(level, 0b1101, AcqRel), 0);
+    assert_eq!(w.swap(level, 0b1101, AcqRel), 0);
     assert_eq!(w.load(level, Acquire), 0b101);
-    assert_eq!(w.store(level, 2, Release), 0b101);
+    w.store(level, 2, Release);
+    assert_eq!(w.swap(level, 2, SeqCst), 2);
     assert_eq!(w.load(level, Relaxed), 2);
     assert!(!w.is_set(DIRTY, Relaxed));
     assert!(format!("{w:?}").starts_with("CAtomicBitfield("));
@@ -120,39 +134,9 @@ fn concurrent_changes_to_different_fields_are_all_kept() {
     for f in fields {
         assert!(w.is_set(f, Relaxed));
     }
-    assert_eq!(w.load_word(Relaxed), 0b1_1111);
-}
-
-/// A mirrored struct: the word is the C storage unit, at the C offset.
-#[repr(C)]
-struct Node {
-    oid: [u8; 33],
-    bits: CBitfield<u16>,
-    in_degree: u16,
-}
-
-#[repr(C)]
-struct NodeC {
-    oid: [u8; 33],
-    bits: u16,
-    in_degree: u16,
-}
-
-#[test]
-fn layout_matches_the_storage_unit() {
-    assert_eq!(size_of::<Node>(), size_of::<NodeC>());
-    assert_eq!(
-        core::mem::offset_of!(Node, bits),
-        core::mem::offset_of!(NodeC, bits)
-    );
-    assert_eq!(size_of::<CAtomicBitfield<u32>>(), 4);
-    assert_eq!(align_of::<CAtomicBitfield<u32>>(), align_of::<u32>());
-    let n = Node {
-        oid: [0; 33],
-        bits: CBitfield::new(0),
-        in_degree: 2,
-    };
-    assert_eq!(n.oid.len() + usize::from(n.in_degree), 35);
+    let all = fields.iter().fold(0, |m, f| m | f.mask());
+    assert_eq!(w.load_word(Relaxed), all);
+    assert_eq!(all.count_ones(), 5);
 }
 
 /// The consumer side writes no `unsafe`: the primitive has none to offer.
