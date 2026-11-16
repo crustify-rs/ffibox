@@ -36,16 +36,44 @@ has a hand-written `Arc`: `Clone` → `rc.inc()`, `Drop` → `rc.dec()` → free
 
 ### 1.1 The count, once: `util/thread.rs`
 
-`GitRefcount` (`util/thread.rs:423-473`) keeps `inc` / `dec` / `own` /
-`owner`. Add one generic helper, so that each type's `CCounted` impl is a few
-lines:
+ffibox's `CCounted` contract (after review `ffibox-grow-r1`) asks more of the
+count than `GitRefcount` gives today. Change `GitRefcount`
+(`util/thread.rs:419-473`) first:
+
+- **No safe way to change or make a count** (F4). Remove
+  `#[derive(Default)]`, and make `inc`, `dec` and `own` `unsafe fn`. Make
+  `new(n)` crate-private, or `unsafe` for any `n != 1`. Through
+  `CShareable`'s `Deref` and `refcount_of` below, safe crate code reaches
+  `&GitRefcount`, so a safe `dec` would let it drop a count it does not own.
+- **`init`** (for `c_init`): count 1, owner NULL. `CShared::from_box` and
+  `try_new` call it, so constructors no longer need to start the count
+  right. `GitIndex::new` starting at 0 (`index/mod.rs:950-978`) is then
+  harmless.
+- **Never wrap** (F1). `inc` returns `bool`, and is `false`, changing
+  nothing, when the count is at a bound (`i32::MAX / 2`, as `Arc`'s
+  `MAX_REFCOUNT`). Use a compare-and-swap loop, or `fetch_add` followed by a
+  check that undoes it. `git_refcount` is 32 bits.
+- **Orderings** (F2). `Atomic32` is `SeqCst` throughout (C's
+  `__atomic_*_fetch(…, __ATOMIC_SEQ_CST)`). That is at least `Release` on
+  every decrement and `Acquire` on the last one and on the sole check, as
+  `CCounted` requires. Keep it.
+- **`dec` tests `v == 0`**, not `v <= 0`, then reads `owner` with `Acquire`
+  (`SeqCst`) after the decrement. "At most once" then holds without relying
+  on no over-decrement.
+- **`sole`** (for `c_is_sole_owner`): `val() == 1 && owner().is_null()`.
+  This is valid only if every holder of the object holds a count, which is
+  the case today: snapshots and iterators take one. A safe `new(n)` would
+  break the `get_mut` clause, so keep `new` private, as above.
+
+Add one generic helper, so that each type's `CCounted` impl is a few lines:
 
 ```rust
 /// The `git_refcount` at offset 0 of a live `T` (`#[repr(C)]`, `rc` first).
 /// # Safety
 /// `p` is live while the result is used; `T` starts with a `GitRefcount`.
 pub(crate) unsafe fn refcount_of<'a, T>(p: NonNull<T>) -> &'a GitRefcount {
-    // SAFETY: the caller's contract; `GitRefcount` is all atomics.
+    // SAFETY: the caller's contract; `GitRefcount` is all atomics, and its
+    // mutators are `unsafe`.
     unsafe { p.cast::<GitRefcount>().as_ref() }
 }
 ```
@@ -54,16 +82,33 @@ This is `repository/handles.rs:32-36` (`refcount`), made generic and moved.
 Delete the old one when §2 lands. Each type also gets
 `const _: () = assert!(offset_of!(T, rc) == 0);`.
 
+All four impls below take the same five methods (written once, for
+example as a `macro_rules!` in `util/thread.rs`):
+
+```rust
+unsafe fn c_init(p: NonNull<Self>) { unsafe { refcount_of(p).init() } }
+unsafe fn c_up_ref(p: NonNull<Self>) -> bool { unsafe { refcount_of(p).inc() } }
+unsafe fn c_down_ref(p: NonNull<Self>) -> bool { unsafe { refcount_of(p).dec() } }
+unsafe fn c_is_sole_owner(p: NonNull<Self>) -> bool { unsafe { refcount_of(p).sole() } }
+```
+
+`CShared`'s own operations are associated functions, as `Arc`'s are:
+`CShared::as_ptr(&s)`, `CShared::into_raw(s)`, `CShared::get_mut(&mut s)`.
+They are written that way below. `CShared::release` is a plain `unsafe fn`,
+so the `barrier` around it in each export now catches a panic in a `Drop`
+(F10).
+
 ### 1.2 `git_odb`: `odb.rs`, `odb/api.rs`, `odb/ffi.rs`
 
 ```rust
 // SAFETY: `rc` is `git_refcount`, which C changes only with GIT_REFCOUNT_*
-// (atomic); `dec` keeps an owned odb (its repository releases it); odbs are
-// built only by `GitOdb::new`, count 1, no owner; they live in GIT_ALLOC.
+// (SeqCst atomics); `inc` refuses before it wraps; `dec` keeps an owned odb
+// (its repository releases it); `GitRefcount` has no safe mutator or
+// constructor of another state; odbs live in GIT_ALLOC (a zero-sized
+// CAllocator over a unit family).
 unsafe impl CCounted for GitOdb {
     type Alloc = GitAlloc;
-    unsafe fn c_up_ref(p: NonNull<Self>) { unsafe { refcount_of(p) }.inc() }
-    unsafe fn c_down_ref(p: NonNull<Self>) -> bool { unsafe { refcount_of(p) }.dec() }
+    // the five methods of §1.1
 }
 // SAFETY: C writes only `rc`; holders reach `locked` through its mutex, and
 // `own_cache` / `do_fsync` are synchronised; `options` is fixed.
@@ -80,21 +125,21 @@ unsafe impl CShareable for GitOdb {}
 | `odb/api.rs:80-95` | hand-written `Clone` (`rc.inc()`) and `Drop` (`odb_decref`) | derived `Clone`; no `Drop` | 1 |
 | `odb/api.rs:97-101` `inner` | `unsafe { self.raw.as_ref() }` | `&self.0` (deref) | 1 |
 | `odb/api.rs:103-127` `from_raw`, `new_ref` | hand-written; `new_ref` does `raw.as_ref().rc.inc()` | `CShared::from_raw(p)`, `CShared::from_borrowed(p)` (still `unsafe fn` for their callers) | 1 |
-| `odb/api.rs:129-140` `as_raw`, `into_raw` | `mem::forget` | `self.0.as_ptr()`, `self.0.into_raw()` | — |
+| `odb/api.rs:129-140` `as_raw`, `into_raw` | `mem::forget` | `CShared::as_ptr(&self.0)`, `CShared::into_raw(self.0)` | — |
 | `odb/ffi.rs:435-443` `git_odb_free` | `barrier` + `odb_decref` | `barrier(\|\| unsafe { CShared::<GitOdb>::release(db) })` | — (1 stays, shorter) |
 | `repository/ffi.rs:558-580` `git_repository_odb` | `p.as_ref().rc.inc()` after the weak pointer | `CShared::<GitOdb>::increment_count(p)` | 1 |
 
 ### 1.3 `git_config`: `config.rs`
 
-Same impls as for the odb, with `type Alloc = std::alloc::Global` (configs
-are `Box<GitConfig>`). `CShareable`: `backends` is an `RwLock`, and C writes
+Same impls as for the odb (§1.1's methods), with
+`type Alloc = std::alloc::Global` (configs are `Box<GitConfig>`). `CShareable`: `backends` is an `RwLock`, and C writes
 only `rc`.
 
 | Location | Today | Becomes | Removes |
 |---|---|---|---|
 | `config.rs:832-838` `GitConfig::new` → `Box<GitConfig>`; also `open_ondisk`, `open_default`, `open_level`, `open_global`, `snapshot` returning `Box<GitConfig>` | boxes adopted by `Config::from_box` | return `CShared<GitConfig>` (`CShared::from_box(Box::new(..))`) | — |
-| `config.rs:2085-2091` `out_config` | `out.write(Box::into_raw(c))` | `out.write(c.into_raw())` | — |
-| `config.rs:3512-3517` `git_config_open_default` | `Box::into_raw(c)` | `c.into_raw()` | — |
+| `config.rs:2085-2091` `out_config` | `out.write(Box::into_raw(c))` | `out.write(CShared::into_raw(c))` | — |
+| `config.rs:3512-3517` `git_config_open_default` | `Box::into_raw(c)` | `CShared::into_raw(c)` | — |
 | `config.rs:2136-2155` `git_config_free` | `cfg(config).rc.dec()` then `Box::from_raw` | `CShared::<GitConfig>::release(config)` in the barrier | 2 |
 | `config.rs:3793-3798` `struct Config<'r>` | `raw` + `_parent` | `#[derive(Clone)] struct Config<'r>(CShared<GitConfig>, PhantomData<&'r ()>)` | — |
 | `config.rs:3800-3803` | `unsafe impl Send` / `Sync for Config` | deleted | 2 |
@@ -111,8 +156,7 @@ which frees the backend through its slot first.
 ```rust
 unsafe impl CCounted for GitRefdb {
     type Alloc = GitAlloc;
-    unsafe fn c_up_ref(p: NonNull<Self>) { unsafe { refcount_of(p) }.inc() }
-    unsafe fn c_down_ref(p: NonNull<Self>) -> bool { unsafe { refcount_of(p) }.dec() }
+    // the five methods of §1.1, and:
     // `free_db`'s body: the backend through its `free` slot, the memzero, then
     // `alloc::free`. Or move the backend free into `impl Drop for GitRefdb` and
     // build with `CShared::try_new`, keeping the default release.
@@ -124,7 +168,7 @@ unsafe impl CShareable for GitRefdb {} // rc and backend are atomics; repo is fi
 | Location | Today | Becomes | Removes |
 |---|---|---|---|
 | `refdb.rs:276-287` `decref` | `(*db).rc.dec()` → `free_db` | `CShared::<GitRefdb>::decrement_count(db)` at the callers, or deleted | 2 |
-| `refdb.rs:373-376` `RefdbPtr::incref` | `rc.inc()` | `CShared::from_borrowed(self.as_ptr())` where a counted reference is wanted | — |
+| `refdb.rs:373-376` `RefdbPtr::incref` | `rc.inc()` | `CShared::from_borrowed(self.as_ptr())` (a `RefdbPtr`'s own `as_ptr`) where a counted reference is wanted | — |
 | `refdb.rs:724-733` `new_db` | `calloc` + `(*db).repo = repo` + `rc.inc()` | `CShared::try_new(GitRefdb { rc: GitRefcount::new(1), repo, backend: AtomicPtr::default() })` | 2 |
 | `refdb.rs:750-757` `open`, error path | `decref(db.as_ptr())` | drop the `CShared` | 1 |
 | `refdb.rs:880-891` `iterator_free` | `decref((*iter).db)` | `CShared::decrement_count(db)` (the iterator's `db` is a C field of `git_reference_iterator`; see the note below) | 1 |
@@ -147,15 +191,15 @@ C writes `entries`, the bits, `tree` and others directly, and C callbacks run
 while the index is in use. So no `&GitIndex` may live across foreign code
 (module docs, `index/mod.rs:27-40`), and `GitIndex` gets `CCounted` without
 `CShareable`. `CShared<GitIndex>` then has no `Deref`. The index is reached
-through `IndexPtr`, as today, and `get_mut()` gives `&mut GitIndex` when the
-count proves the reference sole.
+through `IndexPtr`, as today, and `CShared::get_mut` gives `&mut GitIndex`
+when the count proves the reference sole. That relies on every reader holding
+a count (snapshots and iterators do) and on `GitRefcount`'s private
+constructor (§1.1).
 
 ```rust
 unsafe impl CCounted for GitIndex {
     type Alloc = std::alloc::Global;
-    unsafe fn c_up_ref(p: NonNull<Self>) { unsafe { refcount_of(p) }.inc() }
-    unsafe fn c_down_ref(p: NonNull<Self>) -> bool { unsafe { refcount_of(p) }.dec() }
-    unsafe fn c_is_sole(p: NonNull<Self>) -> bool { /* val() == 1 && owner().is_null() */ }
+    // the five methods of §1.1, and:
     unsafe fn c_release(p: NonNull<Self>) { unsafe { index_free(IndexPtr::new(p)) } }
 }
 ```
@@ -244,6 +288,32 @@ hand-written `publish` over raw `GitRefcount` boxes. Keep them, ported to
 
 None of these sites has `unsafe` for the masks themselves. The win is
 declaring each layout once from the C declaration, and in one place a bug.
+
+**Which `W`.** On System V (the only ABI the port builds for: `USE_RUST` is
+OFF on every platform other than Unix, `rust/PORTING.md` §1), `W` is the unsigned type covering the
+bytes the run occupies, and any byte of `W` beyond the run must be padding in
+C. It is not necessarily the declared type (`ffibox` `bitfield` module docs,
+and `tests/bitfield_c_layout.rs` against clang). For each site below, the
+next member starts at the next boundary of its own alignment, so the bytes of
+`W` past the run are padding:
+
+- `git_index` (`u32` at 132; `tree` at 136);
+- `git_repository` (`u32`; `oid_type` follows at the next 4-byte boundary);
+- `git_process_options` (`u32`; a pointer follows);
+- `git_commit_create_options` (`u32`; a pointer follows);
+- `git_indexwriter` (`u32`, the last member: trailing padding).
+
+`git_commit_list_node` is declared `unsigned`, and its 9-bit run is mirrored
+as `u16` because `in_degree` (`uint16_t`) sits at offset 54, inside the
+`unsigned`'s size. That is right on System V, as the rule says, and would be
+wrong on MSVC (`in_degree` at 56). It is moot for the port, which never builds
+the Rust on Windows. Keep the port's C-compiled layout checks
+(`c_layout_test!` for the offsets, `repository/tests.rs`
+`bitfield_bits_match_c` for bit positions) as the oracle for each mirror.
+
+`CAtomicBitfield::store` no longer returns the previous value (that is
+`swap`). `set_flag` skips the write only for an ordering with no release
+part, and every site here uses `Relaxed`.
 
 ### 3.1 `git_index`'s bits: a lost update (fix this first)
 
