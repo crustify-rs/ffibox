@@ -40,15 +40,22 @@ ffibox's `CCounted` contract (after review `ffibox-grow-r1`) asks more of the
 count than `GitRefcount` gives today. Change `GitRefcount`
 (`util/thread.rs:419-473`) first:
 
-- **No safe way to change or make a count** (F4). Remove
-  `#[derive(Default)]`, and make `inc`, `dec` and `own` `unsafe fn`. Make
-  `new(n)` crate-private, or `unsafe` for any `n != 1`. Through
-  `CShareable`'s `Deref` and `refcount_of` below, safe crate code reaches
+- **No safe way to change a count, or to make one other than one
+  reference with no owner** (r1 F4, r2 N1). Remove `#[derive(Default)]`, and
+  make `inc`, `dec` and `own` `unsafe fn`. Replace `new(n)` with a safe
+  `GitRefcount::one()`, count 1 and no owner, and an `unsafe fn
+  with_count(n)` for any other count. Making `new(n)` private or
+  crate-private is **not** enough: safe code in the crate is still safe
+  code. Through `CShared::get_mut` it can `mem::replace` a whole
+  `GitIndex` with one at count 0, after which a clone and its drop free the
+  object while the `CShared` still points at it. Through `CShareable`'s
+  `Deref` and `refcount_of` below, safe crate code also reaches
   `&GitRefcount`, so a safe `dec` would let it drop a count it does not own.
 - **`init`** (for `c_init`): count 1, owner NULL. `CShared::from_box` and
-  `try_new` call it, so constructors no longer need to start the count
-  right. `GitIndex::new` starting at 0 (`index/mod.rs:950-978`) is then
-  harmless.
+  `try_new` call it, as a defence against a value adopted with a stale
+  count. It does not replace the rule above: nothing calls it after a store
+  through `get_mut`. So **`GitIndex::new` (`index/mod.rs:950-978`) starts at
+  1** (`GitRefcount::one()`), as must every constructor of the four types.
 - **Never wrap** (F1). `inc` returns `bool`, and is `false`, changing
   nothing, when the count is at a bound (`i32::MAX / 2`, as `Arc`'s
   `MAX_REFCOUNT`). Use a compare-and-swap loop, or `fetch_add` followed by a
@@ -62,8 +69,9 @@ count than `GitRefcount` gives today. Change `GitRefcount`
   on no over-decrement.
 - **`sole`** (for `c_is_sole_owner`): `val() == 1 && owner().is_null()`.
   This is valid only if every holder of the object holds a count, which is
-  the case today: snapshots and iterators take one. A safe `new(n)` would
-  break the `get_mut` clause, so keep `new` private, as above.
+  the case today: snapshots and iterators take one. A safe way to make any
+  other count would break the `get_mut` clause, hence `one()` /
+  `unsafe with_count(n)` above.
 
 Add one generic helper, so that each type's `CCounted` impl is a few lines:
 
@@ -193,8 +201,12 @@ while the index is in use. So no `&GitIndex` may live across foreign code
 `CShareable`. `CShared<GitIndex>` then has no `Deref`. The index is reached
 through `IndexPtr`, as today, and `CShared::get_mut` gives `&mut GitIndex`
 when the count proves the reference sole. That relies on every reader holding
-a count (snapshots and iterators do) and on `GitRefcount`'s private
-constructor (§1.1).
+a count (snapshots and iterators do), and on safe code being unable to make a
+`GitRefcount` other than `one()` (§1.1). `GitIndex::new` must therefore start
+at 1. Starting at 0 and relying on `c_init` would make `CShared::get_mut` +
+`mem::replace` a safe use-after-free (review r2, N1). If the index keeps a
+safe constructor at another count, it keeps the provided `c_is_sole_owner`
+(`false`) and loses `get_mut`.
 
 ```rust
 unsafe impl CCounted for GitIndex {
@@ -213,7 +225,7 @@ return, which leaks as the C does.
 | `index/mod.rs:1973-1997` `incref`, `decref` | `rc().inc()`, `rc().dec()` → `index_free` | `CShared::increment_count` / `decrement_count` | 1 |
 | `index/api.rs:366-395` `struct Index<'r>`, `Clone`, `Drop` | `ptr: IndexPtr` + `incref` / `decref` | `#[derive(Clone)] struct Index<'r>(CShared<GitIndex>, PhantomData<(*mut (), &'r ())>)`, reached as `IndexPtr::new(self.0.as_ptr())` | 1 |
 | `index/api.rs:407-419` `Index::new_ref` | `IndexPtr::new` + `incref` | `CShared::from_borrowed` | — |
-| `index/ops.rs:545-572` `open_ext` | `Box::leak` at count 0, `ix.decref()` on a read failure (which frees at 0), `ix.incref()` on success | `GitIndex::new` (`index/mod.rs:950-978`) sets the count to 1; `let ix = CShared::from_box(index)`; on failure `drop(ix)`; return `ix`. Also `index/ops.rs:806, 1083, 1524` `incref()` → `CShared::from_borrowed` / `increment_count` | 1 |
+| `index/ops.rs:545-572` `open_ext` | `Box::leak` at count 0, `ix.decref()` on a read failure (which frees at 0), `ix.incref()` on success | `GitIndex::new` (`index/mod.rs:950-978`) builds the count with `GitRefcount::one()`; `let ix = CShared::from_box(index)`; on failure `drop(ix)`; return `ix`. Also `index/ops.rs:806, 1083, 1524` `incref()` → `CShared::from_borrowed` / `increment_count` | 1 |
 | `repository/ffi.rs:728-750` `git_repository_index` | `IndexPtr::new(p).incref()` | `CShared::<GitIndex>::increment_count(p)` | 1 |
 | `index/ffi.rs:397-405` `git_index_free` | `handle(index)` + `decref` | `CShared::<GitIndex>::release(index)` in the barrier | 1 |
 
@@ -307,12 +319,15 @@ next member starts at the next boundary of its own alignment, so the bytes of
 as `u16` because `in_degree` (`uint16_t`) sits at offset 54, inside the
 `unsigned`'s size. That is right on System V, as the rule says, and would be
 wrong on MSVC (`in_degree` at 56). It is moot for the port, which never builds
-the Rust on Windows. Keep the port's C-compiled layout checks
+the Rust on Windows. The i686 `long long` alignment caveat (the boundary is
+the alignment, not the size) does not apply to any site here, all of which
+are `unsigned` runs. Keep the port's C-compiled layout checks
 (`c_layout_test!` for the offsets, `repository/tests.rs`
 `bitfield_bits_match_c` for bit positions) as the oracle for each mirror.
 
-`CAtomicBitfield::store` no longer returns the previous value (that is
-`swap`). `set_flag` skips the write only for an ordering with no release
+`CAtomicBitfield<W>` now needs `W: CAtomicBitWord` (`u8`, `u16`, `u32`;
+`u64` except on i686). Every site here uses `u32`. `CAtomicBitfield::store`
+no longer returns the previous value (that is `swap`). `set_flag` skips the write only for an ordering with no release
 part, and every site here uses `Relaxed`.
 
 ### 3.1 `git_index`'s bits: a lost update (fix this first)

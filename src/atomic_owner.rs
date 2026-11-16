@@ -38,7 +38,8 @@
 //! Safe code only fills an empty field, so a borrow it lends stays valid
 //! while `&self` lives. Replacing a value that may be lent is
 //! [`replace`](CAtomicOwner::replace), which is `unsafe`: its caller states
-//! that no borrow of the old value, Rust's or C's, is used afterwards.
+//! that every borrow of the old value has ended (is no longer live, not only
+//! unused), and that no weak pointer C keeps to it is used afterwards.
 
 use core::fmt;
 use core::marker::PhantomData;
@@ -184,8 +185,9 @@ unsafe impl<T: crate::counted::CCounted> CPtrOwner for crate::counted::CShared<T
 ///
 /// **What C may do.** C reads the field, and fills it when it is NULL, with
 /// an owner of the same kind. It replaces or clears a full field only where
-/// the binding's contract with C already says no borrow of the old value is
-/// used afterwards, as [`replace`](Self::replace) states for Rust. The field
+/// the binding's contract with C already says every borrow of the old value
+/// has ended (is no longer live), as [`replace`](Self::replace) states for
+/// Rust. The field
 /// holds `NULL` or a pointer the owner's [`into_raw_ptr`](CPtrOwner) gave.
 ///
 /// A borrow keeps the field from being emptied through `&mut self`:
