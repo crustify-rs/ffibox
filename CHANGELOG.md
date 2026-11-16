@@ -15,19 +15,26 @@ Changes on `devel` since 0.1.1.
   feature). `CShared<T>` is `Arc<T>` for an object Rust allocates whose
   reference count is a field of its own, which C increments and decrements
   in place (libgit2's `git_refcount`, touched by `GIT_REFCOUNT_INC` and
-  `git_odb_free`). The binding's `unsafe impl CCounted` states how a
-  reference is taken (`c_up_ref`), dropped (`c_down_ref`, which also
-  decides whether an owner field keeps the object alive), proved sole
-  (`c_is_sole`) and freed (`c_release`, by default the `Box<T, Alloc>` it
-  lives in); `unsafe impl CShareable` adds that a `&T` may live while C
-  holds references, which gives `Deref`. `CShared` is
-  `#[repr(transparent)]` over the pointer, `Clone` and `Drop` through the
-  count, `Send` / `Sync` on `Arc`'s terms, and has `from_box` / `try_new`,
-  `from_raw` / `into_raw` / `from_borrowed` for references crossing to C,
-  `increment_count` / `decrement_count` as `Arc`'s, `get_mut` when sole, and
-  `release`, C's `foo_free`, for the binding's export. It is the outbound
-  counterpart of `CArc`, which counts objects C allocates and reaches through
-  handles. Nothing existing changes. See
+  `git_odb_free`). The binding's `unsafe impl CCounted` states how the count
+  is set when an object is adopted (`c_init`, which `CShared` calls, so no
+  value's count is trusted), taken (`c_up_ref`, `false` before it could
+  wrap, on which `Clone` aborts as `Arc`'s does), dropped (`c_down_ref`,
+  with `Arc`'s `Release` / `Acquire`, also deciding whether an owner field
+  keeps the object alive), proved sole (`c_is_sole_owner`, `Acquire`) and
+  freed (`c_release`, by default the `Box<T, Alloc>` it lives in, `Alloc`
+  zero-sized and stateless, checked at compile time); its contract carries
+  `CRefClone`'s clauses for a C count. `unsafe impl CShareable` adds that a
+  `&T` may live while C holds references, which gives `Deref` and, through
+  `T`, `PartialEq` / `Eq` / `PartialOrd` / `Ord` / `Hash` / `Display` /
+  `Borrow<T>`. `CShared` is `#[repr(transparent)]` over the pointer, `Send`
+  / `Sync` on `Arc`'s terms, and has `from_box` (and `From<Box<T, Alloc>>`)
+  / `try_new`, `from_raw` / `from_borrowed` for references crossing to C,
+  and, as associated functions like `Arc`'s, `as_ptr`, `into_raw`,
+  `get_mut`, `ptr_eq`, `increment_count` / `decrement_count`, and
+  `release`, C's `foo_free`, which the binding's export calls inside its
+  panic barrier. It is the outbound counterpart of `CArc`, which counts
+  objects C allocates and reaches through handles. Nothing existing
+  changes. See
   [docs/outbound.md](docs/outbound.md#counted-objects-published-fields-and-bitfields).
 - **Owners in C pointer fields filled once** (`atomic_owner` module).
   `CAtomicOwner<O>` is a C struct's pointer field, `#[repr(transparent)]`
@@ -37,21 +44,27 @@ Changes on `devel` since 0.1.1.
   back), `get_or_init`, `get_or_try_init`, `take`, `get_mut`,
   `into_inner`. Two threads may both create a value; the loser of the
   compare-and-swap drops its own, as C's does. `as_ptr` is C's weak
-  pointer, and `unsafe replace` is C's setter, whose caller states that no
-  borrow of the old value is used afterwards. `Sync` when `O: Send + Sync`.
-  `CPtrOwner` is a new unsafe trait, implemented for ffibox's pointer owners
-  under a `Default` policy; nothing existing changes.
+  pointer, and `unsafe replace` is C's setter, whose caller states that
+  every borrow of the old value has ended. All-zero bytes are an empty
+  field. `Sync` when `O: Send + Sync`. `CPtrOwner` is a new unsafe trait,
+  implemented for ffibox's pointer owners under a `Default` policy; nothing
+  existing changes.
 - **C bitfields by field** (`bitfield` module). `CBits<W>` names a field of
-  the storage unit `W` (`u8` to `u64`) once, in C's declaration order:
-  `CBits::first(width)` then `.next(width)`, which place the bits as the
-  System V and AAPCS ABIs do for the target's endianness, or `CBits::at`;
-  a field that does not fit fails to build. `CBitfield<W>` is the unit,
-  `#[repr(transparent)]` over `W`, with `get` / `set` (truncating as C's
-  assignment does) / `is_set` / `set_flag`. `CAtomicBitfield<W>` is the unit
-  shared between threads: `load` / `store` / `is_set` / `set_flag`, each
-  change one atomic read-modify-write that keeps the other fields, and
-  `set_flag` skips the write when the flag is already as asked. Unsigned
-  fields only.
+  a unit `W` (`u8` to `u64`) once, in C's declaration order:
+  `CBits::first(width)` then `.next(width)`, which place the bits as System
+  V, AAPCS and Microsoft x64 do for the target's endianness, or `CBits::at`;
+  a field that does not fit, or has no bits, fails to build. `CBitfield<W>`
+  is the unit, `#[repr(transparent)]` over `W`, with `get` / `set`
+  (truncating as C's assignment does) / `is_set` / `set_flag`.
+  `CAtomicBitfield<W>` is the unit shared between threads: `load` / `store`
+  / `swap` / `is_set` / `set_flag`, each change one atomic
+  read-modify-write that keeps the other fields; `set_flag` skips the write
+  when the flag is already as asked only for an ordering with no release
+  part; it fails to build where `W`'s atomic is more aligned than `W`
+  (`u64` on i686). Which bytes the unit is follows the ABI: on System V and
+  AAPCS it covers the bytes the run occupies, not the declared type. The
+  layouts are checked against clang for seven targets
+  (`tests/bitfield_c_layout.rs`). Unsigned fields only.
 - **C tables implemented in Rust** (`vtable` module, `alloc` feature).
   `CTable<T, S>` holds Rust state `S` behind a C table of function pointers
   of the layout type `T`, which C calls into: the table first, each slot

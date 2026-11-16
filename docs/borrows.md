@@ -41,7 +41,10 @@ where the macros take the type.
 - **C bitfields are read by field.** A mirror holds the storage unit as a
   `CBitfield<W>` (or `CAtomicBitfield<W>`, when threads share it), and the
   getters and setters pass the field's `CBits<W>`, declared once in C's
-  order with `CBits::first` / `next`. No mask is written by hand.
+  order with `CBits::first` / `next`. No mask is written by hand. `W`
+  covers the bytes the C compiler gives the run, which on System V is not
+  always the declared type: see
+  [outbound.md](outbound.md#counted-objects-published-fields-and-bitfields).
 - **Every holder reaches the handles the same way:**
   - `as_ref()` / `as_mut()` on `Foo`, `CBox`, `CBoxState`, `CVal` and
     `FooMut` itself. On `FooMut`, `as_mut()` is the reborrow that a `&mut`

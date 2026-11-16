@@ -25,7 +25,7 @@ down for one call, and that C does not keep, is plain Rust:
 | hands Rust a function and its context to call | `CFn` for the call or borrow that the pair came with, or `CFnBox` with the routine that releases the context: `call()`, `parts()` / `into_raw()` | a closure |
 | holds a callback that is either a Rust closure or a C function | `CCallback` (for a call or borrow) or `CCallbackBox` (kept until released): `call()` from Rust, `c_form()` / `into_c()` to C | `impl FnMut`, `Box<dyn Fn>` |
 | calls into a table of function pointers, where each slot is passed the table (a backend, a stream) | `CTable<T, S>`, with its slots from `impl_cvtable!`: `as_c_ptr()` / `into_c()`, released through its `release` slot | `Box<dyn Trait>` |
-| takes and drops references to an object Rust allocated, through a count field of its own (`GIT_REFCOUNT_INC`, `foo_free`) | `CShared<T>` over a `CCounted` type (`alloc` feature): `clone()`, `into_raw()` / `from_raw()`, `release` behind C's free | `Arc<T>` |
+| takes and drops references to an object Rust allocated, through a count field of its own (`GIT_REFCOUNT_INC`, `foo_free`) | `CShared<T>` over a `CCounted` type (`alloc` feature): `clone()`, `CShared::into_raw` / `from_raw`, `CShared::release` inside C's free | `Arc<T>` |
 | reads a pointer field that Rust fills on first use, or fills it itself with compare-and-swap (`repo->_odb`) | `CAtomicOwner<O>` over a one-pointer owner: `get_or_init()`, `try_insert()`, `as_ptr()`, `unsafe replace()` | `OnceLock<O>`, `AtomicPtr` |
 | reads or writes bitfields of a struct Rust mirrors | `CBitfield<W>` / `CAtomicBitfield<W>`, fields named by `CBits<W>` | the integer's shifts and masks, `AtomicU32::fetch_or` |
 | returns an object through an out-parameter | `CBox::from_c_out`, `CStrBox::from_raw_out` | a return value |
@@ -94,18 +94,31 @@ down for one call, and that C does not keep, is plain Rust:
   `barrier`.
 - **C counts references to a Rust object** (a ported `git_odb`, whose
   `git_refcount` C's macros still increment, and whose `git_odb_free` C
-  still calls). Implement `CCounted` for the type: `c_up_ref` and
-  `c_down_ref` over its count field, with C's meaning (an owner field
-  included), and `Alloc`, the allocator it lives in, or a `c_release` of
-  its own. Hold references as `CShared<T>`. Then:
+  still calls). Implement `CCounted` for the type, with the clauses
+  `CRefClone` has for a C count and those of Rust's allocation:
+  - `c_init` sets the count to one reference and clears the owner: `CShared`
+    calls it on every object it adopts, so no value's count is trusted;
+  - `c_up_ref` takes a reference, or returns `false` before the count could
+    wrap (`Clone` then aborts, as `Arc`'s does); `c_down_ref` drops one, at
+    least `Release`, and performs an `Acquire` before it answers "release
+    now"; an owner field is read after the decrement; `c_is_sole_owner`
+    reads with `Acquire`;
+  - the count is private, its mutators `unsafe`: safe code that reaches
+    `&T` or `&mut T` cannot change it;
+  - `Alloc`, the allocator it lives in, is zero-sized and stateless
+    (checked); `c_release` frees the `Box<T, Alloc>`, or is the impl's own.
+
+  Hold references as `CShared<T>`. Its operations are associated functions,
+  as `Arc`'s: `CShared::as_ptr(&s)`, `CShared::get_mut(&mut s)`. Then:
   - if every field C writes, and every field holders write while it is
     shared, is an atomic or behind the type's own lock, also implement
     `CShareable`: `CShared<T>` derefs to `T`, as `Arc<T>` does;
   - otherwise (C writes a plain field, `index->entries`), reach it through
-    `as_ptr()` and the binding's handles, and `get_mut()` when the count
-    proves the reference sole;
-  - C's free is a one-line export over `CShared::release`, and a pointer C
-    returns or lends is adopted with `from_raw` or `from_borrowed`.
+    `CShared::as_ptr` and the binding's handles, and `CShared::get_mut`
+    when the count proves the reference sole;
+  - C's free is an export that calls `CShared::release` inside its panic
+    barrier, and a pointer C returns or lends is adopted with `from_raw` or
+    `from_borrowed`.
 - **C reads a pointer field that is filled once** (a repository's `_odb`,
   `_config`, `_refdb`, `_index`; a lazily built cache). Make the field a
   `CAtomicOwner<O>`, where `O` is the owner of what it points to (`CShared`,
@@ -117,15 +130,19 @@ down for one call, and that C does not keep, is plain Rust:
   - `get()` borrows it for as long as the struct, C's weak pointer;
     `as_ptr()` is that pointer for an export to write out;
   - a setter (`git_repository_set_odb`) is `unsafe replace`, whose caller
-    states that no weak borrow of the old value is used afterwards: the
+    states that every borrow of the old value has ended (not only that it
+    is unused) and that no weak pointer C keeps is used afterwards: the
     contract C's own weak pointers already have.
 - **C reads or writes a bitfield** (`unsigned on_disk:1, dirty:1;`). Name
   each field once with `CBits<W>`, in C's order: `CBits::first(1)`, then
   `.next(width)` for each later field; the bits follow the target's ABI.
-  The storage unit is a `CBitfield<W>` in the `#[repr(C)]` mirror, or a
+  The unit is a `CBitfield<W>` in the `#[repr(C)]` mirror, or a
   `CAtomicBitfield<W>` where several threads update it: each change is
   one read-modify-write that keeps the other fields, where a load and a
   store of the word would lose a concurrent change to another field.
+  On System V and AAPCS, `W` is **not** the declared type: it covers the
+  bytes the run occupies (see below). Check the mirror against the C
+  compiler (`offsetof`, `sizeof`, each field's byte image).
 - **C returns something through an out-parameter.** Use `from_c_out` /
   `from_raw_out`. The slot starts NULL and is adopted whatever the routine
   returns, so an object handed over on failure is still released.
@@ -149,6 +166,9 @@ reference. That logic stays in `c_down_ref`, which answers "release now"
 only when the count is spent and no owner holds the object. `CShareable`
 states that a `&T` may live while the object is shared: what C writes is
 atomic. Without it, `CShared` gives a pointer and `get_mut`, never a `&T`.
+`c_init` sets the count when an object is adopted, `Clone` aborts on a full
+count, and the decrement's orderings are `Arc`'s, so each impl is audited
+against its own methods, not against every way a `T` can be made.
 `Send` and `Sync` follow `Arc`'s terms. A lifetime the object keeps (a
 repository it borrows) goes in the binding's wrapper,
 `struct Odb<'r>(CShared<GitOdb>, PhantomData<&'r Repo>)`, which then
@@ -164,15 +184,32 @@ C's weak pointers alike, so `replace` is `unsafe`. `O` is any owner that is
 one pointer (`CPtrOwner`). It is `Sync` when `O: Send + Sync`, as `OnceLock`.
 
 **`CBits<W>`, `CBitfield<W>`, `CAtomicBitfield<W>`** read and write C
-bitfields by field. Which bits a field occupies is the ABI's: on System V
-and AAPCS, the first field declared takes the least significant bits of its
-unit on a little-endian target, the most significant on a big-endian one.
-`CBits::first` and `next` encode that rule, so the binding states the
-declaration and not the masks. `CBits::at(lsb, width)` states a position
-the declaration order does not give (after a `:0`). A field that does not
-fit its unit fails at compile time. Assignment truncates to the field's
-width, as C's does. Only unsigned fields are covered. A layout test against
-the C compiler still checks the unit's offset and the bit positions.
+bitfields by field. Two facts are the ABI's.
+
+- *Which bits of its unit a field takes.* The first field declared takes
+  the least significant bits on a little-endian target, the most
+  significant on a big-endian one, on System V, AAPCS and Microsoft x64
+  alike. `CBits::first` and `next` encode that, so the binding states the
+  declaration, not masks; `CBits::at(lsb, width)` states a position
+  directly.
+- *Which bytes the unit is.* On System V and AAPCS, a run of bitfields is
+  packed bit after bit from where the previous member ended, and a field
+  moves to the next boundary of its declared type's size only if it would
+  cross one (or after `:0`). The mirror's `W` covers the bytes the run
+  occupies, at its offset; any further byte of `W` must be padding. Later
+  members may sit inside the declared type's size (`unsigned a:4; char c;`
+  puts `c` at offset 1), a run may begin inside the previous member's
+  unit, and the declared type gives the struct its alignment
+  (`#[repr(C, align(N))]`). On Microsoft's ABI, each run of one declared
+  type is a unit of that type.
+
+Platform scope: checked against clang for x86-64, AArch64, ARMv7, i686,
+s390x and PowerPC64 Linux and x86-64 Windows (`tests/bitfield_c_layout.rs`,
+run natively and under Miri per target). `CAtomicBitfield<W>` refuses to
+build where `W`'s atomic is more aligned than `W` (`u64` on i686), as the
+unit would then sit elsewhere than C's. A field that does not fit, or has no
+bits, fails at compile time. Assignment truncates to the field's width, as
+C's does. Only unsigned fields are covered.
 
 ## Conventions
 
