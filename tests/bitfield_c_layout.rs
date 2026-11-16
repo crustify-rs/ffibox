@@ -6,7 +6,10 @@
 //! of the members after the bitfields, and each bitfield's byte image when it
 //! alone is all ones. [`the_table_is_what_clang_computes`] rebuilds it with
 //! clang and `llvm-objdump` (cross-compiling to an object file, no linking)
-//! and checks it is unchanged; `FFIBOX_BLESS=1` rewrites it.
+//! and checks it is unchanged; `FFIBOX_BLESS=1` rewrites it. Without clang
+//! or `llvm-objdump` it passes with a note on stderr, **unless
+//! `FFIBOX_REQUIRE_CLANG=1` is set, when it fails**: set it wherever the
+//! test matrix runs (README, "Testing").
 //!
 //! [`mirrors_match_the_c_layout`] builds each struct's Rust mirror, sets each
 //! field through its `CBits`, and compares with the table's row for the
@@ -68,6 +71,18 @@ const STRUCTS: &[(&str, &str, &[&str], &[&str])] = &[
         "S12",
         "unsigned short a:12; unsigned short b:8;",
         &["a", "b"],
+        &[],
+    ),
+    (
+        "T1",
+        "unsigned int x; unsigned char c; unsigned long long a:40;",
+        &["a"],
+        &["c"],
+    ),
+    (
+        "T2",
+        "unsigned char c[3]; unsigned long long a:40;",
+        &["a"],
         &[],
     ),
     (
@@ -489,6 +504,7 @@ fn mirrors() -> Rows {
         image::<S12>(|p| ones(fld!(p, u1), CBits::first(8))),
     );
 
+    t_runs(&mut r);
     s13(&mut r);
     r
 }
@@ -677,8 +693,93 @@ fn mirrors() -> Rows {
         image::<S12>(|p| ones(fld!(p, u1), CBits::first(8))),
     );
 
+    t_runs(&mut r);
     s13(&mut r);
     r
+}
+
+/// T1 and T2: a `long long` run after 5 and 3 bytes. Where no aligned
+/// integer covers the run's bytes without covering another member (T1 on
+/// i686, whose `long long` alignment of 4 keeps `a` at bit 40; T2 on System
+/// V and AAPCS), the run is mirrored as bytes, set by hand.
+fn t_runs(r: &mut Rows) {
+    // T1: a unit of its own at 8, except on i686, where `a` stays in bytes
+    // 5-9, behind `c`.
+    #[cfg(not(all(target_arch = "x86", not(target_env = "msvc"))))]
+    {
+        #[repr(C)]
+        struct T1 {
+            x: u32,
+            c: u8,
+            u: CBitfield<u64>,
+        }
+        push(r, "sz_T1", size_of::<T1>());
+        push(r, "al_T1", align_of::<T1>());
+        push(r, "of_T1_c", offset_of!(T1, c));
+        push(
+            r,
+            "T1_a",
+            image::<T1>(|p| ones(fld!(p, u), CBits::first(40))),
+        );
+    }
+    #[cfg(all(target_arch = "x86", not(target_env = "msvc")))]
+    {
+        #[repr(C)]
+        struct T1 {
+            x: u32,
+            c: u8,
+            /// `a`, bytes 5-9: no aligned integer covers them without `c`.
+            a: [u8; 7],
+        }
+        push(r, "sz_T1", size_of::<T1>());
+        push(r, "al_T1", align_of::<T1>());
+        push(r, "of_T1_c", offset_of!(T1, c));
+        push(
+            r,
+            "T1_a",
+            image::<T1>(|p| {
+                // SAFETY: the zeroed mirror; 40 bits are its first 5 bytes.
+                unsafe { (*p).a[..5].fill(0xff) }
+            }),
+        );
+    }
+    // T2: bytes 3-7 on System V and AAPCS (as bytes); a unit of its own at 8
+    // on Microsoft's ABI.
+    #[cfg(not(target_env = "msvc"))]
+    {
+        #[cfg_attr(not(target_arch = "x86"), repr(C, align(8)))]
+        #[cfg_attr(target_arch = "x86", repr(C, align(4)))]
+        struct T2 {
+            c: [u8; 3],
+            /// `a`, bytes 3-7: a `u64` over them would cover `c`.
+            a: [u8; 5],
+        }
+        push(r, "sz_T2", size_of::<T2>());
+        push(r, "al_T2", align_of::<T2>());
+        push(
+            r,
+            "T2_a",
+            image::<T2>(|p| {
+                // SAFETY: the zeroed mirror; 40 bits are all 5 bytes.
+                unsafe { (*p).a.fill(0xff) }
+            }),
+        );
+    }
+    #[cfg(target_env = "msvc")]
+    {
+        #[repr(C)]
+        struct T2 {
+            c: [u8; 3],
+            u: CBitfield<u64>,
+        }
+        push(r, "sz_T2", size_of::<T2>());
+        push(r, "al_T2", align_of::<T2>());
+        push(
+            r,
+            "T2_a",
+            image::<T2>(|p| ones(fld!(p, u), CBits::first(40))),
+        );
+    }
 }
 
 /// S13, `git_index`'s word, the same on every covered ABI: a `u32` unit,
