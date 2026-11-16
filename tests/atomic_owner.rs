@@ -139,6 +139,14 @@ unsafe fn c_publish(repo: *mut repo_c, odb: *mut odb_st) -> *mut odb_st {
 }
 
 #[test]
+fn a_zeroed_field_is_empty() {
+    // SAFETY: all-zero bytes are an empty field (documented), as in a
+    // `calloc`ed repository.
+    let mut z: CAtomicOwner<OdbArc> = unsafe { core::mem::zeroed() };
+    assert!(z.get().is_none() && z.as_ptr().is_null() && z.take().is_none());
+}
+
+#[test]
 fn layout_is_the_c_pointer() {
     assert_eq!(size_of::<CAtomicOwner<OdbArc>>(), size_of::<*mut odb_st>());
     assert_eq!(
