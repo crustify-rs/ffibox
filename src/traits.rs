@@ -1,0 +1,1142 @@
+//! The lifecycle **contracts** the owners in [`refs`](crate::refs) run, plus
+//! [`CPlainElem`] (slice-safe buffer elements) and [`CCell`] (the link from a
+//! layout type to its handles).
+//!
+//! The lifecycle traits are implemented on a **policy** — typically a ZST
+//! bound to a C routine with an `impl_*!` macro — never on the pointee. That
+//! lets one C type carry several destructors as several owner types, and
+//! pairs each clone routine with the teardown that settles it:
+//!
+//! | Trait | Registers | Drives |
+//! |-------|-----------|--------|
+//! | [`CDrop<T>`] | `c_drop` — a `*_free`, or a refcount down-ref | [`CBox`], [`CStrBox`], [`CArc`] |
+//! | [`CDupClone<T>`] | `c_dup` — a deep copy (`*_dup`, `strdup`) | their `Clone` |
+//! | [`CRefClone<T>`] | `c_up_ref` — a refcount increment; `c_is_sole_owner` | [`CArc`] |
+//! | [`CLenDrop`] | `c_drop_len(ptr, byte_len)` | [`CVec`] |
+//! | [`CLenClone`] | `c_clone_len` — a buffer memdup | its `Clone`, `CVec::from_slice` |
+//! | [`CLenAlloc`] | `c_alloc_len` — uninitialised buffer storage (`malloc(n)`); `c_realloc_len` (`realloc`) | `CVec::from_fn`, `CVec::new_uninit`, [`CAllocator`](crate::CAllocator) |
+//! | [`CDispose<T>`] | `c_dispose` — `*_uninit` / `*_clear` on a value | [`CVal`] |
+//! | [`CNew<T>`] | `c_new` — a zero-argument `*_alloc` / `*_new` | `CBox::new`, `CArc::new` |
+//! | [`CAlloc<T>`] | `c_alloc` — untyped storage (`malloc`) | `CBox::new_uninit` |
+//! | [`CAllocZeroed<T>`] | `c_alloc_zeroed` — zeroed storage (`calloc`) | `CBox::new_zeroed`, `CArc::new_zeroed` |
+//!
+//! Every method takes `&self`, so a policy may carry runtime state (the
+//! element-free function of a `list_pop_free(list, elem_free)`), held by a
+//! [`CBoxState`](crate::CBoxState). [`CBox`], [`CArc`] and [`CStrBox`] take a
+//! stateless policy, which costs nothing.
+//!
+//! The construction traits are sub-traits of [`CDrop`] on the same policy, so
+//! every safe path into an owner goes through the policy that will free it.
+//!
+//! [`CGuarded`] and [`CZeroable`] are the exceptions, implemented on the layout
+//! type: the C lock protecting the object, which [`CArc::lock`] and
+//! [`CGuardedRef::lock`] take to hand out a [`CGuard`]; and the object's
+//! all-zero validity, which zeroing allocators rely on.
+
+use core::ffi::c_void;
+use core::mem::MaybeUninit;
+use core::ptr::NonNull;
+
+// Imported so the trait docs' intra-doc links resolve; none of them is named in
+// a signature here.
+#[allow(unused_imports)]
+use crate::refs::{CBox, CSlice, CStrBox, CVal, CVec};
+#[allow(unused_imports)]
+use crate::shared::{CArc, CGuard, CGuardedRef};
+
+// ===========================================================================
+// Pointer teardown / duplication policies
+// ===========================================================================
+
+/// Teardown policy for an owned `*mut T`; the bound [`CBox<T, D>`] and
+/// [`CStrBox<D>`] drop on.
+///
+/// `c_drop` releases the owner's claim on the object: a plain `*_free`
+/// (`ctx_free`), a generic allocator free (`free`, a library's `lib_free`), or the
+/// refcount **down-ref** of one counted reference ([`CArc`], or a [`CBox`]
+/// holding the only one).
+///
+/// Implemented on the policy `Self`, not on `T`, so one `T` may have several,
+/// and the owner's type says which runs.
+/// [`impl_cdrop!`](crate::impl_cdrop) binds a C routine, through a private
+/// `unsafe fn` adapter when the routine has another shape, and over a layout
+/// type with a lifetime written `Foo<'_>`; write the impl by hand when
+/// teardown needs runtime state, and hold the object in a
+/// [`CBoxState`](crate::CBoxState). A destructor that must be
+/// suppressed on some paths folds the gate into `c_drop`.
+///
+/// # Safety
+///
+/// `c_drop` must release the object and every sub-resource it owns, exactly
+/// once, using only `self` as extra state.
+///
+/// # Example
+///
+/// ```ignore
+/// pub struct ListPopFree(unsafe extern "C" fn(*mut c_void));
+/// unsafe impl CDrop<List> for ListPopFree {
+///     unsafe fn c_drop(&self, ptr: NonNull<List>) {
+///         // SAFETY: caller upholds the trait contract.
+///         unsafe { list_pop_free(ptr.as_ptr().cast(), Some(self.0)) }
+///     }
+/// }
+/// ```
+pub unsafe trait CDrop<T> {
+    /// Release the object at `ptr`. Called unconditionally by the owner's
+    /// `Drop`.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must address a live `T` whose claim the caller owns.
+    unsafe fn c_drop(&self, ptr: NonNull<T>);
+}
+
+/// Deep copy; the bound that gives [`CBox`] and [`CStrBox`] their [`Clone`]
+/// and `try_clone`.
+///
+/// A sub-trait of [`CDrop`] on the same policy, so a `*_dup` is always settled
+/// by its `*_free`. A deep copy is what keeps a cloned [`CBox`] the **sole**
+/// owner of its object; a refcount bump is [`CRefClone`], which `CBox` never
+/// uses.
+///
+/// [`impl_cdupclone!`](crate::impl_cdupclone) binds a C routine, over a
+/// layout type with a lifetime naming it in a leading list,
+/// `impl_cdupclone!(<'r> FooFree, Foo<'r>, ffi::foo_dup)`.
+///
+/// # Safety
+///
+/// - A `Some` return must be a fresh, fully-initialised object, independent of
+///   `ptr` (no shared mutable state, no aliased sub-allocations beyond what the
+///   C type itself treats as immutable), that this policy's `c_drop` releases.
+/// - `None` must mean the C routine failed.
+/// - `c_dup` must not invalidate `ptr`.
+/// - For `T = c_char`, `c_dup` must copy any live NUL-terminated string,
+///   wherever it lives, reading it only, as `strdup` does:
+///   [`CStrBox::from_c_str`] hands it a Rust-side `CStr`.
+///
+/// # Example
+///
+/// ```ignore
+/// unsafe impl CDupClone<Key> for KeyFree {
+///     unsafe fn c_dup(&self, ptr: NonNull<Key>) -> Option<NonNull<Key>> {
+///         // SAFETY: caller upholds the trait contract.
+///         NonNull::new(unsafe { key_dup(ptr.as_ptr().cast()) }.cast())
+///     }
+/// }
+/// ```
+pub unsafe trait CDupClone<T>: CDrop<T> {
+    /// Deep-copy the object at `ptr`, or `None` on failure.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must address a live `T`.
+    unsafe fn c_dup(&self, ptr: NonNull<T>) -> Option<NonNull<T>>;
+}
+
+/// Refcount increment, paired with the down-ref this policy's [`CDrop`]
+/// performs; the bound [`CArc`] clones on.
+/// [`CBox`] never clones through this trait.
+///
+/// [`c_is_sole_owner`](Self::c_is_sole_owner) lets an arc hand out exclusive
+/// access without a lock or a copy (`get_mut`, `make_mut`) when its reference
+/// is provably the only one. The default answers `false`, which is always
+/// sound: `get_mut` then returns `None` and `make_mut` always copies.
+///
+/// # Safety
+///
+/// - A `true` from `c_up_ref` must mean the count was actually incremented,
+///   so the object owes one more `c_drop` of this policy (or a clone of it).
+/// - The count must never wrap. Safe code can clone an arc and leak the clone
+///   (`mem::forget`) as often as it likes, each leak owing a `c_drop` that
+///   never comes, so `true` must stay truthful after any number of them:
+///   either `c_up_ref` returns `false` before the count would wrap (the C
+///   routine checks), or the count is too wide to wrap within a process's
+///   lifetime (64 bits). An unchecked 32-bit count (`unsigned int`, or
+///   `uintptr_t` on a 32-bit target) wraps after 2^32 leaked clones, within
+///   seconds, and the next down-ref frees an object other references hold.
+/// - A `false` from `c_up_ref` must mean the C routine failed and nothing
+///   changed.
+/// - Neither method may invalidate `ptr`.
+/// - A `true` from `c_is_sole_owner` must mean no other reference can reach
+///   the object, now or later: the count is read with at least Acquire
+///   ordering (so a down-ref on another thread happens-before it), and every
+///   reference is counted — weak ones, and any pointer C itself keeps and
+///   could `up_ref` later.
+pub unsafe trait CRefClone<T>: CDrop<T> {
+    /// Increment the reference count of the object at `ptr`.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must address a live `T` whose claim the caller holds.
+    unsafe fn c_up_ref(&self, ptr: NonNull<T>) -> bool;
+
+    /// Whether the caller's reference is the only one. `false` when unsure.
+    ///
+    /// # Safety
+    ///
+    /// As [`c_up_ref`](Self::c_up_ref).
+    #[inline]
+    unsafe fn c_is_sole_owner(&self, ptr: NonNull<T>) -> bool {
+        let _ = ptr;
+        false
+    }
+}
+
+/// The C lock that protects part or all of an object, registered on the
+/// layout type: what [`CArc::lock`] and [`CGuardedRef::lock`] take, handing
+/// out a [`CGuard`] that unlocks on drop.
+///
+/// A C object usually locks only the state it mutates after it is shared — a
+/// cache, a list of backends — while the rest is fixed once set up. The three
+/// handles split along that line:
+///
+/// | Handle | Reached through | Touches |
+/// |--------|-----------------|---------|
+/// | [`Ref`](CCell::Ref) | [`CArc::as_ref`], unconditionally | state nobody writes once the object is shared, and C routines that take this lock themselves |
+/// | [`Locked`](Self::Locked) | [`CGuard::as_locked`], under the lock | the state this lock protects — reads as well as writes — and C routines that require the caller to hold it |
+/// | [`Mut`](CCell::Mut) | [`CArc::get_mut`], when the reference is provably sole | anything; no other reference exists |
+///
+/// A getter for lock-protected state therefore lives on `Locked`, never on
+/// `Ref`: a `Ref` read races with a writer holding the lock through another
+/// clone. Where one lock covers the whole object, [`CGuardedAll`] makes
+/// `Locked` the `Mut` handle.
+///
+/// The functions take the object's pointer rather than `&self`, because a
+/// `&Foo` would be a reference covering the C object.
+/// [`impl_cguarded!`](crate::impl_cguarded) binds C routines and defines the
+/// `Locked` handle.
+///
+/// # Safety
+///
+/// - Every C routine that touches the protected state either takes this lock
+///   or requires its caller to hold it, so holding it excludes C as well as
+///   Rust.
+/// - `c_lock` returns `true` only once no other holder — on any thread,
+///   *including this one* — has the lock, and blocks until then (or returns
+///   `false`, as for `pthread_mutex_*`'s `EDEADLK`). A recursive lock would
+///   hand out two `Locked` handles on one thread.
+/// - `false` means the C lock call failed and nothing is held.
+/// - `c_unlock` is called once per successful `c_lock`, on the same thread.
+/// - [`Locked<'a>`](Self::Locked) is `#[repr(transparent)]` over
+///   [`CBorrowedPtr<'a, Self>`](crate::CBorrowedPtr) (pointer-sized; checked
+///   at compile time), has no `Drop`, and is invariant in `Self`, as `Mut` is.
+/// - `Self` is invariant in every parameter the protected state can hold, as
+///   a Rust type with a `Mutex` field is. A [`CArc`] is covariant like `Arc`,
+///   so a clone of a `CArc<Foo<'static>>` could otherwise shrink to
+///   `Foo<'short>` and store a `'short` borrow through its locked handle for
+///   the `'static` original to read. A type with no parameters meets this
+///   trivially; a [`define_ctype!`](crate::define_ctype) type with lifetimes
+///   meets it through an invariant `phantom`, `fn(&'x T) -> &'x T`.
+/// - A [`CDupClone`] policy for `Self` takes this lock itself around the
+///   protected state it copies: [`CArc::make_mut`] copies through a shared
+///   reference while other clones may hold the lock.
+pub unsafe trait CGuarded: CCell {
+    /// The handle a held lock grants: exclusive over the state the lock
+    /// protects, move-only like [`Mut`](CCell::Mut).
+    type Locked<'a>
+    where
+        Self: 'a;
+
+    /// What the lock covers: [`LockFields`], part of the object, reached
+    /// through [`CArc::lock`]; or [`LockWhole`], all of it, which only a
+    /// [`CGuardedAll`] type declares and only a [`CGuardedRef`] reaches — a
+    /// `CArc` also hands out an unlocked [`Ref`](CCell::Ref), so `CArc::lock`
+    /// does not accept it.
+    type Scope: LockScope;
+
+    /// Take the lock. `false` if the C call failed.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must address a live `Self`.
+    unsafe fn c_lock(ptr: NonNull<Self>) -> bool;
+
+    /// Release the lock.
+    ///
+    /// # Safety
+    ///
+    /// The calling thread must hold the lock on `ptr`.
+    unsafe fn c_unlock(ptr: NonNull<Self>);
+}
+
+/// A [`CGuarded`] lock that covers the whole object — `Mutex<T>` rather than a
+/// lock over some fields. Its [`Locked`](CGuarded::Locked) handle is the
+/// [`Mut`](CCell::Mut) handle, so a held [`CGuard`] reaches every getter and
+/// setter; the object is reached only through a [`CGuardedRef`], typically a C
+/// global under its C lock.
+///
+/// [`impl_cguarded!`](crate::impl_cguarded)`(Foo, all, …)` implements both
+/// traits.
+///
+/// # Safety
+///
+/// - Nothing reaches the object's state without this lock — not C, and not a
+///   Rust handle built from the raw pointer.
+/// - `Self::Locked<'a>` is `Self::Mut<'a>`.
+pub unsafe trait CGuardedAll: CGuarded<Scope = LockWhole> {}
+
+/// [`CGuarded::Scope`] of a lock over part of the object — a cache, a list —
+/// reached through [`CArc::lock`].
+#[derive(Debug)]
+pub enum LockFields {}
+
+/// [`CGuarded::Scope`] of a lock over the whole object ([`CGuardedAll`]),
+/// reached through [`CGuardedRef::lock`].
+#[derive(Debug)]
+pub enum LockWhole {}
+
+/// The two [`CGuarded::Scope`]s, [`LockFields`] and [`LockWhole`]. Sealed.
+pub trait LockScope: sealed::Sealed {}
+impl LockScope for LockFields {}
+impl LockScope for LockWhole {}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::LockFields {}
+    impl Sealed for super::LockWhole {}
+}
+
+/// In-place disposal of a value Rust holds inline; the bound [`CVal<T, D>`]
+/// drops on. Releases what the value's fields own and leaves the value's
+/// storage, which is Rust's, alone: `*_uninit`, `*_clear`, `*_dispose`.
+///
+/// [`impl_cdispose!`](crate::impl_cdispose) binds a C routine.
+///
+/// # Safety
+///
+/// `c_dispose` must release the value's owned resources exactly once, must not
+/// free the value itself, and must accept every value a [`CVal`] can hold: one
+/// whose ownership [`CVal::new`]'s caller vouched for, an all-zero one when
+/// `T` is [`CZeroable`] ([`CVal::zeroed`] is safe), and anything a safe setter
+/// on [`T::Mut`](CCell::Mut) then writes into it.
+///
+/// That makes the setters part of this contract. A setter that can leave the
+/// value in a state `c_dispose` cannot handle — an arbitrary pointer in a field
+/// it frees, a length longer than the buffer it clears — must validate its
+/// input or be `unsafe`, or a safe `CVal` would hand that state to the
+/// disposal routine on drop.
+pub unsafe trait CDispose<T> {
+    /// Dispose the resources of the value at `ptr`.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must address a live, initialised `T` the caller owns.
+    unsafe fn c_dispose(&self, ptr: NonNull<T>);
+}
+
+// ===========================================================================
+// Construction policies — the safe paths into an owner
+// ===========================================================================
+
+/// All-zero bytes are a valid `Self` for **every safe operation** that can
+/// reach one — the bound a zeroing allocator needs to hand out a `T` rather
+/// than a [`MaybeUninit<T>`](core::mem::MaybeUninit).
+///
+/// Rust-level validity is the easy half: a bindgen struct has no niches.
+/// The half this trait exists for is C's. A type whose C constructor sets
+/// non-zero defaults (a `frame_alloc` that sets `format = -1` and `pts` to
+/// a sentinel) must not implement it, even though zero bytes are a
+/// well-formed Rust value: a safe wrapper forwarding a zeroed one to C would
+/// hand C a state its constructor never produces.
+///
+/// Implemented on the layout type, unlike the policies, because zero-validity
+/// is a property of `T` whatever allocates it. The provided
+/// [`zeroed`](Self::zeroed) builds a value by hand, so no macro is needed.
+///
+/// Without it, a zeroing allocator does not type-check:
+///
+/// ```compile_fail,E0277
+/// # use core::ptr::NonNull;
+/// # use ffibox::{define_ctype, CBox, CDrop};
+/// # mod ffi { #[repr(C)] pub struct frame_st { pub format: i32 } }
+/// define_ctype!(Frame, FrameRef, FrameMut, ffi::frame_st); // no `CZeroable`
+/// # #[derive(Default)]
+/// # struct Heap;
+/// # unsafe impl CDrop<Frame> for Heap { unsafe fn c_drop(&self, _: NonNull<Frame>) {} }
+/// let _ = CBox::<Frame, Heap>::new_zeroed();
+/// ```
+///
+/// # Safety
+///
+/// An all-zero `Self` must be accepted by:
+///
+/// - the getters and setters of [`Ref`](CCell::Ref) / [`Mut`](CCell::Mut) —
+///   a null pointer field surfaces as `None` or is checked before use;
+/// - every safe wrapper that takes a `Self`, and the C routines it forwards
+///   to;
+/// - every teardown policy paired with it — a [`CDrop`], [`CDispose`] or C
+///   `free` callback — because a zeroed object dropped untouched still runs
+///   its teardown.
+///
+/// And `Self` must not be address-sensitive: [`zeroed`](Self::zeroed) hands
+/// out a value that moves — on the stack, into a [`CVal`], out of it with
+/// [`into_inner`](CVal::into_inner) — so no C routine may keep a pointer into
+/// it past the call, or make it point into itself. A struct C registers or
+/// self-references does not implement this trait; allocate it zeroed behind a
+/// pointer instead, where a zeroing policy gives [`CBox`] a stable address.
+pub unsafe trait CZeroable: CCell {
+    /// An all-zero value.
+    #[inline]
+    #[must_use]
+    fn zeroed() -> Self {
+        // SAFETY: `Self` is layout-compatible with its C type per `CCell`,
+        // and all-zero is valid for it per this trait's contract.
+        unsafe { core::mem::MaybeUninit::<Self>::zeroed().assume_init() }
+    }
+}
+
+/// Untyped storage for a `T`: the policy's half of
+/// [`CBox::new_uninit`], like an
+/// [`Allocator`](https://doc.rust-lang.org/std/alloc/trait.Allocator.html)
+/// paired with its free — `malloc` with `free`.
+///
+/// The policy frees the storage both before and after it holds a `T`, so it
+/// is a [`CDrop`] of both: `CDrop<MaybeUninit<T>>` for a box dropped unfilled,
+/// `CDrop<T>` once [`assume_init`](CBox::assume_init) has promoted it. A storage-only policy
+/// writes one generic impl that covers both:
+///
+/// ```ignore
+/// unsafe impl<T> CDrop<T> for LibFree { /* lib_free */ }
+/// unsafe impl<T: CCell> CAlloc<T> for LibFree { /* lib_malloc(size_of::<T>()) */ }
+/// ```
+///
+/// A policy whose free reads the object (a `frame_free`, or a refcount whose
+/// release callback disposes fields) has no sound `CDrop<MaybeUninit<T>>`, so
+/// it cannot implement this; zeroed storage, which it can, is
+/// [`CAllocZeroed`].
+///
+/// # Safety
+///
+/// - A `Some` from [`c_alloc`](Self::c_alloc) must be a fresh, uniquely-owned
+///   allocation of at least `size_of::<T>()` bytes, aligned to
+///   `align_of::<T>()`. A generic impl over an allocator with a fixed
+///   alignment rejects over-aligned `T` with
+///   `const { assert!(align_of::<T>() <= ALIGN) }` in `c_alloc`.
+/// - `CDrop<MaybeUninit<T>>::c_drop` must release such storage exactly once
+///   without reading it.
+/// - `CDrop<T>::c_drop` must release it once it holds a `T`. Which `T`s it
+///   accepts is the policy's to document: the only path from storage to a
+///   `T` is the `unsafe` [`CBox::assume_init`], whose caller vouches for the
+///   object it promotes.
+pub unsafe trait CAlloc<T: CCell>: CDrop<T> + CDrop<MaybeUninit<T>> {
+    /// Allocate uninitialised storage for one `T`; `None` on failure.
+    fn c_alloc(&self) -> Option<NonNull<MaybeUninit<T>>>;
+}
+
+/// Zero-filled storage for a [`CZeroable`] `T`: the policy's half of
+/// [`CBox::new_zeroed`] and [`CArc::new_zeroed`] — `calloc`, a zeroing
+/// `lib_mallocz`, a refcounted allocator's zeroed variant.
+///
+/// Separate from [`CAlloc`] because it asks less of the policy: the object is
+/// valid from the start, so [`CDrop::c_drop`] may read it. A refcount whose
+/// release callback disposes fields can implement this and not `CAlloc`.
+///
+/// # Safety
+///
+/// - A `Some` must be a fresh, uniquely-owned, all-zero `T`, aligned and sized
+///   as [`CAlloc`] requires, holding one claim this policy's `c_drop` releases.
+/// - `c_drop` must accept every `T` safe code can bring it to — the zeroed
+///   state [`CZeroable`] vouches for, and what safe setters write.
+pub unsafe trait CAllocZeroed<T: CZeroable>: CDrop<T> {
+    /// Allocate one all-zero `T`; `None` on failure.
+    fn c_alloc_zeroed(&self) -> Option<NonNull<T>>;
+}
+
+/// A type's zero-argument C constructor, paired with the destructor that
+/// settles it — `frame_alloc` with `frame_free`. The policy's half of
+/// [`CBox::new`] and [`CArc::new`], the analogue of [`Default`].
+///
+/// Constructors that take arguments stay inherent functions on the layout
+/// type returning a `CBox<T, D>` (`Parent::new_child(&self, flags)`): a trait
+/// signature cannot carry their parameters, names or error types. The owner
+/// type still names the policy, so construction and teardown stay paired.
+///
+/// A policy that is only a destructor gives no constructor:
+///
+/// ```compile_fail,E0277
+/// # use core::ptr::NonNull;
+/// # use ffibox::{define_ctype, CBox, CDrop};
+/// # mod ffi { #[repr(C)] pub struct frame_st { pub format: i32 } }
+/// # define_ctype!(Frame, FrameRef, FrameMut, ffi::frame_st);
+/// #[derive(Default)]
+/// struct FrameFree; // `CDrop` only
+/// # unsafe impl CDrop<Frame> for FrameFree { unsafe fn c_drop(&self, _: NonNull<Frame>) {} }
+/// let _ = CBox::<Frame, FrameFree>::new();
+/// ```
+///
+/// # Safety
+///
+/// A `Some` must be a fresh, uniquely-owned, fully-initialised `T` holding one
+/// claim this policy's [`CDrop::c_drop`] releases. `None` must mean the C
+/// routine failed.
+pub unsafe trait CNew<T: CCell>: CDrop<T> {
+    /// Construct one `T`; `None` on failure.
+    fn c_new(&self) -> Option<NonNull<T>>;
+}
+
+// ===========================================================================
+// Buffer elements
+// ===========================================================================
+
+/// Plain-data elements: values with no C-side identity, every bit pattern of
+/// which is a valid `Self`. The bound on the two element paths that bypass
+/// handles.
+///
+/// It does two jobs:
+///
+/// - **It admits a real slice.** [`CVec::as_slice`] / `as_mut_slice` hand out
+///   `&[Self]` / `&mut [Self]`. A wrapped C type is a C *object*, whose bytes C
+///   may change behind a reference, so it implements [`CCell`] and not this:
+///   `&[Foo]` does not typecheck, and a buffer of those is reached through
+///   [`CVec::as_handles`] instead. Rust has no negative bounds, so this
+///   allowlist is what keeps C objects out of slices.
+/// - **It makes reads of memory C writes sound.** [`CSlice::elem`] and its
+///   siblings copy values out of runs inside C objects, which C may overwrite
+///   at any time. A constructor's one-time promise cannot cover what C writes
+///   later; this trait does, because whatever bits C stores are a valid
+///   `Self`.
+///
+/// | Category | Why it holds |
+/// |---|---|
+/// | integers, floats, thin raw pointers, raw slice and `str` pointers | no invalid bit patterns |
+/// | [`MaybeUninit<T>`](core::mem::MaybeUninit) | valid even uninitialized — the type for a buffer C has not filled |
+/// | arrays of the above, `()` | element-wise |
+///
+/// `bool` and `char` are excluded: C's `_Bool` may hold a byte outside
+/// `{0, 1}` and a `char` outside the Unicode scalar range, both invalid Rust
+/// values. Use the integer type and convert.
+///
+/// So are pointers to trait objects: the metadata of a `*const dyn Trait` must
+/// be a valid vtable even in a raw pointer, so all-zero bytes, say, are not one
+/// (a safe upcast would load through the NULL vtable).
+///
+/// ```compile_fail,E0277
+/// fn plain<T: ffibox::CPlainElem>() {}
+/// plain::<*const dyn core::fmt::Debug>();
+/// ```
+///
+/// **Any bit pattern is not the same as initialized.** Uninitialized memory is
+/// no bit pattern at all, so it is not a valid `u8` either: a buffer from a
+/// non-zeroing allocator is a `CVec<MaybeUninit<T>, _>` until it is filled,
+/// then [`CVec::assume_init`] turns it into a `CVec<T, _>`. A zeroing
+/// allocator may produce `T` directly, since all-zero is one of the bit
+/// patterns every `CPlainElem` accepts.
+///
+/// # Safety
+///
+/// Every bit pattern must be a valid `Self`, and `Self` must not be a C object
+/// whose bytes C may change behind a reference. A slice reference is formed
+/// over a whole buffer at once, so a single bad element is undefined behaviour
+/// for the entire borrow.
+pub unsafe trait CPlainElem {}
+
+macro_rules! impl_cplain_elem_for_primitives {
+    ($($t:ty),* $(,)?) => {$(
+        // SAFETY: no bit pattern of this type is invalid.
+        unsafe impl CPlainElem for $t {}
+    )*};
+}
+
+impl_cplain_elem_for_primitives!(
+    u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, f32, f64,
+);
+
+// SAFETY: `MaybeUninit<T>` is valid for every bit pattern, which is the whole
+// point of it — the standard escape hatch for a buffer C has not filled.
+unsafe impl<T> CPlainElem for core::mem::MaybeUninit<T> {}
+
+// SAFETY: a thin raw pointer (`T: Sized`) is valid for every bit pattern, null
+// included. Wide pointers to `dyn Trait` are left out: their metadata must be a
+// valid vtable.
+unsafe impl<T> CPlainElem for *const T {}
+// SAFETY: as above.
+unsafe impl<T> CPlainElem for *mut T {}
+// SAFETY: a raw slice pointer's metadata is a length, valid as any initialized
+// `usize`; its address, as a thin pointer's.
+unsafe impl<T> CPlainElem for *const [T] {}
+// SAFETY: as above.
+unsafe impl<T> CPlainElem for *mut [T] {}
+// SAFETY: as for slices: the metadata is a byte length.
+unsafe impl CPlainElem for *const str {}
+// SAFETY: as above.
+unsafe impl CPlainElem for *mut str {}
+
+// SAFETY: an array of valid elements is valid.
+unsafe impl<T: CPlainElem, const N: usize> CPlainElem for [T; N] {}
+// SAFETY: a ZST has one bit pattern, the empty one.
+unsafe impl CPlainElem for () {}
+
+/// Elements a [`CVec`] hands out as a real `&[Self]` / `&mut [Self]`: Rust
+/// values rather than C objects, which a reference may cover while the
+/// buffer is owned.
+///
+/// Two kinds qualify:
+///
+/// - **plain data**, every [`CPlainElem`], by a blanket impl;
+/// - **owners**, whose value is a pointer the element owns: `CBox`,
+///   `CStrBox` and `CArc`, bare or in an `Option` for a nullable slot, and
+///   `CVal`. A buffer of them is C's `foo **` (or `foo *` of disposable
+///   values), each slot released by its element type's own policy when the
+///   `CVec` drops — as a `Vec<Box<T>>` drops each box.
+///
+/// A wrapped C object (a [`CCell`] layout type) does not qualify: C may write
+/// it behind a reference, so a buffer of those is reached through
+/// [`CVec::as_handles`] instead.
+///
+/// ```compile_fail,E0599
+/// # use ffibox::{define_ctype, CLenDrop, CVec};
+/// # #[repr(C)] pub struct obj_st { x: u8 }
+/// define_ctype!(Obj, ObjRef, ObjMut, obj_st);
+/// # struct Free;
+/// # unsafe impl CLenDrop for Free { unsafe fn c_drop_len(&self, _: *mut u8, _: usize) {} }
+/// fn view(v: &CVec<Obj, Free>) -> &[Obj] {
+///     v.as_slice() // `Obj` is a C object, not a `CSliceElem`
+/// }
+/// ```
+///
+/// # Safety
+///
+/// `Self` must not be a C object whose bytes C may change behind a
+/// reference: a reference to a `Self` the buffer owns asserts nothing about
+/// memory C writes.
+pub unsafe trait CSliceElem {}
+
+// SAFETY: plain data is a Rust value with no C-side identity.
+unsafe impl<T: CPlainElem> CSliceElem for T {}
+
+// ===========================================================================
+// Length-aware buffer policies — drive CVec's cleanup / clone
+// ===========================================================================
+
+/// Byte-buffer cleanup policy; the bound [`CVec<T, S>`] drops on. Like
+/// [`CDrop`], implemented on a policy (typically a ZST), not on the element
+/// type, so one element type pairs with several policies — plain free, secure
+/// zero-then-free, zero-only — at zero runtime cost.
+///
+/// **`c_drop_len` releases the buffer only, never its elements.** A [`CVec`]
+/// drops its elements first, each through its own type (an owner element
+/// releases what it points at), and then hands the buffer to this policy,
+/// which knows only a byte length and serves buffers of every element type.
+/// A C routine that frees an array together with its elements
+/// (`foo_array_free(arr, n)`) is therefore not a `CLenDrop`: it would free
+/// owner elements a second time, free whatever safe code stored in the
+/// slots of bare-pointer elements (which are [`CPlainElem`], so the `CVec`
+/// hands them out as `&mut [T]`), and read as pointers the buffer of any
+/// other element type the policy serves. Hold the elements as owners, and
+/// the array under the policy of the allocator it came from.
+///
+/// # Safety
+///
+/// `c_drop_len` must release the buffer at `ptr` exactly once, under whatever
+/// allocator and cleanup policy `self` represents, touching at most `byte_len`
+/// bytes of it, and must be sound for every `byte_len` its method contract
+/// admits. It must not release anything the elements point at: they have
+/// already been dropped.
+///
+/// # Example
+///
+/// ```ignore
+/// pub struct SecureFree;
+/// unsafe impl CLenDrop for SecureFree {
+///     unsafe fn c_drop_len(&self, ptr: *mut u8, byte_len: usize) {
+///         unsafe {
+///             explicit_bzero(ptr.cast(), byte_len);
+///             libc::free(ptr.cast());
+///         }
+///     }
+/// }
+/// ```
+pub unsafe trait CLenDrop {
+    /// Free the buffer at `ptr`, whose first `byte_len` bytes are in use. The
+    /// buffer alone: its elements have already been dropped.
+    ///
+    /// # Safety
+    ///
+    /// - `ptr` must be a live allocation the caller owns, from the allocator
+    ///   this policy targets.
+    /// - `byte_len` must not exceed the allocation's size, and must equal it
+    ///   exactly when the policy's free takes a size (a clearing free
+    ///   taking the length, a sized deallocator) — passing less there frees the wrong amount, or
+    ///   leaves the tail uncleared.
+    unsafe fn c_drop_len(&self, ptr: *mut u8, byte_len: usize);
+}
+
+/// Deep-copy policy for a length-aware buffer (a `memdup`): the length-aware
+/// analogue of [`CDupClone`], needed because a buffer copy carries a byte length
+/// that a pointer-only `c_dup` cannot. Gives [`CVec<T, S>`] its [`Clone`],
+/// and only on opt-in — a `CLenDrop`-only policy is deliberately not cloneable.
+///
+/// This policy copies bytes, not elements. [`CVec`] therefore exposes
+/// cloning only when `T: Copy`; a buffer of owning elements needs a
+/// per-element clone contract, which this trait does not provide.
+///
+/// It also copies *into* the policy's allocator from memory it does not own —
+/// a Rust slice ([`CVec::from_slice`]) or a run inside a C object
+/// ([`CSlice::to_cvec`](crate::CSlice::to_cvec)) — so the source need not come
+/// from this allocator, and is only read.
+///
+/// # Safety
+///
+/// - `c_clone_len` must return a fresh, uniquely-owned allocation of
+///   `byte_len` bytes byte-copied from `ptr` and releasable by this policy's
+///   [`CLenDrop`] impl — or `None` on allocation failure.
+/// - It must only read `ptr`, whatever allocator (if any) it came from.
+/// - Every allocation it returns must be aligned to at least
+///   [`ALIGN`](Self::ALIGN).
+pub unsafe trait CLenClone: CLenDrop {
+    /// Alignment every allocation [`c_clone_len`](Self::c_clone_len) returns
+    /// is guaranteed to have; the copying constructors reject an element type
+    /// aligned beyond it at compile time. `1` (any byte) unless the policy
+    /// vouches for more, as `malloc`-family allocators do.
+    const ALIGN: usize = 1;
+
+    /// Byte-copy the `byte_len` bytes at `ptr` into a fresh allocation, or
+    /// `None` on failure.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be valid for reads of `byte_len` bytes for the call, from any
+    /// allocator; the routine does not write through it.
+    unsafe fn c_clone_len(&self, ptr: *mut u8, byte_len: usize) -> Option<NonNull<u8>>;
+}
+
+/// Uninitialised buffer storage from the allocator a [`CLenDrop`] policy
+/// frees into — `malloc(n)` paired with `free`, `lib_malloc` with `lib_free`.
+/// The buffer analogue of [`CAlloc`], and what lets Rust build a buffer C
+/// will free: [`CVec::new_uninit`], filled and promoted with
+/// [`assume_init`](CVec::assume_init), and [`CVec::from_fn`], which fills it
+/// element by element.
+///
+/// The elements may own resources of their own (a `char **` of owned
+/// strings), unlike [`CLenClone`]'s byte copies: the constructors write each
+/// element as a value.
+///
+/// With [`CLenDrop`] and [`c_realloc_len`](Self::c_realloc_len), this is a C
+/// allocation family, `malloc` / `realloc` / `free` and the alignment they
+/// vouch for, which [`CAllocator`](crate::CAllocator) offers as the standard
+/// `Allocator`, so that `Box<T, CAllocator<P>>` and `Vec<T, CAllocator<P>>`
+/// hold memory C frees. [`impl_clenalloc!`](crate::impl_clenalloc) binds the
+/// C routines.
+///
+/// # Safety
+///
+/// - A `Some` from [`c_alloc_len`](Self::c_alloc_len) must be a fresh,
+///   uniquely-owned allocation of `byte_len` bytes, aligned to at least
+///   [`ALIGN`](Self::ALIGN), that this policy's
+///   [`c_drop_len`](CLenDrop::c_drop_len) releases given the same `byte_len`,
+///   without reading it.
+/// - `None` must mean the allocation failed.
+/// - An override of [`c_realloc_len`](Self::c_realloc_len) must keep the
+///   provided one's contract: a `Some` is an allocation as `c_alloc_len`'s,
+///   of `new_len` bytes (at the same address or a fresh one), holding the
+///   first `min(old_len, new_len)` bytes of the buffer it was given, which it
+///   has released; a `None` means the allocation failed and the buffer it was
+///   given is unchanged, still live and still the caller's — C's `realloc`.
+pub unsafe trait CLenAlloc: CLenDrop {
+    /// Alignment every allocation [`c_alloc_len`](Self::c_alloc_len) returns
+    /// is guaranteed to have; the constructors reject an element type aligned
+    /// beyond it at compile time. As [`CLenClone::ALIGN`].
+    const ALIGN: usize = 1;
+
+    /// Allocate `byte_len` uninitialised bytes, or `None` on failure. Never
+    /// called with `byte_len == 0`: an empty buffer is NULL.
+    fn c_alloc_len(&self, byte_len: usize) -> Option<NonNull<u8>>;
+
+    /// Move the buffer at `ptr`, `old_len` bytes in use, into one of
+    /// `new_len` bytes that keeps its first `min(old_len, new_len)` bytes, or
+    /// `None` on failure, leaving the buffer as it was — C's `realloc`.
+    ///
+    /// Provided as a fresh [`c_alloc_len`](Self::c_alloc_len), a copy and a
+    /// [`c_drop_len`](CLenDrop::c_drop_len) of the old buffer. A policy whose
+    /// allocator has a `realloc` overrides it, through
+    /// [`impl_clenalloc!`](crate::impl_clenalloc)'s `realloc =`, to grow or
+    /// shrink in place. Never called with a length of 0, so an override never
+    /// meets `realloc(p, 0)`, which C leaves to the implementation.
+    ///
+    /// # Safety
+    ///
+    /// - `ptr` must be a live allocation the caller owns from the allocator
+    ///   this policy targets, and `old_len` a length
+    ///   [`c_drop_len`](CLenDrop::c_drop_len) accepts for it: no larger than
+    ///   the allocation, and exactly its size when the policy's free takes a
+    ///   size.
+    /// - Neither `old_len` nor `new_len` may be 0.
+    ///
+    /// On `Some`, the caller owns the new buffer and no longer the old one;
+    /// on `None`, it still owns the old one.
+    unsafe fn c_realloc_len(
+        &self,
+        ptr: *mut u8,
+        old_len: usize,
+        new_len: usize,
+    ) -> Option<NonNull<u8>> {
+        let new = self.c_alloc_len(new_len)?;
+        // SAFETY: the caller passes a live allocation of at least `old_len`
+        // bytes; `new` is a fresh one of `new_len`, so the two do not
+        // overlap and each is valid for the bytes copied. The old buffer is
+        // then released once, with a length `c_drop_len` accepts for it.
+        unsafe {
+            core::ptr::copy_nonoverlapping(ptr, new.as_ptr(), old_len.min(new_len));
+            self.c_drop_len(ptr, old_len);
+        }
+        Some(new)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CCell — the link from a layout newtype to its handles
+// ---------------------------------------------------------------------------
+
+/// A `#[repr(transparent)]` newtype over a C type (`Self::C`), together with
+/// the borrowed handles that carry its accessors.
+///
+/// A **linking** trait, not an access trait: it names the wrapped C type and
+/// the two handle types. Its only methods are the provided, `unsafe` inbound
+/// seam (`ref_from_ptr`, `mut_from_ptr` and their `void *` twins), so
+/// implementing it exposes no constructor. ffibox builds the handles from a
+/// pointer itself, relying on the layout the contract below guarantees. The
+/// outbound seam (`as_ptr` / `as_mut_ptr`) lives on the handles, through
+/// [`CRefSeam`] and [`CMutSeam`], because that is where a `&self` receiver is
+/// sound — `&FooRef` covers one pointer of Rust stack where `&Foo` would
+/// cover the C object.
+///
+/// Implemented by [`define_ctype!`](crate::define_ctype) for a newtype with no
+/// parameters or with lifetimes only, or by hand for a type-generic one. A
+/// newtype generic over a lifetime takes its policies from the macros, written
+/// `Foo<'_>`, as [`impl_cdrop!`](crate::impl_cdrop) shows.
+///
+/// # Safety
+///
+/// - `Self` MUST be layout-compatible with `Self::C`: `#[repr(transparent)]`
+///   over it, any other fields zero-sized.
+/// - [`Ref<'a>`](CCell::Ref) and [`Mut<'a>`](CCell::Mut) MUST each be
+///   `#[repr(transparent)]` over
+///   [`CBorrowedPtr<'a, Self>`](crate::CBorrowedPtr) — directly, or `Mut` over
+///   `Ref` — with every other field zero-sized and no `Drop`: ffibox builds
+///   them from a `CBorrowedPtr` by layout alone. They borrow the pointee for
+///   `'a` and MUST NOT hand out a reference to `Self`.
+/// - `Ref` MUST NOT offer any operation that writes through the pointer — that
+///   is `Mut`'s job, and the split is what keeps a shared borrow shared. The
+///   one exception is a routine of an object that locks itself, which writes
+///   under the object's own lock, as [`ref_from_ptr`](CCell::ref_from_ptr)'s
+///   contract allows, and only for a type Rust never holds by value: a handle
+///   built from `&self` may only be read through, by whatever path the
+///   routine takes its pointer.
+/// - `Mut<'a>` MUST be invariant in `Self`, as `&'a mut Self` is. A
+///   [`CBorrowedPtr`](crate::CBorrowedPtr) alone is covariant, like `&'a T`, so
+///   add a `PhantomData<&'a mut Self>` field. This matters only when `Self`
+///   has lifetime or type parameters (what [`define_ctype!`](crate::define_ctype)
+///   emits carries the marker): without it,
+///   `Mut<'a>` over `Holder<'static>` would coerce to one over
+///   `Holder<'short>`, whose setter could store a `'short` borrow that the
+///   `'static` owner later reads.
+///
+/// ```compile_fail
+/// use core::marker::PhantomData;
+/// use ffibox::{CBorrowedPtr, CCell};
+///
+/// #[repr(C)]
+/// pub struct holder_st { p: *const u32 }
+/// /// Holds a `&'x u32` in a C field.
+/// #[repr(transparent)]
+/// pub struct Holder<'x>(holder_st, PhantomData<&'x u32>);
+/// #[repr(transparent)]
+/// #[derive(Clone, Copy)]
+/// pub struct HolderRef<'a, 'x>(CBorrowedPtr<'a, Holder<'x>>);
+/// #[repr(transparent)]
+/// pub struct HolderMut<'a, 'x>(HolderRef<'a, 'x>, PhantomData<&'a mut Holder<'x>>);
+///
+/// unsafe impl<'x> CCell for Holder<'x> {
+///     type C = holder_st;
+///     type Ref<'a> = HolderRef<'a, 'x> where Self: 'a;
+///     type Mut<'a> = HolderMut<'a, 'x> where Self: 'a;
+/// }
+///
+/// // Rejected thanks to the marker; without it, this compiles.
+/// fn shrink<'a, 's>(m: HolderMut<'a, 'static>) -> HolderMut<'a, 's> {
+///     m
+/// }
+/// ```
+///
+/// The handle size is checked at compile time wherever ffibox builds a handle,
+/// so an impl whose `Ref` or `Mut` is not pointer-sized fails the build:
+///
+/// ```compile_fail,E0080
+/// use core::ptr::NonNull;
+/// use ffibox::{CBorrowedPtr, CCell, CSlice};
+///
+/// #[repr(C)]
+/// pub struct raw_st { x: u8 }
+/// #[repr(transparent)]
+/// pub struct Foo(raw_st);
+/// #[derive(Clone, Copy)]
+/// pub struct FooRef<'a>(CBorrowedPtr<'a, Foo>, u64); // not transparent
+/// pub struct FooMut<'a>(CBorrowedPtr<'a, Foo>);
+///
+/// unsafe impl CCell for Foo {
+///     type C = raw_st;
+///     type Ref<'a> = FooRef<'a>;
+///     type Mut<'a> = FooMut<'a>;
+/// }
+///
+/// let mut v = Foo(raw_st { x: 0 });
+/// let run = unsafe { CSlice::from_raw_parts(NonNull::from(&mut v), 1) };
+/// let _ = run.get(0); // instantiates the handle conversion for `Foo`
+/// ```
+pub unsafe trait CCell: Sized {
+    /// The wrapped C FFI type (e.g. `ffi::foo_st`).
+    type C;
+
+    /// The shared borrowed handle — `Copy`, getters only.
+    ///
+    /// `Self: 'a` because a handle borrows the object: a generic wrapper's
+    /// parameters must outlive the borrow, exactly as `&'a T` requires.
+    type Ref<'a>: Copy
+    where
+        Self: 'a;
+
+    /// The exclusive borrowed handle — move-only, getters plus setters.
+    type Mut<'a>
+    where
+        Self: 'a;
+
+    /// Borrow a raw pointer as the shared handle; `None` if null.
+    ///
+    /// The generic seam: code over `T: CCell` builds a `T::Ref` where it only
+    /// holds a pointer C gave it (a callback argument, a field). The handles
+    /// [`define_ctype!`](crate::define_ctype) generates forward their own
+    /// `from_ptr` here. Provided, from the layout this trait's contract
+    /// already requires; an implementor never needs to override it, and an
+    /// override must keep this contract.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must address a live, initialised `Self::C` (or be null) that
+    /// outlives `'a`, and nothing may write it while the handle lives except
+    /// through a `Mut` derived from the same borrow, or, for an object that
+    /// locks itself, under a lock that every read through `Self::Ref` of what
+    /// those writes reach takes too.
+    ///
+    /// The pointee must also be a valid `Self`, not only an initialised
+    /// `Self::C`: every borrow the lifetimes of `Self` name lives for them,
+    /// and every invariant the type's safe operations rely on holds, as the
+    /// type documents it. The handle's safe methods rely on both, so a
+    /// `FooRef<'_, 'static>` over an object that borrows shorter-lived memory
+    /// dangles from safe code.
+    #[inline]
+    unsafe fn ref_from_ptr<'a>(ptr: *mut Self::C) -> Option<Self::Ref<'a>>
+    where
+        Self: 'a,
+    {
+        // SAFETY: `Self` is transparent over `Self::C` (this trait's
+        // contract), so the cast keeps the layout; the caller upholds
+        // liveness for `'a`.
+        NonNull::new(ptr.cast::<Self>()).map(|p| unsafe { crate::refs::handle_ref(p) })
+    }
+
+    /// Borrow a raw pointer as the exclusive handle; `None` if null.
+    ///
+    /// As [`ref_from_ptr`](CCell::ref_from_ptr), for the setters.
+    ///
+    /// # Safety
+    ///
+    /// As [`ref_from_ptr`](CCell::ref_from_ptr), plus: `ptr` must carry write
+    /// provenance, and nothing else may access the object while the result
+    /// lives, no other handle and no C, under a lock or not.
+    #[inline]
+    unsafe fn mut_from_ptr<'a>(ptr: *mut Self::C) -> Option<Self::Mut<'a>>
+    where
+        Self: 'a,
+    {
+        // SAFETY: as `ref_from_ptr`; the caller also upholds exclusivity and
+        // write provenance.
+        NonNull::new(ptr.cast::<Self>()).map(|p| unsafe { crate::refs::handle_mut(p) })
+    }
+
+    /// Borrow a type-erased `void *` back as the shared handle; `None` if
+    /// null. For C slots that hand an opaque pointer back (a callback's
+    /// `void *arg`, a `get_user_data` getter). Ownership is not transferred.
+    ///
+    /// # Safety
+    ///
+    /// As [`ref_from_ptr`](CCell::ref_from_ptr), plus: `ptr` must be a pointer
+    /// to a `Self::C`. Nothing in a `void *` records the type, so one erased
+    /// from another type reconstitutes as confusion.
+    #[inline]
+    unsafe fn ref_from_void_ptr<'a>(ptr: *mut c_void) -> Option<Self::Ref<'a>>
+    where
+        Self: 'a,
+    {
+        // SAFETY: the caller asserts `ptr` addresses a live `Self::C`.
+        unsafe { Self::ref_from_ptr(ptr.cast::<Self::C>()) }
+    }
+
+    /// Borrow a type-erased `void *` back as the exclusive handle; `None` if
+    /// null. As [`ref_from_void_ptr`](CCell::ref_from_void_ptr).
+    ///
+    /// # Safety
+    ///
+    /// As [`mut_from_ptr`](CCell::mut_from_ptr), plus: `ptr` must be a pointer
+    /// to a `Self::C`.
+    #[inline]
+    unsafe fn mut_from_void_ptr<'a>(ptr: *mut c_void) -> Option<Self::Mut<'a>>
+    where
+        Self: 'a,
+    {
+        // SAFETY: the caller asserts `ptr` addresses a live `Self::C` it may
+        // borrow exclusively.
+        unsafe { Self::mut_from_ptr(ptr.cast::<Self::C>()) }
+    }
+}
+
+// ===========================================================================
+// The handles' seams, public wherever the handles are
+// ===========================================================================
+
+/// The raw seam of a shared handle: the one way to reach the pointer a
+/// `FooRef` holds, or to borrow one as a `FooRef`, in any crate.
+///
+/// [`define_ctype!`](crate::define_ctype) implements it on `FooRef<'a>`. The
+/// owning crate imports it to write its getters, and another crate that holds
+/// a `FooRef` and calls C with it (a wrapper over a library whose API takes
+/// the owning crate's type) imports it the same way.
+///
+/// ```ignore
+/// use ffibox::CRefSeam;
+/// // SAFETY: `widget_name` reads the widget for the call's duration.
+/// let name = unsafe { ffi::widget_name(widget.as_ptr()) };
+/// ```
+///
+/// Every method is provided, from the layout [`CCell`]'s contract requires
+/// of `CCell::Ref`, and the bound `Cell: CCell<Ref<'a> = Self>` admits only
+/// the type that is some cell's shared handle, so an impl needs no `unsafe`.
+/// A hand-written `CCell` implementor (one `define_ctype!` cannot express, or
+/// one written before it took lifetimes) opts in the same way:
+///
+/// ```ignore
+/// impl<'a> ffibox::CRefSeam<'a> for FooRef<'a> {
+///     type Cell = Foo;
+/// }
+/// ```
+///
+/// As on [`CBox::as_c_ptr`](crate::CBox::as_c_ptr), giving a pointer out is
+/// safe and adopting one is `unsafe`.
+pub trait CRefSeam<'a>: Copy {
+    /// The wrapped type this is the shared handle of.
+    type Cell: CCell<Ref<'a> = Self> + 'a;
+
+    /// Borrow a raw pointer; `None` if null. As
+    /// [`CCell::ref_from_ptr`], called on the handle type.
+    ///
+    /// # Safety
+    ///
+    /// As [`CCell::ref_from_ptr`].
+    #[inline]
+    unsafe fn from_ptr(ptr: *mut <Self::Cell as CCell>::C) -> Option<Self> {
+        // SAFETY: the caller upholds `CCell::ref_from_ptr`'s contract.
+        unsafe { <Self::Cell as CCell>::ref_from_ptr(ptr) }
+    }
+
+    /// Borrow a type-erased `void *` back; `None` if null. As
+    /// [`CCell::ref_from_void_ptr`], called on the handle type.
+    ///
+    /// # Safety
+    ///
+    /// As [`CCell::ref_from_void_ptr`].
+    #[inline]
+    unsafe fn from_void_ptr(ptr: *mut c_void) -> Option<Self> {
+        // SAFETY: the caller upholds `CCell::ref_from_void_ptr`'s contract.
+        unsafe { <Self::Cell as CCell>::ref_from_void_ptr(ptr) }
+    }
+
+    /// Read-only pointer to the C object, for FFI calls taking
+    /// `*const C` and for field reads through `addr_of!`. A C routine that
+    /// writes the object under a lock it takes itself, which
+    /// [`CCell::ref_from_ptr`]'s contract allows, may take it only for a type
+    /// Rust never holds by value: a handle built from `&self`, as a layout
+    /// type's own `as_ref` builds one, carries a pointer that may only be
+    /// read through.
+    #[inline]
+    #[must_use]
+    fn as_ptr(&self) -> *const <Self::Cell as CCell>::C {
+        crate::refs::ref_handle_ptr::<Self::Cell>(self)
+            .as_ptr()
+            .cast_const()
+            .cast()
+    }
+
+    /// Type-erased `*const c_void`, for read-only `void *` shims.
+    #[inline]
+    #[must_use]
+    fn as_void_ptr(&self) -> *const c_void {
+        self.as_ptr().cast()
+    }
+}
+
+/// The raw seam of an exclusive handle, callable from any crate. As
+/// [`CRefSeam`], for `FooMut<'a>`; `Cell: CCell<Mut<'a> = Self>`.
+pub trait CMutSeam<'a>: Sized {
+    /// The wrapped type this is the exclusive handle of.
+    type Cell: CCell<Mut<'a> = Self> + 'a;
+
+    /// Borrow a raw pointer exclusively; `None` if null. As
+    /// [`CCell::mut_from_ptr`], called on the handle type.
+    ///
+    /// # Safety
+    ///
+    /// As [`CCell::mut_from_ptr`].
+    #[inline]
+    unsafe fn from_ptr(ptr: *mut <Self::Cell as CCell>::C) -> Option<Self> {
+        // SAFETY: the caller upholds `CCell::mut_from_ptr`'s contract.
+        unsafe { <Self::Cell as CCell>::mut_from_ptr(ptr) }
+    }
+
+    /// Borrow a type-erased `void *` back exclusively; `None` if null. As
+    /// [`CCell::mut_from_void_ptr`], called on the handle type.
+    ///
+    /// # Safety
+    ///
+    /// As [`CCell::mut_from_void_ptr`].
+    #[inline]
+    unsafe fn from_void_ptr(ptr: *mut c_void) -> Option<Self> {
+        // SAFETY: the caller upholds `CCell::mut_from_void_ptr`'s contract.
+        unsafe { <Self::Cell as CCell>::mut_from_void_ptr(ptr) }
+    }
+
+    /// Writable pointer to the C object, for FFI calls taking `*mut C` and
+    /// for field writes through `addr_of_mut!`. Takes `&mut self`, so the
+    /// pointer is derived under the handle's exclusive borrow.
+    #[inline]
+    #[must_use]
+    fn as_mut_ptr(&mut self) -> *mut <Self::Cell as CCell>::C {
+        crate::refs::mut_handle_ptr::<Self::Cell>(self)
+            .as_ptr()
+            .cast()
+    }
+
+    /// Type-erased `*mut c_void`, for writing `void *` shims.
+    #[inline]
+    #[must_use]
+    fn as_mut_void_ptr(&mut self) -> *mut c_void {
+        self.as_mut_ptr().cast()
+    }
+}
+
+/// The raw seam of a locked handle (`FooLocked`, from
+/// [`impl_cguarded!`](crate::impl_cguarded) over some fields), callable from
+/// any crate. As [`CMutSeam`], for [`CGuarded::Locked`]; a lock over the whole
+/// object hands out the `Mut` handle, whose seam is `CMutSeam`'s.
+pub trait CLockedSeam<'a>: Sized {
+    /// The guarded type this is the locked handle of.
+    type Cell: CGuarded<Locked<'a> = Self> + 'a;
+
+    /// Writable pointer to the C object, for FFI calls that require the lock
+    /// held and for field access through `addr_of_mut!`.
+    #[inline]
+    #[must_use]
+    fn as_mut_ptr(&mut self) -> *mut <Self::Cell as CCell>::C {
+        crate::refs::locked_handle_ptr::<Self::Cell>(self)
+            .as_ptr()
+            .cast()
+    }
+}

@@ -1,0 +1,173 @@
+//! # ffibox
+//!
+//! Generic smart pointers and traits for building safe Rust wrappers over C
+//! types — opaque handles, and also structs you need field access to and a
+//! C-ABI layout for.
+//!
+//! The [README] is the primary guide: the types a wrapper crate gets, how
+//! teardown policies work, and a decision procedure from a C declaration to
+//! its wrapper. This page is the API reference.
+//!
+//! ## Two rules
+//!
+//! - **No reference to a wrapped C object is ever formed.** A `&Wrapper` over
+//!   the object's bytes would assert `noalias` / `readonly` over memory C may
+//!   write, so access goes through handles that hold the pointer by value (see
+//!   [`refs`]).
+//! - **Teardown is a policy, not a property of `T`.** [`CDrop`] and its
+//!   siblings are implemented on a policy type the owner stores inline, so an
+//!   owner cannot exist without a destructor and one C type can have several
+//!   (see [`traits`]).
+//!
+//! ## The pieces
+//!
+//! | Item | Role |
+//! |------|------|
+//! | [`define_ctype!`] | per C type: the layout type `Foo` and its handles `FooRef<'a>` / `FooMut<'a>`; over a lifetime-carrying `Foo<'r>`, `FooRef<'a, 'r>` / `FooMut<'a, 'r>` |
+//! | [`CBox<T, D>`] | the sole owner of a C-allocated object of a [`CCell`] layout type |
+//! | [`CBoxState<T, D>`] | the same, under a policy with state; [`CBox`] and the other pointer owners take a stateless one |
+//! | [`CArc<T, D>`] | one counted reference to a refcounted object; [`lock`](CArc::lock) takes the C lock a [`CGuarded`] object carries |
+//! | [`CGuard<'a, T>`] | a held C lock, released on drop; hands out the `FooLocked<'a>` handle |
+//! | [`CGuardedRef<'a, T>`] | a borrow reached only through the object's lock, never released — a C global under its C lock |
+//! | [`CStrBox<D>`] | an owned NUL-terminated `char *` |
+//! | [`CVec<T, S>`] | an owned `(ptr, len)` buffer |
+//! | [`CVal<T, D>`] | a C struct held by value, disposed on drop |
+//! | [`CSlice<'a, T>`] / [`CSliceMut<'a, T>`] | a borrowed run of elements |
+//! | [`iter::CNullTerminated<'a, T>`] | a borrowed NULL-terminated array of pointers, as an `Iterator` |
+//! | [`status`] | a C routine's error convention as a `Result` |
+//! | `impl_*!` | bind a C routine to a policy |
+//! | `export_*!` | offer a policy to C as the routine it calls |
+//! | [`CClosure`] / [`CPayload`] | a Rust closure C calls, for one call or until C releases it |
+//! | [`CFn`] / [`CFnBox`] | a C function and its context that Rust calls, borrowed or owned |
+//! | [`CCallback`] / [`CCallbackBox`] | either: a callback called from Rust and handed to C alike |
+//! | [`CTable<T, S>`] / [`impl_cvtable!`] | Rust state behind a C table of function pointers C calls into, its slots minted from the trait the state implements; [`impl_clocal_handles!`] lends its handles over any state where they stay on their thread |
+//! | [`RustAlloc`] | the policy over Rust's global allocator, for what Rust allocates and C frees |
+//! | [`CAllocator<P>`] / [`impl_clenalloc!`] | a C allocation family (`malloc` / `realloc` / `free`) as the standard `Allocator`, for `Box<T, CAllocator<P>>` and `Vec<T, CAllocator<P>>` over memory C frees, and as a storage-only policy; [`CBox`] and [`CVec`] convert to and from them |
+//!
+//! Like `Box`, the owners adopt a raw pointer with an `unsafe` `from_raw` and
+//! give one out with a safe `into_raw` / `as_ptr`. A type alias names an owner with its policy.
+//! A policy that also constructs gives [`CBox`] and [`CArc`] safe constructors
+//! that allocate through it: `new` ([`CNew`], a C `*_alloc`), `new_zeroed`
+//! ([`CAllocZeroed`], for a [`CZeroable`] type) and `new_uninit` ([`CAlloc`],
+//! filled in place by C and promoted with `assume_init`).
+//!
+//! ## Quick example
+//!
+//! ```
+//! use ffibox::{define_ctype, impl_cdrop, impl_cdupclone, CBox, CMutSeam, CRefSeam};
+//!
+//! mod ffi {
+//!     #[repr(C)]
+//!     pub struct point_st { pub x: i32, pub y: i32 }
+//!     // Stand-ins for a C library's constructor, copy and destructor.
+//!     pub unsafe extern "C" fn point_new(x: i32, y: i32) -> *mut point_st {
+//!         Box::into_raw(Box::new(point_st { x, y }))
+//!     }
+//!     pub unsafe extern "C" fn point_dup(p: *mut point_st) -> *mut point_st {
+//!         unsafe { point_new((*p).x, (*p).y) }
+//!     }
+//!     pub unsafe extern "C" fn point_free(p: *mut point_st) {
+//!         drop(unsafe { Box::from_raw(p) });
+//!     }
+//! }
+//!
+//! define_ctype!(Point, PointRef, PointMut, ffi::point_st);
+//!
+//! #[derive(Clone, Copy, Debug, Default)]
+//! pub struct PointFree;
+//! impl_cdrop!(PointFree, Point, ffi::point_free);
+//! impl_cdupclone!(PointFree, Point, ffi::point_dup);
+//!
+//! pub type PointBox = CBox<Point, PointFree>;
+//!
+//! impl Point {
+//!     pub fn new(x: i32, y: i32) -> Option<PointBox> {
+//!         // SAFETY: point_new returns an owned object or NULL.
+//!         unsafe { PointBox::from_c(ffi::point_new(x, y)) }
+//!     }
+//! }
+//! impl PointRef<'_> {
+//!     pub fn x(&self) -> i32 {
+//!         // SAFETY: a read through the raw pointer; no reference is formed.
+//!         unsafe { core::ptr::addr_of!((*self.as_ptr()).x).read() }
+//!     }
+//! }
+//! impl PointMut<'_> {
+//!     pub fn set_x(&mut self, v: i32) {
+//!         // SAFETY: as above, through the exclusive handle.
+//!         unsafe { core::ptr::addr_of_mut!((*self.as_mut_ptr()).x).write(v) }
+//!     }
+//! }
+//!
+//! let mut p = Point::new(3, 4).unwrap();
+//! p.as_mut().set_x(5);
+//! let q = p.clone();                  // point_dup
+//! assert_eq!(q.as_ref().x(), 5);
+//! // point_free runs twice here.
+//! ```
+//!
+//! ## `no_std`
+//!
+//! `#![no_std]`. The `std` feature (default) selects
+//! [`std::process::abort`](https://doc.rust-lang.org/std/process/fn.abort.html) for the unrecoverable-failure path, where
+//! without it that path is a double-panic, and lets [`CClosure`] and
+//! [`callback::barrier`] catch a panic before it reaches C, as [`CTable`]'s
+//! slots do. The `alloc` feature, which `std` enables, adds [`RustAlloc`],
+//! [`CPayload`], [`CCallbackBox`] and [`CTable`], which allocate through Rust's
+//! global allocator, and the conversions between ffibox's owners and `Box` /
+//! `Vec`; nothing else allocates but through a policy the consumer chose, as
+//! [`CAllocator`], which needs no feature, allocates through its family.
+//!
+//! [README]: https://github.com/crustify-rs/ffibox#readme
+
+#![no_std]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+// The docs link to the items `alloc` and `std` add, which a build without them
+// cannot resolve; docs.rs documents every feature.
+#![cfg_attr(not(feature = "std"), allow(rustdoc::broken_intra_doc_links))]
+
+#[cfg(feature = "alloc")]
+extern crate alloc;
+#[cfg(feature = "std")]
+extern crate std;
+
+pub mod allocator;
+pub mod callback;
+pub mod iter;
+pub mod macros;
+pub mod refs;
+#[cfg(feature = "alloc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+pub mod rust_alloc;
+pub mod shared;
+pub mod status;
+pub mod traits;
+#[cfg(feature = "alloc")]
+#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+pub mod vtable;
+
+// Compiles every Rust block the docs carry, so no example can drift from the
+// API. The examples live in `docs/examples.md`; the README is included too, so
+// a snippet added there is compiled rather than silently untested. They are
+// `no_run`: their `sys` modules declare C routines that are never linked.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+#[doc = include_str!("../docs/examples.md")]
+pub struct DocExamples;
+
+// Re-export the primary items at the crate root for convenience.
+pub use crate::allocator::CAllocator;
+pub use crate::callback::{CCallback, CClosure, CFn, CFnBox};
+#[cfg(feature = "alloc")]
+pub use crate::callback::{CCallbackBox, CPayload};
+pub use crate::refs::{CBorrowedPtr, CBox, CBoxState, CSlice, CSliceMut, CStrBox, CVal, CVec};
+#[cfg(feature = "alloc")]
+pub use crate::rust_alloc::RustAlloc;
+pub use crate::shared::{CArc, CGuard, CGuardedRef};
+pub use crate::traits::{
+    CAlloc, CAllocZeroed, CCell, CDispose, CDrop, CDupClone, CGuarded, CGuardedAll, CLenAlloc,
+    CLenClone, CLenDrop, CLockedSeam, CMutSeam, CNew, CPlainElem, CRefClone, CRefSeam, CSliceElem,
+    CZeroable, LockFields, LockScope, LockWhole,
+};
+#[cfg(feature = "alloc")]
+pub use crate::vtable::{CLocalHandles, CSlots, CTable, CVtable};
