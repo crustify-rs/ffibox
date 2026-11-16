@@ -194,19 +194,23 @@ bitfields by field. Two facts are the ABI's.
   directly.
 - *Which bytes the unit is.* On System V and AAPCS, a run of bitfields is
   packed bit after bit from where the previous member ended, and a field
-  moves to the next boundary of its declared type's size only if it would
-  cross one (or after `:0`). The mirror's `W` covers the bytes the run
+  of type `T` moves on only if it does not fit in a `sizeof(T)`-byte span
+  starting at a multiple of `alignof(T)` (or after `:0`): the boundary is
+  the alignment, which differs from the size for `long long` on i686. The mirror's `W` covers the bytes the run
   occupies, at its offset; any further byte of `W` must be padding. Later
   members may sit inside the declared type's size (`unsigned a:4; char c;`
   puts `c` at offset 1), a run may begin inside the previous member's
   unit, and the declared type gives the struct its alignment
-  (`#[repr(C, align(N))]`). On Microsoft's ABI, each run of one declared
-  type is a unit of that type.
+  (`#[repr(C, align(N))]`). A run whose bytes no aligned integer covers
+  without covering another member (`char c[3]; unsigned long long a:40;`)
+  is not a `CBitfield`: mirror it as bytes with hand-written accessors. On
+  Microsoft's ABI, each run of one declared type is a unit of that type.
 
 Platform scope: checked against clang for x86-64, AArch64, ARMv7, i686,
 s390x and PowerPC64 Linux and x86-64 Windows (`tests/bitfield_c_layout.rs`,
 run natively and under Miri per target). `CAtomicBitfield<W>` refuses to
-build where `W`'s atomic is more aligned than `W` (`u64` on i686), as the
+build where `W`'s atomic is more aligned than `W` (`u64` on i686: no
+`CAtomicBitWord` impl, so the type itself is rejected), as the
 unit would then sit elsewhere than C's. A field that does not fit, or has no
 bits, fails at compile time. Assignment truncates to the field's width, as
 C's does. Only unsigned fields are covered.
