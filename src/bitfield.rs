@@ -1,35 +1,66 @@
-//! C bitfields: [`CBits<W>`] names a field of a bitfield word `W` once, in
+//! C bitfields: [`CBits<W>`] names a field of a storage unit `W` once, in
 //! C's declaration order, and [`CBitfield<W>`] / [`CAtomicBitfield<W>`] are
-//! the word, read and written by field.
+//! the unit, read and written by field.
+//!
+//! Rust has no bitfields, so a mirror holds the bits as an unsigned integer
+//! and reads each field through a shift and a mask. Two things are the ABI's:
+//! which bits of its unit a field takes, which [`CBits`] computes, and which
+//! bytes of the struct the unit is, which the binding chooses and a layout
+//! check against the C compiler confirms.
+//!
+//! **Platform scope.** The placement within a unit is right for the System V
+//! family (x86-64, i386, s390x, PowerPC) and AAPCS / AAPCS64 (Arm), little-
+//! and big-endian, and for Microsoft's x64 ABI. It is checked against clang
+//! for x86-64, AArch64, ARMv7, i686, s390x and PowerPC64 Linux and for
+//! x86-64 Windows (`tests/bitfield_c_layout.rs`, from clang's own layouts,
+//! `tests/data/bitfield_layouts.txt`). Other ABIs are not covered.
+//!
+//! **Bits within a unit.** The first field declared takes the least
+//! significant bits on a little-endian target and the most significant on a
+//! big-endian one, and each later field follows it. [`CBits::first`] and
+//! [`CBits::next`] follow the declaration and compute the bits from the
+//! target, so the binding writes the C's order and widths, not masks.
+//!
+//! **Which unit, System V and AAPCS.** A run of bitfields is packed bit after
+//! bit, starting where the previous member ended; a field moves on to the
+//! next boundary of its declared type's size only if it would cross one, and
+//! `:0` moves to the next boundary. So the unit is **not** the declared type:
+//! the mirror's `W` is an unsigned integer covering the bytes the run
+//! occupies, at the run's offset, and any byte of `W` beyond the run must be
+//! padding in C, never another member. Members after the run may sit inside
+//! the declared type's size (`unsigned a:4; char c;` puts `c` at offset 1),
+//! and a run may start inside the previous member's unit (`char c;
+//! unsigned a:4;` puts `a` in byte 1). The declared type still gives the
+//! struct its alignment, which may need `#[repr(C, align(N))]`, and, where
+//! the last unit extends past the last byte, its size.
+//!
+//! **Which unit, Microsoft.** Each run of fields of one declared type is a
+//! unit of that type, aligned as it; a change of declared type starts a new
+//! unit. There `W` is the declared type.
 //!
 //! ```c
-//! struct node {
-//!     unsigned short seen:1, uninteresting:1, flags:4;
-//!     unsigned short in_degree;
+//! struct node {                      /* System V: 8 bytes, align 4 */
+//!     unsigned seen:1, uninteresting:1, flags:4;  /* bits 0-5 of byte 0 */
+//!     unsigned short in_degree;      /* offset 2, inside the unsigned's size */
+//!     unsigned short out_degree;
 //! };
 //! ```
-//!
-//! Rust has no bitfields, so a mirror holds the storage unit as an integer
-//! and reads each field through a shift and a mask. Which bits a field has
-//! is the ABI's: on the System V and AAPCS ABIs, the first field declared
-//! takes the least significant bits on a little-endian target and the most
-//! significant on a big-endian one. [`CBits::first`] and [`CBits::next`]
-//! follow the declaration and compute the bits from the target, so the
-//! binding writes the C's order and widths, not masks:
 //!
 //! ```
 //! use ffibox::bitfield::{CBitfield, CBits};
 //!
-//! #[repr(C)]
+//! // System V: the run takes 6 bits, so 2 bytes cover it before `in_degree`.
+//! #[repr(C, align(4))] // the alignment of `unsigned`
 //! pub struct Node {
 //!     pub bits: CBitfield<u16>,
 //!     pub in_degree: u16,
+//!     pub out_degree: u16,
 //! }
 //! pub const SEEN: CBits<u16> = CBits::first(1);
 //! pub const UNINTERESTING: CBits<u16> = SEEN.next(1);
 //! pub const FLAGS: CBits<u16> = UNINTERESTING.next(4);
 //!
-//! let mut n = Node { bits: CBitfield::new(0), in_degree: 0 };
+//! let mut n = Node { bits: CBitfield::new(0), in_degree: 0, out_degree: 0 };
 //! n.bits.set_flag(UNINTERESTING, true);
 //! n.bits.set(FLAGS, 0b1_0110);           // truncated to 4 bits, as C does
 //! assert!(!n.bits.is_set(SEEN));
@@ -37,6 +68,7 @@
 //! assert_eq!(n.bits.get(FLAGS), 0b0110);
 //! # #[cfg(target_endian = "little")]
 //! assert_eq!(n.bits.into_inner(), 0b0110_10);
+//! assert_eq!((size_of::<Node>(), core::mem::offset_of!(Node, in_degree)), (8, 2));
 //! ```
 //!
 //! A word that several threads update while C reads it is a
@@ -48,10 +80,7 @@
 //! C's side, as it was between two C threads.
 //!
 //! Only unsigned fields: a signed one (`int x:3`) sign-extends, and plain
-//! `int` bitfields are signed or not as the implementation chooses. The
-//! storage unit `W` is the type the fields are declared with, as a
-//! layout test against the C compiler confirms; a field does not straddle
-//! two units.
+//! `int` bitfields are signed or not as the implementation chooses.
 
 use core::fmt;
 use core::marker::PhantomData;
@@ -161,6 +190,13 @@ bit_word!(u8 => AtomicU8, u16 => AtomicU16, u32 => AtomicU32, u64 => AtomicU64);
 /// use ffibox::bitfield::CBits;
 /// const A: CBits<u8> = CBits::first(5);
 /// const B: CBits<u8> = A.next(4); // 5 + 4 bits in an 8-bit unit
+/// ```
+///
+/// nor does a field of no bits:
+///
+/// ```compile_fail,E0080
+/// use ffibox::bitfield::CBits;
+/// const NONE: CBits<u32> = CBits::first(0);
 /// ```
 ///
 /// and a field reads and writes only the word it was declared for:
@@ -348,12 +384,14 @@ impl<W: CBitWord> fmt::Debug for CBitfield<W> {
 
 /// A C bitfield word that several threads update: the atomic of `W`, read
 /// and written by field, each change one atomic read-modify-write of the
-/// word. `#[repr(transparent)]` over the atomic, which has `W`'s size, and
-/// its alignment but for `u64` on a target where `u64` is less aligned than
-/// its atomic (i686): there the field's offset is checked against C's.
+/// word. `#[repr(transparent)]` over the atomic, which has `W`'s size and
+/// alignment: a `W` whose atomic is more aligned than it, `u64` on i686
+/// (where C aligns a `long long` member to 4), fails to build, as the mirror
+/// would put the unit at another offset than C's.
 ///
-/// Its counterparts are `AtomicU32::fetch_or`, `fetch_and` and
-/// `fetch_update`, over the field's bits. The orderings are std's.
+/// Its counterparts are `AtomicU32::fetch_or`, `fetch_and`, `store` and
+/// `swap`, over the field's bits. The orderings are std's, but for
+/// [`set_flag`](Self::set_flag)'s shortcut, which it documents.
 ///
 /// ```
 /// use core::sync::atomic::Ordering::Relaxed;
@@ -376,10 +414,17 @@ impl<W: CBitWord> fmt::Debug for CBitfield<W> {
 pub struct CAtomicBitfield<W: CBitWord>(W::Atomic);
 
 impl<W: CBitWord> CAtomicBitfield<W> {
+    /// Fails the build where the atomic is more aligned than `W`.
+    const C_ALIGNED: () = assert!(
+        core::mem::align_of::<W::Atomic>() == core::mem::align_of::<W>(),
+        "ffibox: this target aligns the atomic of W more than W, so the unit would not sit where C puts it"
+    );
+
     /// The word `raw`.
     #[inline]
     #[must_use]
     pub fn new(raw: W) -> Self {
+        let () = Self::C_ALIGNED;
         Self(W::Atomic::new(raw))
     }
 
@@ -412,10 +457,16 @@ impl<W: CBitWord> CAtomicBitfield<W> {
     }
 
     /// Set the field to `value`, truncated to its width, in one atomic
-    /// read-modify-write that keeps the other fields; the field's previous
-    /// value. `order` is the read-modify-write's, as for `fetch_update`'s
-    /// `set_order`; its loads are `order` without its release part.
-    pub fn store(&self, field: CBits<W>, value: W, order: Ordering) -> W {
+    /// read-modify-write that keeps the other fields.
+    #[inline]
+    pub fn store(&self, field: CBits<W>, value: W, order: Ordering) {
+        let _ = self.swap(field, value, order);
+    }
+
+    /// As [`store`](Self::store), returning the field's previous value, as
+    /// `AtomicU32::swap`. `order` is the read-modify-write's; its loads are
+    /// `order` without its release part.
+    pub fn swap(&self, field: CBits<W>, value: W, order: Ordering) -> W {
         let fetch = load_order(order);
         let mut cur = self.0.load(fetch);
         loop {
@@ -430,15 +481,24 @@ impl<W: CBitWord> CAtomicBitfield<W> {
     }
 
     /// Set every bit of the field, or clear them, with one `fetch_or` or
-    /// `fetch_and`; whether any was set before. A field already so is not
-    /// written at all, so that a read path that C runs on several threads
-    /// and that sets a flag already set leaves the word alone.
+    /// `fetch_and`; whether any was set before.
+    ///
+    /// With an `order` that has no release part (`Relaxed`, `Acquire`), a
+    /// field already as asked is not written at all, so that a read path C
+    /// runs on several threads, setting a flag that is already set, leaves
+    /// the word alone; the load then has `order`. With `Release`, `AcqRel` or
+    /// `SeqCst` the read-modify-write always happens, so the release it
+    /// promises is made even when the flag does not change.
     pub fn set_flag(&self, field: CBits<W>, on: bool, order: Ordering) -> bool {
+        let releases = matches!(
+            order,
+            Ordering::Release | Ordering::AcqRel | Ordering::SeqCst
+        );
         let cur = self.0.load(load_order(order));
         let mask = field.mask();
         let full = field.extract(cur) == W::from_u64(field.low_mask());
         let clear = field.extract(cur) == W::from_u64(0);
-        if (on && full) || (!on && clear) {
+        if !releases && ((on && full) || (!on && clear)) {
             return !clear;
         }
         let prev = if on {
@@ -481,6 +541,16 @@ impl<W: CBitWord> fmt::Debug for CAtomicBitfield<W> {
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<CBitfield<u16>>() == 2);
-    assert!(core::mem::size_of::<CAtomicBitfield<u32>>() == 4);
+    use core::mem::{align_of, size_of};
+    macro_rules! same_layout {
+        ($($w:ty),*) => {$(
+            assert!(size_of::<CBitfield<$w>>() == size_of::<$w>());
+            assert!(align_of::<CBitfield<$w>>() == align_of::<$w>());
+            assert!(size_of::<CAtomicBitfield<$w>>() == size_of::<$w>());
+        )*};
+    }
+    same_layout!(u8, u16, u32, u64);
+    assert!(align_of::<CAtomicBitfield<u8>>() == align_of::<u8>());
+    assert!(align_of::<CAtomicBitfield<u16>>() == align_of::<u16>());
+    assert!(align_of::<CAtomicBitfield<u32>>() == align_of::<u32>());
 };
