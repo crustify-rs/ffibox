@@ -25,7 +25,8 @@
 //!     use core::sync::atomic::{AtomicI32, Ordering, fence};
 //!
 //!     /// `int rc`, which C increments and decrements in place with
-//!     /// sequentially consistent atomics. Safe code can make one only at one
+//!     /// sequentially consistent atomics: the atomic alone, with no padding
+//!     /// or other field, so a `&Count` covers nothing else. Safe code can make one only at one
 //!     /// reference, and change it not at all: its field is private to this
 //!     /// module and its mutators are `unsafe`.
 //!     pub struct Count(AtomicI32);
@@ -101,8 +102,11 @@
 //!         unsafe { this.as_ref().rc.up() }
 //!     }
 //!     unsafe fn c_down_ref(this: NonNull<Self>) -> bool {
+//!         // Only the count is borrowed across the decrement: `Count` is the
+//!         // atomic alone, so no reference covers the rest of the session
+//!         // when another thread may take it (`CCounted`'s contract).
 //!         // SAFETY: as above; the caller gives it up.
-//!         unsafe { this.as_ref().rc.down() }
+//!         unsafe { (*this.as_ptr()).rc.down() }
 //!     }
 //!     unsafe fn c_is_sole_owner(this: NonNull<Self>) -> bool {
 //!         // SAFETY: as above.
@@ -201,7 +205,15 @@ use crate::refs::abort_process;
 ///   so that every use of the object through another reference
 ///   happens-before its release. [`c_is_sole_owner`](Self::c_is_sole_owner)
 ///   reads the count with at least `Acquire`, so that a drop on another
-///   thread happens-before the `&mut Self` it grants. If `Self` is `Send` or
+///   thread happens-before the `&mut Self` it grants. **No reference
+///   covering more than the atomic count is live across or after a
+///   decrement**: once the count drops, another thread's `c_is_sole_owner`
+///   may grant `&mut Self`, or its `c_down_ref` may free the object, while
+///   this call is still running. So the decrement goes through a reference
+///   to the atomic alone (`&AtomicI32`, projected from the pointer), as
+///   `Arc`'s does, not through a `&self` method of a count struct with
+///   padding or other fields, whose argument stays protected until the
+///   method returns. If `Self` is `Send` or
 ///   `Sync`, every change of the count is atomic with respect to C's and to
 ///   each other's.
 /// - **Exclusive access.** A `true` from `c_is_sole_owner` means the caller's

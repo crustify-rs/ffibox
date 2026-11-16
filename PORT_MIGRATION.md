@@ -64,6 +64,17 @@ count than `GitRefcount` gives today. Change `GitRefcount`
   `__atomic_*_fetch(…, __ATOMIC_SEQ_CST)`). That is at least `Release` on
   every decrement and `Acquire` on the last one and on the sole check, as
   `CCounted` requires. Keep it.
+- **No `&GitRefcount` across the decrement** (found by Miri's many-seeds
+  run on ffibox's own tests after review r2). `GitRefcount` is
+  `{ Atomic32 refcount; AtomicPtr owner; }`, with 4 bytes of padding
+  between them. A `dec(&self)` keeps that `&GitRefcount` argument
+  protected until it returns. If another thread's decrement leaves the
+  count at 1, that thread's `CShared::get_mut` (or the last drop's free)
+  may meanwhile take `&mut` of the object, which Stacked Borrows rejects.
+  Implement `inc`, `dec`, `init` and `sole` on the count's pointer, borrowing
+  only the atomic each one touches (`&*(&raw const (*p).refcount)`), as
+  ffibox's `tests/counted.rs` `Refcount` does and as `Arc` does.
+  `refcount_of` below then returns `*const GitRefcount`, not a reference.
 - **`dec` tests `v == 0`**, not `v <= 0`, then reads `owner` with `Acquire`
   (`SeqCst`) after the decrement. "At most once" then holds without relying
   on no over-decrement.
@@ -79,10 +90,10 @@ Add one generic helper, so that each type's `CCounted` impl is a few lines:
 /// The `git_refcount` at offset 0 of a live `T` (`#[repr(C)]`, `rc` first).
 /// # Safety
 /// `p` is live while the result is used; `T` starts with a `GitRefcount`.
-pub(crate) unsafe fn refcount_of<'a, T>(p: NonNull<T>) -> &'a GitRefcount {
-    // SAFETY: the caller's contract; `GitRefcount` is all atomics, and its
-    // mutators are `unsafe`.
-    unsafe { p.cast::<GitRefcount>().as_ref() }
+pub(crate) fn refcount_of<T>(p: NonNull<T>) -> *const GitRefcount {
+    // A pointer, not a reference: no `&GitRefcount` is live across a
+    // decrement (see above). `GitRefcount`'s operations take it.
+    p.as_ptr().cast_const().cast()
 }
 ```
 
@@ -90,14 +101,14 @@ This is `repository/handles.rs:32-36` (`refcount`), made generic and moved.
 Delete the old one when §2 lands. Each type also gets
 `const _: () = assert!(offset_of!(T, rc) == 0);`.
 
-All four impls below take the same five methods (written once, for
+All four impls below take the same four methods (written once, for
 example as a `macro_rules!` in `util/thread.rs`):
 
 ```rust
-unsafe fn c_init(p: NonNull<Self>) { unsafe { refcount_of(p).init() } }
-unsafe fn c_up_ref(p: NonNull<Self>) -> bool { unsafe { refcount_of(p).inc() } }
-unsafe fn c_down_ref(p: NonNull<Self>) -> bool { unsafe { refcount_of(p).dec() } }
-unsafe fn c_is_sole_owner(p: NonNull<Self>) -> bool { unsafe { refcount_of(p).sole() } }
+unsafe fn c_init(p: NonNull<Self>) { unsafe { GitRefcount::init(refcount_of(p)) } }
+unsafe fn c_up_ref(p: NonNull<Self>) -> bool { unsafe { GitRefcount::inc(refcount_of(p)) } }
+unsafe fn c_down_ref(p: NonNull<Self>) -> bool { unsafe { GitRefcount::dec(refcount_of(p)) } }
+unsafe fn c_is_sole_owner(p: NonNull<Self>) -> bool { unsafe { GitRefcount::sole(refcount_of(p)) } }
 ```
 
 `CShared`'s own operations are associated functions, as `Arc`'s are:
@@ -116,7 +127,7 @@ so the `barrier` around it in each export now catches a panic in a `Drop`
 // CAllocator over a unit family).
 unsafe impl CCounted for GitOdb {
     type Alloc = GitAlloc;
-    // the five methods of §1.1
+    // the four methods of §1.1
 }
 // SAFETY: C writes only `rc`; holders reach `locked` through its mutex, and
 // `own_cache` / `do_fsync` are synchronised; `options` is fixed.
@@ -164,7 +175,7 @@ which frees the backend through its slot first.
 ```rust
 unsafe impl CCounted for GitRefdb {
     type Alloc = GitAlloc;
-    // the five methods of §1.1, and:
+    // the four methods of §1.1, and:
     // `free_db`'s body: the backend through its `free` slot, the memzero, then
     // `alloc::free`. Or move the backend free into `impl Drop for GitRefdb` and
     // build with `CShared::try_new`, keeping the default release.
@@ -211,7 +222,7 @@ safe constructor at another count, it keeps the provided `c_is_sole_owner`
 ```rust
 unsafe impl CCounted for GitIndex {
     type Alloc = std::alloc::Global;
-    // the five methods of §1.1, and:
+    // the four methods of §1.1, and:
     unsafe fn c_release(p: NonNull<Self>) { unsafe { index_free(IndexPtr::new(p)) } }
 }
 ```

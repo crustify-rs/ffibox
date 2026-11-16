@@ -739,7 +739,7 @@ fn t_runs(r: &mut Rows) {
             "T1_a",
             image::<T1>(|p| {
                 // SAFETY: the zeroed mirror; 40 bits are its first 5 bytes.
-                unsafe { (*p).a[..5].fill(0xff) }
+                unsafe { (&raw mut (*p).a).cast::<u8>().write_bytes(0xff, 5) }
             }),
         );
     }
@@ -761,7 +761,7 @@ fn t_runs(r: &mut Rows) {
             "T2_a",
             image::<T2>(|p| {
                 // SAFETY: the zeroed mirror; 40 bits are all 5 bytes.
-                unsafe { (*p).a.fill(0xff) }
+                unsafe { (&raw mut (*p).a).write_bytes(0xff, 1) }
             }),
         );
     }

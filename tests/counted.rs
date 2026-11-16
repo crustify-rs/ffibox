@@ -69,30 +69,55 @@ mod rc {
         pub unsafe fn own(&self, owner: *mut c_void) {
             self.owner.store(owner, Ordering::Release);
         }
+
+        // The `CCounted` operations take the count's pointer and borrow
+        // only the atomic each one uses: `Refcount` has padding between
+        // its fields, and a `&self` would stay protected across the
+        // decrement while another thread takes `&mut` of the object
+        // (`CCounted`'s contract; Miri's many-seeds run found it).
+
+        /// The count field, borrowed alone.
+        ///
+        /// # Safety
+        ///
+        /// `this` is live for `'a`.
+        unsafe fn count_of<'a>(this: *const Refcount) -> &'a AtomicI32 {
+            // SAFETY: the caller's contract; the projection forms no
+            // reference to the rest.
+            unsafe { &(*this).count }
+        }
+        /// The owner field, borrowed alone.
+        ///
+        /// # Safety
+        ///
+        /// As `count_of`.
+        unsafe fn owner_of<'a>(this: *const Refcount) -> &'a AtomicPtr<c_void> {
+            // SAFETY: as in `count_of`.
+            unsafe { &(*this).owner }
+        }
         /// `c_init`.
         ///
         /// # Safety
         ///
         /// Nothing else reaches the object.
-        pub unsafe fn init(&self) {
-            self.count.store(1, Ordering::Relaxed);
-            self.owner.store(ptr::null_mut(), Ordering::Relaxed);
+        pub unsafe fn init(this: *const Refcount) {
+            // SAFETY: the caller's contract.
+            unsafe { Self::count_of(this) }.store(1, Ordering::Relaxed);
+            // SAFETY: as above.
+            unsafe { Self::owner_of(this) }.store(ptr::null_mut(), Ordering::Relaxed);
         }
         /// `GIT_REFCOUNT_INC`, refusing before the count could wrap.
         ///
         /// # Safety
         ///
         /// The caller holds a reference.
-        pub unsafe fn inc(&self) -> bool {
+        pub unsafe fn inc(this: *const Refcount) -> bool {
+            // SAFETY: live: the caller's reference.
+            let count = unsafe { Self::count_of(this) };
             let max = MAX.load(Ordering::Relaxed);
-            let mut n = self.count.load(Ordering::Relaxed);
+            let mut n = count.load(Ordering::Relaxed);
             while n < max {
-                match self.count.compare_exchange_weak(
-                    n,
-                    n + 1,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
+                match count.compare_exchange_weak(n, n + 1, Ordering::Relaxed, Ordering::Relaxed) {
                     Ok(_) => return true,
                     Err(now) => n = now,
                 }
@@ -104,38 +129,47 @@ mod rc {
         /// # Safety
         ///
         /// The caller holds a reference.
-        pub unsafe fn c_inc(&self) {
-            self.count.fetch_add(1, Ordering::SeqCst);
+        pub unsafe fn c_inc(this: *const Refcount) {
+            // SAFETY: live: the caller's reference.
+            unsafe { Self::count_of(this) }.fetch_add(1, Ordering::SeqCst);
         }
         /// `GIT_REFCOUNT_DEC` without the free: `Release`, then `Acquire`
-        /// before it answers "free now"; the owner read after the decrement.
+        /// before it answers "free now"; the owner read after the decrement,
+        /// only by the last one out.
         ///
         /// # Safety
         ///
         /// The caller gives up a reference it holds.
-        pub unsafe fn dec(&self) -> bool {
-            if self.count.fetch_sub(1, Ordering::Release) != 1 {
+        pub unsafe fn dec(this: *const Refcount) -> bool {
+            // SAFETY: live until the decrement; only the atomic is borrowed.
+            if unsafe { Self::count_of(this) }.fetch_sub(1, Ordering::Release) != 1 {
                 return false;
             }
             fence(Ordering::Acquire);
-            self.owner.load(Ordering::Acquire).is_null()
+            // SAFETY: the count is spent: nothing but an owner reaches the
+            // object, and an owner keeps it alive while it is set.
+            unsafe { Self::owner_of(this) }
+                .load(Ordering::Acquire)
+                .is_null()
         }
         /// One reference, no owner, read with `Acquire`.
-        pub fn sole(&self) -> bool {
-            self.count.load(Ordering::Acquire) == 1 && self.owner.load(Ordering::Acquire).is_null()
+        ///
+        /// # Safety
+        ///
+        /// The caller holds a reference.
+        pub unsafe fn sole(this: *const Refcount) -> bool {
+            // SAFETY: live: the caller's reference.
+            let (count, owner) = unsafe { (Self::count_of(this), Self::owner_of(this)) };
+            count.load(Ordering::Acquire) == 1 && owner.load(Ordering::Acquire).is_null()
         }
     }
 }
 use rc::{MAX, Refcount};
 
-/// The count of the live object at `this`.
-///
-/// # Safety
-///
-/// `this` is live for `'a`, and starts with its `Refcount`.
-unsafe fn rc<'a, T>(this: NonNull<T>) -> &'a Refcount {
-    // SAFETY: the caller's contract; the count is all atomics.
-    unsafe { this.cast::<Refcount>().as_ref() }
+/// The count of the object at `this`, as a pointer: every counted type
+/// here starts with its `Refcount` (`#[repr(C)]`).
+fn rc<T>(this: NonNull<T>) -> *const Refcount {
+    this.as_ptr().cast_const().cast()
 }
 
 /// The `CCounted` methods over a leading `Refcount`.
@@ -143,19 +177,19 @@ macro_rules! counted_by_refcount {
     () => {
         unsafe fn c_init(this: NonNull<Self>) {
             // SAFETY: the caller has the object to itself.
-            unsafe { rc(this).init() }
+            unsafe { Refcount::init(rc(this)) }
         }
         unsafe fn c_up_ref(this: NonNull<Self>) -> bool {
             // SAFETY: a live object (the caller's reference).
-            unsafe { rc(this).inc() }
+            unsafe { Refcount::inc(rc(this)) }
         }
         unsafe fn c_down_ref(this: NonNull<Self>) -> bool {
             // SAFETY: as above.
-            unsafe { rc(this).dec() }
+            unsafe { Refcount::dec(rc(this)) }
         }
         unsafe fn c_is_sole_owner(this: NonNull<Self>) -> bool {
             // SAFETY: as above.
-            unsafe { rc(this) }.sole()
+            unsafe { Refcount::sole(rc(this)) }
         }
     };
 }
@@ -212,7 +246,7 @@ mod c {
     /// What C's inline macro does to the field directly (`SEQ_CST`).
     pub unsafe fn refcount_inc(db: *mut Odb) {
         // SAFETY: C's caller holds a reference.
-        unsafe { (*db).rc.c_inc() };
+        unsafe { Refcount::c_inc(&raw const (*db).rc) };
     }
 }
 
