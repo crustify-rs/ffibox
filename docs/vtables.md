@@ -96,7 +96,7 @@ comments only: an attribute such as `#[target_feature]` would add an
 obligation to calling the slot that C cannot see. The macro is preferred
 because it ties every slot to its table and state by construction. It is kept
 to what an `unsafe impl` written by hand would contain
-([G20](goals.md#g20-simple-macros)).
+([G19](goals.md#g19-simple-macros)).
 
 ### (b) Slots that hand out C memory, and the table's own owner
 

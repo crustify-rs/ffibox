@@ -1,13 +1,19 @@
 # Goals
 
-ffibox is one vocabulary for every value that crosses the boundary between
-Rust and a foreign language, in both directions:
+ffibox is one vocabulary for every value whose memory, layout or lifetime
+Rust shares with a foreign language, in both directions:
 
 - **inbound**: memory the foreign side allocates, frees, copies, refcounts or
   locks, held from Rust;
-- **outbound**: memory Rust owns that the foreign side holds, calls or reads.
+- **outbound**: memory Rust owns that the foreign side holds, calls, reads or
+  writes, including Rust objects whose layout it knows and Rust statics it
+  names;
+- **the call boundary**: the arguments and results of a foreign function Rust
+  calls, and of a Rust function the foreign side calls (an export).
 
-The foreign language is C, as G8 states.
+It serves bindings, safe Rust over foreign code that stays, and ports, Rust
+that replaces foreign code and keeps its ABI for the code that remains and
+for its consumers. The foreign side meets Rust at the C ABI, as G8 states.
 
 Two parties use each primitive:
 
@@ -17,10 +23,16 @@ Two parties use each primitive:
 - a **consumer** uses it through its safe API, without knowing whether C or
   Rust sits behind it.
 
-ffibox is needed only where the foreign side **aliases** a value: keeps a
-pointer to it beyond a call, frees it, or shares its refcount or lock. A
-pointer passed down for the duration of one call, and memory the foreign side
-never sees, are plain Rust: `&mut`, `&`, `Box`, `Vec`, `Arc`.
+ffibox is needed where the foreign side **aliases** a value: keeps a pointer
+to it beyond a call, frees it, shares its refcount or lock, or writes it while
+Rust holds it. It is also needed where the foreign side knows a value's
+layout, and at the call boundary, where a pointer becomes a reference.
+
+A pointer lent for one call becomes a plain `&` or `&mut` only if nothing
+else reaches its target while the reference lives: no other argument, no
+callback, no other thread, and no free made by the call itself. Memory the
+foreign side neither aliases nor lays out is plain Rust: `&mut`, `&`, `Box`,
+`Vec`, `Arc`.
 
 The goals below are grouped by what they serve. Each states what it means and
 how it is checked.
@@ -137,40 +149,38 @@ Either side can produce any ownership shape, and either can consume it.
 *Checked by:* every inbound primitive names its outbound counterpart, or
 states why it has none.
 
-### G7. Composable axes
+### G7. Typed exports
 
-These are independent axes:
+A Rust function the foreign side calls, an export, receives its arguments as
+types with the pointer's ABI that state what the caller guarantees:
 
-- shape (one object, a run, a string);
-- policy (what release, copy and construction mean);
-- sharing (sole or counted);
-- lock scope;
-- thread affinity;
-- address sensitivity;
-- element ownership.
+- a string;
+- an out-parameter to write;
+- an object borrowed for the call;
+- a run of elements to read, or to fill from uninitialised memory;
+- a callback with its context.
 
-Primitives compose along them: owners are elements of vectors, fields of
-`#[repr(C)]` structs and contents of guards. No combination has a primitive of
-its own.
+Its body converts no pointer by hand. A panic becomes the routine's own
+failure value (G11). An export that replaces a foreign routine makes the
+checks the routine made, in the same order, so that the same invalid argument
+yields the same result.
 
-*Checked by:* a new combination of axes needs no new primitive.
+*Checked by:* an export's body has no `unsafe` for its arguments, and each
+argument type has a compile-fail test for the misuse it rules out.
 
-### G8. C first
+### G8. The C ABI
 
-ffibox targets C. Its names are C's: the `C`-prefixed owners, `c_drop`,
-`as_c_ptr`. So are the conventions its primitives encode: `malloc` and `free`,
-refcounts, C locks, NUL-terminated strings, status codes and `errno`,
-callbacks with a context pointer.
+ffibox serves the C ABI and the conventions of APIs at that ABI: allocator
+pairs, refcounts, locks, NUL-terminated strings, status codes and `errno`,
+callbacks with a context pointer. Any language that exports or imports
+through the C ABI is served by them, and ffibox's names are the ABI's:
+`C`-prefixed owners, `c_drop`, `as_c_ptr`.
 
-No primitive is shaped for a language ffibox does not serve yet: C++'s move
-constructors, exceptions and smart pointers, and Go's pointer-passing rules,
-are out of scope for now.
+Conventions of one language behind the ABI, such as C++ exceptions or Go's
+pointer-passing rules, are out of scope until a binding needs them. They are
+then added beside these, not folded into them.
 
-When another language is taken on, its conventions are added beside C's
-rather than folded into them. What the two share is factored out then, from
-what they actually share, without changing what C bindings write.
-
-*Checked by:* every primitive serves a convention a C API uses.
+*Checked by:* every primitive serves a convention an API at the C ABI uses.
 
 ## Safety
 
@@ -181,7 +191,7 @@ code. Each hazard is excluded by a primitive or a producer's contract:
 
 | hazard | excluded by |
 |--------|-------------|
-| aliasing a foreign object through a reference | handles: no Rust reference over foreign memory that anything may write or free while the reference lives (C, another handle, another thread), and no `&mut` over memory anything else may access |
+| aliasing memory the foreign side can reach | for a foreign-defined layout, handles: no Rust reference over memory that anything may write or free while the reference lives (the foreign side, another handle, another thread), and no `&mut` over memory anything else may access; for a Rust-defined type, `&T` only where every byte the foreign side or another thread writes while `&T` lives is an atomic or behind `UnsafeCell`, and nothing frees it while a reference lives, including a reference argument, which must stay valid until its function returns |
 | moving an address-sensitive object | pinned owners; inline values only for movable layouts |
 | null dereference | `NonNull`, `Option` with the null niche |
 | invalid values (`_Bool`, `char`, out-of-range enums) | plain-element markers, open enums |
@@ -192,7 +202,7 @@ code. Each hazard is excluded by a primitive or a producer's contract:
 | use after free, outliving a keepalive | lifetimes, counted references |
 | double release, release by the wrong routine | policies pairing release with allocation |
 | data races | `Send` / `Sync` opt-in, lock scopes |
-| re-entrancy through callbacks | callback arguments typed by the access the caller holds |
+| re-entry through callbacks or exports | callback arguments typed by the access the caller holds; no reference held across a call that can reach the same object; where one must be, re-entry is refused or serialised |
 | unwinding or `longjmp` across the boundary | panic barriers, documented non-local exits |
 
 Leaks are not undefined behaviour and are not excluded, but no primitive leaks
@@ -208,7 +218,8 @@ Every default is the conservative one:
 - foreign types are neither `Send` nor `Sync`;
 - adopting a pointer is `unsafe`;
 - no status code is discarded;
-- an unknown fact selects the more restrictive primitive.
+- an unknown fact selects the more restrictive primitive, and establishing
+  the fact later relaxes it.
 
 Every relaxation is an explicit opt-in that states its justification.
 
@@ -236,6 +247,10 @@ implementation at a time, without reasoning about the whole program. The
 distinct obligations are few and listed, so that auditing a binding is a
 checklist.
 
+Each fact a binding relies on, such as ownership, nullability, keepalive or
+thread affinity, is visible in its types, so that a reviewer or a tool
+recovers the facts from the binding.
+
 *Checked by:* every `unsafe impl` and `unsafe` block maps to one listed
 obligation.
 
@@ -252,18 +267,9 @@ Generic code is bound by traits rather than raw pointers:
 *Checked by:* compile-fail tests binding a routine, an element or an erased
 value to the wrong type.
 
-### G14. A small, verified trusted base
-
-ffibox's own unsafe code is minimal. It is exercised under Miri with strict
-provenance, the sanitizers and BorrowSanitizer. Each misuse ffibox claims to
-prevent has a compile-fail test. ffibox's guarantees are only as strong as
-this base.
-
-*Checked by:* the test suite runs clean under each instrument.
-
 ## Cost
 
-### G15. Zero overhead
+### G14. Zero overhead
 
 A primitive costs what the equivalent raw code costs. With a stateless policy,
 an owner is pointer-sized and a handle is one pointer. Runtime state is
@@ -272,18 +278,20 @@ foreign contract does not require.
 
 *Checked by:* compile-time size assertions, and benchmarks against raw calls.
 
-### G16. ABI fidelity
+### G15. ABI fidelity
 
 A primitive that stands in for a foreign value has a guaranteed ABI:
 
 - `#[repr(transparent)]` where it crosses by value;
 - the null pointer as `None`;
-- the foreign layout where the foreign side reads its fields.
+- the foreign layout where the foreign side reads or writes its fields.
 
-*Checked by:* compile-time size and alignment assertions against the foreign
-layout.
+*Checked by:* size, alignment and field offsets asserted against what the C
+compiler computes for each supported target, never against Rust's own
+numbers. The assertions cover shared prefixes, atomics and cells standing in
+for foreign fields, bitfields and statics.
 
-### G17. Stable Rust, `no_std`, no hidden allocation
+### G16. Stable Rust, `no_std`, no hidden allocation
 
 ffibox builds on stable Rust, with a declared minimum version, and in
 `no_std`. It allocates only through a policy or an allocator the consumer
@@ -295,25 +303,19 @@ variadic functions, is documented as unsupported.
 
 ## Production
 
-### G18. Producer-agnostic and deterministic
+### G17. Patterns that recur across projects
 
-The primitives do not depend on who produces a binding. A binding follows from
-facts about each foreign item: ownership and transfer, access, nullability,
-cardinality, keepalive, lifecycle role, thread affinity and address
-sensitivity.
+A primitive captures an interop pattern that recurs across APIs, not one
+project's convention. A pattern seen in one project stays in that project's
+crate until another project needs it.
 
-The choice of primitive is a function of those facts. It is documented as a
-table that a human reads, an agent follows and a tool implements. A fact is
-visible in the binding's types, so that a reviewer or a tool recovers the
-facts from the binding.
+A combination of existing primitives is composed from them, not given a
+primitive of its own: owners are elements of vectors, fields of `#[repr(C)]`
+structs and contents of guards.
 
-A fact no producer has established selects the conservative primitive, as G10
-describes, so that a partial analysis still yields a sound binding, and
-establishing the fact later relaxes it.
+*Checked by:* each primitive names at least two independent APIs that use it.
 
-*Checked by:* two producers given the same facts emit the same binding.
-
-### G19. Stable through migration
+### G18. Stable through migration
 
 A consumer's code does not change when the producer behind a primitive
 changes: a C allocator replaced by Rust's, a C implementation by a Rust
@@ -322,7 +324,7 @@ module at a time.
 
 *Checked by:* a ported module's consumers compile unchanged against the port.
 
-### G20. Simple macros
+### G19. Simple macros
 
 Macros mint only what traits and generics cannot: layout types, handles, and
 the impls that name a foreign routine. Everything else is ordinary generic
@@ -338,11 +340,40 @@ the invocation, not inside the expansion.
 *Checked by:* each macro's expansion reads as the impl a producer would write
 by hand, and fits on a screen.
 
+## Verification
+
+### G20. A small trusted base
+
+ffibox's own unsafe code is minimal and kept in few places, and each unsafe
+block states which listed obligation it discharges (G12). ffibox's
+guarantees are only as strong as this base.
+
+*Checked by:* the lints that require safety comments on unsafe code are
+enforced.
+
+### G21. Every claim tested
+
+Each claim ffibox makes has a test that fails if the claim is false:
+
+- each misuse ffibox claims to prevent has a compile-fail test;
+- the tests run under Miri with strict provenance, under both borrow models,
+  with many seeds for concurrent primitives, and on big-endian and 32-bit
+  targets;
+- they run under the address, undefined-behaviour and thread sanitizers, and
+  under BorrowSanitizer;
+- each layout is checked against the C compiler for the target (G15).
+
+A test compares Rust with the C compiler, the foreign routine or an
+instrument, never with Rust's own numbers.
+
+*Checked by:* the test matrix runs clean under each instrument before a
+change lands.
+
 ## Non-goals
 
 - **Finding the facts.** ffibox records ownership facts in types; it does not
   infer them. Inference is the producer's: a human, an agent or an analysis.
 - **Generating bindings.** ffibox is what bindings are written in, not a
   generator. Its regularity serves generators.
-- **Memory the foreign side does not alias.** That is standard Rust's.
-- **Foreign languages other than C, for now.** See G8.
+- **Memory the foreign side neither aliases nor lays out.** That is standard
+  Rust's.
