@@ -171,9 +171,21 @@ a primitive, Rust can offer through it.
 *Checked by:* every inbound primitive names its outbound counterpart, or
 states why it has none.
 
+### G11. Documented for the developer
+
+A primitive's documentation speaks to the developer who uses it, as "you",
+as the [Google developer documentation style guide](https://developers.google.com/style)
+asks. A sentence
+carries one or two facts, and parallel rules and obligations are lists. Each
+primitive opens with an example, and every statement holds for the source:
+its signatures, its safety sections and its tests.
+
+*Checked by:* every example compiles and runs as a doctest, and a review
+compares each statement with the source before a change lands.
+
 ## Admission
 
-### G11. Recurring, not composable
+### G12. Recurring, not composable
 
 A primitive captures a pattern that recurs across APIs, not one project's
 convention. A pattern seen in one project stays in that project's crate until
@@ -185,7 +197,7 @@ defined once and states how it relates to the terms beside it.
 *Checked by:* each primitive names at least two independent APIs that use it,
 and each term is defined once.
 
-### G12. Portable
+### G13. Portable
 
 ffibox builds on stable Rust, with a declared minimum version, and in
 `no_std`. It allocates only through an allocator the consumer chose, and
