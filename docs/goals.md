@@ -56,7 +56,7 @@ but no primitive leaks except by an explicit surrender.
 interface cannot reach it, and a compile-fail test where the type system
 rejects the misuse.
 
-### G2. Obligations stated and local
+### G2. Unsafe obligations stated and local
 
 `unsafe` stays with producers, and ffibox's own unsafe code is limited to what
 safe Rust cannot express. Every unsafe trait, function and block states a
