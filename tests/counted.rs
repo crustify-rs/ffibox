@@ -26,7 +26,7 @@ use ffibox::{CAtomicOwner, CCounted, CShareable, CShared};
 mod rc {
     use core::ffi::c_void;
     use core::ptr;
-    use core::sync::atomic::{AtomicI32, AtomicPtr, Ordering, fence};
+    use core::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
 
     /// The count and the owner, both atomic; no `Default`, no `Clone`.
     #[repr(C)]
@@ -145,7 +145,12 @@ mod rc {
             if unsafe { Self::count_of(this) }.fetch_sub(1, Ordering::Release) != 1 {
                 return false;
             }
-            fence(Ordering::Acquire);
+            // `Arc`'s acquire, as a load of the count rather than a fence:
+            // equivalent here, and visible to ThreadSanitizer, which does
+            // not model fences (std's `Arc` does the same under it).
+            // SAFETY: the count is spent, but the object is not freed
+            // until this returns: the atomic is still live.
+            let _ = unsafe { Self::count_of(this) }.load(Ordering::Acquire);
             // SAFETY: the count is spent: nothing but an owner reaches the
             // object, and an owner keeps it alive while it is set.
             unsafe { Self::owner_of(this) }
@@ -791,4 +796,51 @@ fn layout() {
         size_of::<CAtomicOwner<CShared<Odb>>>(),
         size_of::<*mut Odb>()
     );
+}
+
+/// The repository pattern of the TSan report: one thread publishes the odb
+/// (`try_insert_target`, a compare-and-swap on the field) while others read
+/// it (`get_target`). Every access to the field is atomic: the readers load
+/// the pointer and borrow the odb it points to, never the field's bytes
+/// (Miri checks it; under ThreadSanitizer this test reports nothing).
+#[test]
+fn published_and_read_concurrently_through_the_target() {
+    static FREED: AtomicUsize = AtomicUsize::new(0);
+    let slot: CAtomicOwner<CShared<Odb>> = CAtomicOwner::new();
+    std::thread::scope(|s| {
+        for _ in 0..3 {
+            s.spawn(|| {
+                let odb: &Odb = loop {
+                    if let Some(o) = slot.get_target() {
+                        break o;
+                    }
+                    std::thread::yield_now();
+                };
+                odb.read();
+            });
+        }
+        for _ in 0..2 {
+            s.spawn(|| {
+                let won = match slot.try_insert_target(Odb::new(&FREED)) {
+                    Ok(o) => o,
+                    Err((o, loser)) => {
+                        drop(loser);
+                        o
+                    }
+                };
+                won.read();
+                let again = slot.get_or_init_target(|| Odb::new(&FREED));
+                assert!(core::ptr::eq(won, again));
+            });
+        }
+    });
+    // One of the two published, the other was dropped.
+    assert_eq!(FREED.load(Ordering::Relaxed), 1);
+    assert_eq!(slot.get_target().unwrap().reads.load(Ordering::Relaxed), 5);
+    assert!(core::ptr::eq(
+        slot.get_target().unwrap(),
+        slot.as_ptr().cast_const()
+    ));
+    drop(slot);
+    assert_eq!(FREED.load(Ordering::Relaxed), 2);
 }

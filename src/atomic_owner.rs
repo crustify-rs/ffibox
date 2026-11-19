@@ -161,6 +161,87 @@ unsafe impl<T: crate::counted::CCounted> CPtrOwner for crate::counted::CShared<T
     }
 }
 
+/// A [`CPtrOwner`] whose shared access is its pointee: what the field's
+/// `*_target` methods lend, read through the pointer the field holds
+/// (loaded atomically) rather than through a reference to the field.
+///
+/// Implemented for `Box<T>` (`View = T`), [`CShared<T>`](crate::CShared)
+/// when `T` is [`CShareable`](crate::CShareable) (`View = T`, what it
+/// derefs to) and [`CStrBox`] (`View = CStr`). Not for [`CBox`] or
+/// [`CArc`], whose objects are reached through handles, never through a
+/// reference:
+///
+/// ```compile_fail,E0599
+/// # use ffibox::{CAtomicOwner, CBox, define_ctype, impl_cdrop};
+/// # #[repr(C)] pub struct x_st { v: u8 }
+/// # define_ctype!(X, XRef, XMut, x_st);
+/// # #[derive(Clone, Copy, Debug, Default)] pub struct XFree;
+/// # unsafe fn x_free(_: *mut x_st) {}
+/// # impl_cdrop!(XFree, X, x_free);
+/// let f = CAtomicOwner::<CBox<X, XFree>>::new();
+/// let _ = f.get_target();
+/// ```
+///
+/// # Safety
+///
+/// For a pointer `ptr` that [`into_raw_ptr`](CPtrOwner::into_raw_ptr)
+/// returned, of an owner that stays held (not adopted back, not dropped)
+/// and is only shared-borrowed for `'a`: [`view`](Self::view)`(ptr)` is
+/// valid for `'a`, is what the owner's own shared access (its `Deref`)
+/// gives, and reads only memory the owner points to, never the place the
+/// pointer is stored in.
+pub unsafe trait CPtrDeref: CPtrOwner {
+    /// What a shared borrow of the owner gives.
+    type View: ?Sized;
+
+    /// The view of the owner whose pointer is `ptr`.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` came from [`into_raw_ptr`](CPtrOwner::into_raw_ptr), and that
+    /// owner stays held and is not written (only shared-borrowed) for `'a`.
+    unsafe fn view<'a>(ptr: NonNull<Self::Target>) -> &'a Self::View;
+}
+
+// SAFETY: a held `Box<T>` owns a live `T` at its pointer, which its `Deref`
+// gives; while the box is only shared-borrowed nothing writes it.
+#[cfg(feature = "alloc")]
+unsafe impl<T> CPtrDeref for alloc::boxed::Box<T> {
+    type View = T;
+    #[inline]
+    unsafe fn view<'a>(ptr: NonNull<T>) -> &'a T {
+        // SAFETY: the held box's `T` (this fn's contract), live and not
+        // written for `'a`.
+        unsafe { ptr.as_ref() }
+    }
+}
+
+// SAFETY: a held `CShared<T>` keeps the object live, and `CShareable`
+// makes a `&T` sound while it is shared (its `Deref` gives exactly that).
+#[cfg(feature = "alloc")]
+unsafe impl<T: crate::counted::CShareable> CPtrDeref for crate::counted::CShared<T> {
+    type View = T;
+    #[inline]
+    unsafe fn view<'a>(ptr: NonNull<T>) -> &'a T {
+        // SAFETY: a live object, kept so by the held owner for `'a` (this
+        // fn's contract), which a shared reference may cover while it is
+        // shared (`CShareable`).
+        unsafe { ptr.as_ref() }
+    }
+}
+
+// SAFETY: a held `CStrBox` owns a live, NUL-terminated string that nothing
+// writes (the type is read-only), which its `Deref` gives as a `CStr`.
+unsafe impl<D: CDrop<core::ffi::c_char> + Default> CPtrDeref for CStrBox<D> {
+    type View = core::ffi::CStr;
+    #[inline]
+    unsafe fn view<'a>(ptr: NonNull<core::ffi::c_char>) -> &'a core::ffi::CStr {
+        // SAFETY: the held box's string (this fn's contract): live and
+        // NUL-terminated, unwritten for `'a`.
+        unsafe { core::ffi::CStr::from_ptr(ptr.as_ptr()) }
+    }
+}
+
 /// An owner `O` held in a pointer field that C reads, and fills with
 /// compare-and-swap: `AtomicPtr<O::Target>` holding an `O`, with
 /// `OnceLock<O>`'s methods for filling it once.
@@ -168,6 +249,8 @@ unsafe impl<T: crate::counted::CCounted> CPtrOwner for crate::counted::CShared<T
 /// | Method | Counterpart | Does |
 /// |---|---|---|
 /// | [`get`](Self::get) | `OnceLock::get` | borrows the value, `None` while empty |
+/// | [`try_insert_ptr`](Self::try_insert_ptr) | — | fills an empty field, lending nothing: the pointers, as [`as_ptr`](Self::as_ptr) |
+/// | [`get_target`](Self::get_target), [`try_insert_target`](Self::try_insert_target), [`get_or_init_target`](Self::get_or_init_target), [`get_or_try_init_target`](Self::get_or_try_init_target) | — | the same, lending the owner's pointee (`O: CPtrDeref`) instead of the owner |
 /// | [`try_insert`](Self::try_insert), [`set`](Self::set) | `OnceLock::try_insert`, `OnceLock::set` | fill an empty field; a full one hands the value back |
 /// | [`get_or_init`](Self::get_or_init), [`get_or_try_init`](Self::get_or_try_init) | `OnceLock::get_or_init`, `get_or_try_init` | create on first use; the loser of a race is dropped |
 /// | [`replace`](Self::replace) (`unsafe`) | `AtomicPtr::swap` | replace a value that may be lent |
@@ -179,6 +262,28 @@ unsafe impl<T: crate::counted::CCounted> CPtrOwner for crate::counted::CShared<T
 /// compare-and-swap does. Where creating a value has side effects that the
 /// loser must undo first (an owner it set), use
 /// [`try_insert`](Self::try_insert), which hands the loser back.
+///
+/// **Fields shared between threads: use the `*_target` methods.** [`get`],
+/// [`try_insert`], [`get_or_init`] and [`get_or_try_init`] lend `&O`, a
+/// reference to the field's own storage: reading through it (an owner's
+/// `Deref` reads its pointer) reads the `AtomicPtr`'s bytes non-atomically,
+/// while another thread may run a compare-and-swap on them in
+/// [`try_insert`]. On a full field that compare-and-swap fails, and a
+/// failed one is a load in the Rust (C++20) memory model, so this is not a
+/// data race there; but ThreadSanitizer models every compare-and-swap as a
+/// write and reports it, and the code gains nothing from the reference. The
+/// `*_target` methods (for an `O: CPtrDeref`) load the pointer atomically
+/// and lend what it points to, so no reference to the field is ever formed
+/// while other threads may write it; for other owners, [`as_ptr`] and
+/// [`try_insert_ptr`] give the pointer.
+///
+/// [`as_ptr`]: Self::as_ptr
+/// [`try_insert_ptr`]: Self::try_insert_ptr
+///
+/// [`get`]: Self::get
+/// [`try_insert`]: Self::try_insert
+/// [`get_or_init`]: Self::get_or_init
+/// [`get_or_try_init`]: Self::get_or_try_init
 ///
 /// All-zero bytes are an empty field, as a NULL pointer is: a struct that
 /// C or Rust `calloc`s starts with its `CAtomicOwner` fields empty.
@@ -332,6 +437,31 @@ impl<O: CPtrOwner> CAtomicOwner<O> {
         }
     }
 
+    /// [`try_insert`](Self::try_insert), lending nothing: `Ok` with the
+    /// inserted owner's pointer, or `Err` with the held one's and `value`
+    /// back. For owners whose object is reached through a handle or a
+    /// pointer (and which are not [`CPtrDeref`]); the pointer is valid
+    /// while the field holds its owner, as [`as_ptr`](Self::as_ptr)'s is.
+    #[allow(clippy::type_complexity)] // `try_insert`'s shape, with pointers
+    pub fn try_insert_ptr(&self, value: O) -> Result<NonNull<O::Target>, (NonNull<O::Target>, O)> {
+        let new = value.into_raw_ptr();
+        match self.ptr.compare_exchange(
+            ptr::null_mut(),
+            new.as_ptr(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(new),
+            Err(cur) => {
+                // SAFETY: `new` was not published: the owner is still ours.
+                let value = unsafe { O::from_raw_ptr(new) };
+                // SAFETY: the compare-and-swap failed on a full field, so
+                // `cur` is its non-null value.
+                Err((unsafe { NonNull::new_unchecked(cur) }, value))
+            }
+        }
+    }
+
     /// Fill the field if it is empty, or hand `value` back.
     #[inline]
     pub fn set(&self, value: O) -> Result<(), O> {
@@ -419,6 +549,86 @@ impl<O: CPtrOwner> CAtomicOwner<O> {
     #[must_use]
     pub fn as_ptr(&self) -> *mut O::Target {
         self.ptr.load(Ordering::Acquire)
+    }
+}
+
+impl<O: CPtrDeref> CAtomicOwner<O> {
+    /// The pointee of the owner at the non-null `p`, borrowed for `&self`.
+    ///
+    /// # Safety
+    ///
+    /// As [`lend`](Self::lend).
+    #[inline]
+    unsafe fn lend_target(&self, p: *mut O::Target) -> &O::View {
+        // SAFETY: `p` is the field's current value (the contract): the
+        // pointer of an owner the field holds, which stays held and is
+        // only shared-borrowed while `&self` lives (only `replace`, whose
+        // caller ends every borrow first, and `&mut self` methods take it
+        // out). The view reads the pointee, not the field.
+        unsafe { O::view(NonNull::new_unchecked(p)) }
+    }
+
+    /// The owner's pointee (what its `Deref` gives), borrowed while `self`
+    /// is; `None` while the field is empty. Unlike [`get`](Self::get), it
+    /// forms no reference to the field: the pointer is loaded atomically
+    /// (see the type's documentation).
+    #[inline]
+    pub fn get_target(&self) -> Option<&O::View> {
+        let p = self.ptr.load(Ordering::Acquire);
+        if p.is_null() {
+            None
+        } else {
+            // SAFETY: the field's value, read with `Acquire`.
+            Some(unsafe { self.lend_target(p) })
+        }
+    }
+
+    /// [`try_insert`](Self::try_insert), lending the pointee: `Ok` with
+    /// the inserted value's, or `Err` with the held value's and `value`
+    /// back.
+    pub fn try_insert_target(&self, value: O) -> Result<&O::View, (&O::View, O)> {
+        let new = value.into_raw_ptr();
+        match self.ptr.compare_exchange(
+            ptr::null_mut(),
+            new.as_ptr(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            // SAFETY: this thread wrote `new` into the field.
+            Ok(_) => Ok(unsafe { self.lend_target(new.as_ptr()) }),
+            Err(cur) => {
+                // SAFETY: `new` was not published: the owner is still ours.
+                let value = unsafe { O::from_raw_ptr(new) };
+                // SAFETY: the full field's value, read with `Acquire`.
+                Err((unsafe { self.lend_target(cur) }, value))
+            }
+        }
+    }
+
+    /// [`get_or_init`](Self::get_or_init), lending the pointee.
+    #[inline]
+    pub fn get_or_init_target(&self, f: impl FnOnce() -> O) -> &O::View {
+        match self.get_or_try_init_target(|| Ok::<O, core::convert::Infallible>(f())) {
+            Ok(v) => v,
+            Err(e) => match e {},
+        }
+    }
+
+    /// [`get_or_try_init`](Self::get_or_try_init), lending the pointee.
+    pub fn get_or_try_init_target<E>(
+        &self,
+        f: impl FnOnce() -> Result<O, E>,
+    ) -> Result<&O::View, E> {
+        if let Some(v) = self.get_target() {
+            return Ok(v);
+        }
+        match self.try_insert_target(f()?) {
+            Ok(v) => Ok(v),
+            Err((winner, loser)) => {
+                drop(loser);
+                Ok(winner)
+            }
+        }
     }
 }
 

@@ -307,9 +307,10 @@ impl<T: CGuarded<Scope = LockFields>, D: CDrop<T>> CArc<T, D> {
     /// A [`CGuardedAll`] type ([`LockWhole`]) is rejected at compile time:
     /// its `Locked` handle is `Mut`, and other clones still reach
     /// [`as_ref`](Self::as_ref) unlocked. Such an object belongs in a
-    /// [`CGuardedRef`].
+    /// [`CGuardedRef`]. (The error is E0271 on stable and E0599 on current
+    /// nightly, whose Miri runs the doctests: no code is pinned.)
     ///
-    /// ```compile_fail,E0271
+    /// ```compile_fail
     /// # use core::ptr::NonNull;
     /// # use ffibox::{define_ctype, impl_cguarded, CArc, CDrop};
     /// # #[repr(C)] pub struct reg_st { x: u8 }

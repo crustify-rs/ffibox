@@ -303,6 +303,36 @@ fn holds_every_pointer_owner() {
 }
 
 #[test]
+fn targets_of_box_and_cstrbox() {
+    let bx = CAtomicOwner::<Box<Vec<u8>>>::new();
+    assert!(bx.get_target().is_none());
+    let v: &Vec<u8> = bx.get_or_init_target(|| Box::new(vec![7]));
+    assert_eq!(*v, [7]);
+    assert!(core::ptr::eq(v, bx.as_ptr().cast_const()));
+    let (held, back) = bx.try_insert_target(Box::new(vec![8])).unwrap_err();
+    assert!(core::ptr::eq(held, v));
+    assert_eq!(*back, [8]);
+
+    // The pointer variant, for any owner.
+    let a = CAtomicOwner::<OdbArc>::new();
+    let p = a.try_insert_ptr(open_odb(9)).unwrap();
+    let (held, loser) = a.try_insert_ptr(open_odb(10)).unwrap_err();
+    assert_eq!(held, p);
+    assert_eq!(p.as_ptr(), a.as_ptr());
+    drop(loser);
+
+    let st = CAtomicOwner::<CStrBox<StrFree>>::new();
+    let s: &CStr = st.try_insert_target(make_str(c"gitdir")).unwrap();
+    assert_eq!(s, c"gitdir");
+    assert_eq!(st.get_target(), Some(c"gitdir"));
+    let e: Result<&CStr, ()> = st.get_or_try_init_target(|| Err(()));
+    assert_eq!(e, Ok(c"gitdir"));
+    let empty = CAtomicOwner::<CStrBox<StrFree>>::new();
+    assert_eq!(empty.get_or_try_init_target(|| Err(1)), Err(1));
+    assert!(empty.get_target().is_none());
+}
+
+#[test]
 fn a_panicking_initialiser_leaves_the_field_empty() {
     let slot = CAtomicOwner::<Box<u32>>::new();
     let r = std::panic::catch_unwind(|| {

@@ -42,7 +42,7 @@
 //! | [`CCallback`] / [`CCallbackBox`] | either: a callback called from Rust and handed to C alike |
 //! | [`CTable<T, S>`] / [`impl_cvtable!`] | Rust state behind a C table of function pointers C calls into, its slots minted from the trait the state implements; [`impl_clocal_handles!`] lends its handles over any state where they stay on their thread |
 //! | [`CShared<T>`] / [`CCounted`] | one counted reference to a Rust-allocated object whose count is its own field, which C also changes: `Arc<T>` over an intrusive count; `&T` when [`CShareable`] |
-//! | [`CAtomicOwner<O>`] / [`CPtrOwner`] | a C pointer field holding a one-pointer owner, filled once with compare-and-swap: `OnceLock<O>` with C's layout |
+//! | [`CAtomicOwner<O>`] / [`CPtrOwner`] / [`CPtrDeref`] | a C pointer field holding a one-pointer owner, filled once with compare-and-swap: `OnceLock<O>` with C's layout; its `*_target` methods lend the pointee, for fields shared between threads |
 //! | [`CBits<W>`] / [`CBitfield<W>`] / [`CAtomicBitfield<W>`] | C bitfields read and written by field, named once in C's declaration order |
 //! | [`RustAlloc`] | the policy over Rust's global allocator, for what Rust allocates and C frees |
 //! | [`CAllocator<P>`] / [`impl_clenalloc!`] | a C allocation family (`malloc` / `realloc` / `free`) as the standard `Allocator`, for `Box<T, CAllocator<P>>` and `Vec<T, CAllocator<P>>` over memory C frees, and as a storage-only policy; [`CBox`] and [`CVec`] convert to and from them |
@@ -165,7 +165,7 @@ pub struct DocExamples;
 
 // Re-export the primary items at the crate root for convenience.
 pub use crate::allocator::CAllocator;
-pub use crate::atomic_owner::{CAtomicOwner, CPtrOwner};
+pub use crate::atomic_owner::{CAtomicOwner, CPtrDeref, CPtrOwner};
 pub use crate::bitfield::{CAtomicBitfield, CBitfield, CBits};
 pub use crate::callback::{CCallback, CClosure, CFn, CFnBox};
 #[cfg(feature = "alloc")]

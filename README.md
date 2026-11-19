@@ -220,6 +220,8 @@ MIRIFLAGS=-Zmiri-strict-provenance cargo +nightly miri test
 MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-tree-borrows" cargo +nightly miri test
 MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-many-seeds=0..16" \
     cargo +nightly miri test --test counted --test atomic_owner --test bitfield
+RUSTFLAGS=-Zsanitizer=thread cargo +nightly test -Zbuild-std \
+    --target x86_64-unknown-linux-gnu --test counted --test atomic_owner
 for t in s390x-unknown-linux-gnu powerpc64-unknown-linux-gnu i686-unknown-linux-gnu \
          aarch64-unknown-linux-gnu armv7-unknown-linux-gnueabihf x86_64-pc-windows-msvc; do
     MIRIFLAGS=-Zmiri-strict-provenance \

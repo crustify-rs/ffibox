@@ -11,6 +11,22 @@ Changes on `devel` since 0.1.1.
 
 ### Added
 
+- **`CAtomicOwner::*_target` and `CPtrDeref`** (`atomic_owner` module).
+  `get_target`, `try_insert_target`, `get_or_init_target` and
+  `get_or_try_init_target` lend the owner's pointee (`&O::View`: `T` for
+  `Box<T>` and for `CShared<T>` with `T: CShareable`, `CStr` for
+  `CStrBox`) instead of `&O`, a reference to the field's own storage.
+  They load the pointer atomically, so a field that one thread fills with
+  compare-and-swap while others read it is never read non-atomically: the
+  `&O` methods are not a data race in the Rust memory model (a failed
+  compare-and-swap is a load) but ThreadSanitizer, which models every
+  compare-and-swap as a write, reports them. Use the `*_target` methods for
+  fields shared between threads; `try_insert_ptr` (any owner) fills the
+  field and returns pointers only. `CPtrDeref` is a new unsafe trait
+  (implemented for `Box`, `CShared<T: CShareable>` and `CStrBox`; not for
+  `CBox`/`CArc`, reached through handles); nothing existing changes.
+  `tests/counted.rs` reproduces the pattern; the README matrix runs it under
+  ThreadSanitizer.
 - **Counted Rust objects whose count C shares** (`counted` module, `alloc`
   feature). `CShared<T>` is `Arc<T>` for an object Rust allocates whose
   reference count is a field of its own, which C increments and decrements
