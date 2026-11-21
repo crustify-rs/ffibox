@@ -989,8 +989,10 @@ impl<T: CCell, S> fmt::Debug for CTable<T, S> {
 ///   right only when every slot C calls unconditionally is declared below.
 /// - `fn slot(…)`: the C field, then its C arguments in C's order, the one C
 ///   passes the table in marked `@name`, which names the table pointer in the
-///   body. Only doc comments go before it: the trampoline takes no other
-///   attribute. The trampoline has exactly this signature, so a slot that
+///   body. Only doc comments go before it, then `#[doc(alias = "…")]`
+///   attributes (the name of the C function the slot stands in for, so that
+///   rustdoc's search and other tools find it): the trampoline takes no
+///   other attribute. The trampoline has exactly this signature, so a slot that
 ///   does not match the C field's type does not compile, nor, in most
 ///   tables, does one marking the wrong argument; but where another argument
 ///   has the table's type too (`cmp(ops *self, ops *other)`), the types
@@ -1210,8 +1212,9 @@ impl<T: CCell, S> fmt::Debug for CTable<T, S> {
 /// }
 /// ```
 ///
-/// A slot takes doc comments only: an attribute such as `#[target_feature]`
-/// would make calling the trampoline `unsafe` in a way C cannot see.
+/// A slot takes doc comments and doc aliases only: an attribute such as
+/// `#[target_feature]` would make calling the trampoline `unsafe` in a way C
+/// cannot see.
 ///
 /// ```compile_fail
 /// # use core::ffi::c_int;
@@ -1245,6 +1248,7 @@ macro_rules! impl_cvtable {
     // `CTable` building a `$t` over `$s` makes: without one, nothing compiles.
     (@slot $table:ident $token:ident [$($g:ident $(: $b:path)?),*] $t:ty, $s:ty;
         $(#[doc = $doc:literal])*
+        $(#[doc(alias = $alias:literal)])*
         fn $slot:ident (
             $($pre:ident : $pty:ty ,)*
             @ $this:ident
@@ -1258,6 +1262,7 @@ macro_rules! impl_cvtable {
         let _: &$crate::vtable::Install<'_, $t, $s> = &$token;
         let _: &&mut <$t as $crate::CCell>::C = &$table;
         $(#[doc = $doc])*
+        $(#[doc(alias = $alias)])*
         unsafe extern "C" fn __ffibox_slot<$($g $(: $b)?),*>(
             $($pre: $pty,)*
             $this: *mut <$t as $crate::CCell>::C
@@ -1280,6 +1285,7 @@ macro_rules! impl_cvtable {
     (@slots $table:ident $token:ident $gen:tt $t:ty, $s:ty;
         $(
             $(#[doc = $doc:literal])*
+            $(#[doc(alias = $alias:literal)])*
             fn $slot:ident $params:tt $(-> $ret:ty)? { $($body:tt)* }
         )*
         $(release $free:ident;)?
@@ -1288,7 +1294,8 @@ macro_rules! impl_cvtable {
         let _: &&mut <$t as $crate::CCell>::C = &$table;
         $(
             $crate::impl_cvtable!(@slot $table $token $gen $t, $s;
-                $(#[doc = $doc])* fn $slot $params $(-> $ret)? { $($body)* }
+                $(#[doc = $doc])* $(#[doc(alias = $alias)])*
+                fn $slot $params $(-> $ret)? { $($body)* }
             );
         )*
         $(

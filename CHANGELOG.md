@@ -120,6 +120,12 @@ Changes on `devel` since 0.1.1.
   changes: a hand-written `CLenAlloc` keeps the provided `c_realloc_len`,
   which its contract already makes sound, and yields its `CAllocator`
   as it is. See [docs/ownership.md](docs/ownership.md#box-and-vec-over-a-c-allocator).
+- **Doc aliases on `impl_cvtable!` slots.** A slot's doc comments may be
+  followed by `#[doc(alias = "…")]` attributes, which the slot's trampoline
+  carries: a port names the C function a slot stands in for, as its
+  conventions ask of every item that replaces one. The trampoline still
+  takes no other attribute. Nothing existing changes. `tests/vtable.rs`
+  (`aliases`) covers it.
 
 ### Migration from 0.1.1
 

@@ -1025,3 +1025,63 @@ fn a_release_while_slots_leave_on_other_threads() {
         }
     }
 }
+
+/// A slot's doc comments may be followed by doc aliases, the names of the C
+/// functions the slots stand in for, which the trampoline carries.
+mod aliases {
+    use core::ffi::c_int;
+
+    use ffibox::vtable::CTable;
+    use ffibox::{define_ctype, impl_cvtable};
+
+    mod ffi {
+        use core::ffi::c_int;
+
+        #[repr(C)]
+        #[derive(Default)]
+        pub struct counter {
+            pub bump: Option<unsafe extern "C" fn(*mut counter, c_int) -> c_int>,
+            pub read: Option<unsafe extern "C" fn(*mut counter) -> c_int>,
+            pub free: Option<unsafe extern "C" fn(*mut counter)>,
+        }
+    }
+
+    define_ctype!(Counter, CounterRef, CounterMut, ffi::counter);
+
+    impl_cvtable! {
+        // SAFETY: the test passes each slot its table, first, and calls only
+        // the slots declared here.
+        unsafe impl CVtable<c_int> for Counter {}
+        base = ffi::counter::default();
+        /// `counter.bump`: one doc alias.
+        #[doc(alias = "counter_bump")]
+        fn bump(@table, by: c_int) -> c_int {
+            on panic: -1,
+            on busy: -2,
+            |n: &mut c_int| {
+                *n += by;
+                *n
+            },
+        }
+        /// `counter.read`: two doc aliases.
+        #[doc(alias = "counter_read")]
+        #[doc(alias = "counter_get")]
+        fn read(@table) -> c_int {
+            on panic: -1,
+            on busy: -2,
+            |n: &c_int| *n,
+        }
+        release free;
+    }
+
+    #[test]
+    fn slots_take_doc_aliases() {
+        let p = CTable::<Counter, _>::new(40).into_c().as_ptr();
+        // SAFETY: `p` is a live table, with its slots set, released once.
+        unsafe {
+            assert_eq!(((*p).bump.unwrap())(p, 2), 42);
+            assert_eq!(((*p).read.unwrap())(p), 42);
+            ((*p).free.unwrap())(p);
+        }
+    }
+}
