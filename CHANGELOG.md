@@ -126,6 +126,13 @@ Changes on `devel` since 0.1.1.
   conventions ask of every item that replaces one. The trampoline still
   takes no other attribute. Nothing existing changes. `tests/vtable.rs`
   (`aliases`) covers it.
+- **A restricted visibility for `define_ctype!`.**
+  `define_ctype!(pub(crate) Foo, FooRef, FooMut, ffi::foo_st)` gives the
+  layout type and its two handles that visibility instead of `pub`, so
+  that a crate may mirror a C type it keeps crate-private: the `CCell`
+  impl names `$c_type` as `CCell::C`, which a `pub` type may not do for a
+  less visible one (E0446). Without a visibility the types are `pub`, as
+  before. `tests/ctype_visibility.rs` covers it.
 
 ### Migration from 0.1.1
 

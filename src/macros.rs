@@ -281,6 +281,23 @@
 /// }
 /// ```
 ///
+/// # Visibility
+///
+/// The three types are `pub` by default. A restricted visibility before the
+/// name, `pub(crate) Foo, FooRef, FooMut, ffi::foo_st`, applies to all
+/// three: a crate whose C types are crate-private (bindings it does not
+/// export) keeps them so, since `CCell::C` names `$c_type` in the impl and a
+/// `pub` type there must not name a less visible one.
+///
+/// ```
+/// mod bindings {
+///     #[repr(C)]
+///     pub(crate) struct node_st { pub(crate) id: u32 }
+/// }
+/// ffibox::define_ctype!(pub(crate) Node, NodeRef, NodeMut, bindings::node_st);
+/// # fn main() {}
+/// ```
+///
 /// # Safety
 ///
 /// The macro is safe to invoke but emits an `unsafe impl`. You assert that
@@ -291,21 +308,21 @@
 #[macro_export]
 macro_rules! define_ctype {
     (
-        @impl [$(#[$attr:meta])*] $name:ident [$($lt:lifetime),*],
+        @impl [$(#[$attr:meta])*] ($vis:vis) $name:ident [$($lt:lifetime),*],
         $rf:ident, $mt:ident, $c_type:ty, $marker:ty
     ) => {
         $(#[$attr])*
         #[repr(transparent)]
-        pub struct $name<$($lt),*>($c_type, ::core::marker::PhantomData<$marker>);
+        $vis struct $name<$($lt),*>($c_type, ::core::marker::PhantomData<$marker>);
 
         #[doc = concat!("Shared borrow of a [`", stringify!($name), "`]. `Copy`, like `&T`; the getters live here.")]
         #[repr(transparent)]
         #[derive(Clone, Copy)]
-        pub struct $rf<'a, $($lt),*>($crate::CBorrowedPtr<'a, $name<$($lt),*>>);
+        $vis struct $rf<'a, $($lt),*>($crate::CBorrowedPtr<'a, $name<$($lt),*>>);
 
         #[doc = concat!("Exclusive borrow of a [`", stringify!($name), "`]. Reaches the getters with [`as_ref`](Self::as_ref); the setters live here.")]
         #[repr(transparent)]
-        pub struct $mt<'a, $($lt),*>(
+        $vis struct $mt<'a, $($lt),*>(
             $rf<'a, $($lt),*>,
             // Invariant in the pointee, as `&'a mut` is; see `CCell`'s contract.
             ::core::marker::PhantomData<&'a mut $name<$($lt),*>>,
@@ -380,15 +397,31 @@ macro_rules! define_ctype {
             }
         }
     };
+    (
+        $(#[$attr:meta])* pub($($vis:tt)+) $name:ident, $rf:ident, $mt:ident, $c_type:ty $(,)?
+    ) => {
+        $crate::define_ctype!(
+            @impl [$(#[$attr])*] (pub($($vis)+)) $name [], $rf, $mt, $c_type, *const ()
+        );
+    };
+    (
+        $(#[$attr:meta])* pub($($vis:tt)+) $name:ident<$($lt:lifetime),+>, $rf:ident,
+        $mt:ident, $c_type:ty, phantom = $phantom:ty $(,)?
+    ) => {
+        $crate::define_ctype!(
+            @impl [$(#[$attr])*] (pub($($vis)+)) $name [$($lt),+], $rf, $mt, $c_type,
+            (*const (), $phantom)
+        );
+    };
     ($(#[$attr:meta])* $name:ident, $rf:ident, $mt:ident, $c_type:ty) => {
-        $crate::define_ctype!(@impl [$(#[$attr])*] $name [], $rf, $mt, $c_type, *const ());
+        $crate::define_ctype!(@impl [$(#[$attr])*] (pub) $name [], $rf, $mt, $c_type, *const ());
     };
     (
         $(#[$attr:meta])* $name:ident<$($lt:lifetime),+>, $rf:ident, $mt:ident, $c_type:ty,
         phantom = $phantom:ty $(,)?
     ) => {
         $crate::define_ctype!(
-            @impl [$(#[$attr])*] $name [$($lt),+], $rf, $mt, $c_type, (*const (), $phantom)
+            @impl [$(#[$attr])*] (pub) $name [$($lt),+], $rf, $mt, $c_type, (*const (), $phantom)
         );
     };
 }
