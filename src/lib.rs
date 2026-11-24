@@ -135,6 +135,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod allocator;
+pub mod args;
 pub mod atomic_owner;
 pub mod bitfield;
 pub mod callback;
@@ -165,6 +166,7 @@ pub struct DocExamples;
 
 // Re-export the primary items at the crate root for convenience.
 pub use crate::allocator::CAllocator;
+pub use crate::args::{COut, CStrArg};
 pub use crate::atomic_owner::{CAtomicOwner, CPtrDeref, CPtrOwner};
 pub use crate::bitfield::{CAtomicBitfield, CBitfield, CBits};
 pub use crate::callback::{CCallback, CClosure, CFn, CFnBox};

@@ -11,6 +11,17 @@ Changes on `devel` since 0.1.1.
 
 ### Added
 
+- **The arguments an exported function receives** (`args` module). `CStrArg<'a>`
+  is a `const char *` argument (NULL, or a string nothing writes for `'a`),
+  read lazily with `get` / `to_bytes`; `COut<'a, T>` is a write-only
+  `T *out`, written with `write` (a NULL out-parameter is skipped); and
+  `c_slice` forms the slice of a C `(const T *, size_t)` pair, empty for NULL
+  or 0. Both types are `#[repr(transparent)]` over the C pointer, so an
+  export's signature carries its callers' contract and its body reads the
+  arguments with safe code. They form no reference to the pointee until it is
+  read or written, and so keep the raw pointer's aliasing behaviour. Moved
+  from libgit2-crustify, where 83 modules use them. Nothing existing changes.
+
 - **`CAtomicOwner::*_target` and `CPtrDeref`** (`atomic_owner` module).
   `get_target`, `try_insert_target`, `get_or_init_target` and
   `get_or_try_init_target` lend the owner's pointee (`&O::View`: `T` for

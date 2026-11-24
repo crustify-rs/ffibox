@@ -30,6 +30,7 @@ down for one call, and that C does not keep, is plain Rust:
 | reads or writes bitfields of a struct Rust mirrors | `CBitfield<W>` / `CAtomicBitfield<W>`, fields named by `CBits<W>` | the integer's shifts and masks, `AtomicU32::fetch_or` |
 | returns an object through an out-parameter | `CBox::from_c_out`, `CStrBox::from_raw_out` | a return value |
 | calls a Rust routine that must not unwind into it | `callback::barrier` | `catch_unwind` |
+| calls a Rust routine with a string, an out-parameter or an array (the routine's arguments) | `args::CStrArg`, `args::COut`, `args::c_slice`, in the routine's signature | `Option<&CStr>`, `&mut MaybeUninit<T>`, `&[T]` |
 | frees, copies or constructs a ported type's objects | `export_cdrop!`, `export_cdupclone!`, `export_cnew!` | the C routines they replace |
 
 ## Choosing a primitive

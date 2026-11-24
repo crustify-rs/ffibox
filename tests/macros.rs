@@ -409,6 +409,10 @@ fn cval_disposes_once_on_drop() {
 
 #[test]
 fn cval_gates_read_against_write_the_ordinary_way() {
+    // Its drop counts a disposal, which `cval_disposes_once_on_drop` checks.
+    let _serial = QUX_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // The value is Rust's inline storage, so `&self` / `&mut self` do the
     // gating and the handles come from them.
     let mut v = QuxVal::zeroed();
